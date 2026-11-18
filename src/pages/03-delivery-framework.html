@@ -1,0 +1,144 @@
+<section class="page" id="p-delivery-framework" data-title="Delivery Framework" data-kw="requirements functional non-functional capacity estimation api core entities high level design deep dives timing">
+<div class="banner" style="--banner:#e8907a" data-bt="Delivery Framework" data-bs="45 minutes, one working system"></div>
+<p class="eyebrow">LLM System Design · Fast Track</p>
+<h1>Delivery Framework</h1>
+<p class="lead">The sequence of steps and timings to use in an LLM system design interview. Follow it and you'll always deliver a working system, then spend the remaining time where interviewers actually score.</p>
+<hr class="sep">
+
+<p>The most common way to fail a design interview is not a wrong answer. It's running out of time with half a system on the board. A fixed structure keeps you moving forward, gives you something to fall back on when nerves hit, and makes sure the interviewer sees a complete design before the deep dives begin.</p>
+<p>This framework follows the classic shape (requirements, entities, API, high-level design, deep dives) with three LLM-specific additions: <strong>quality, cost and safety become first-class non-functional requirements</strong>, <strong>capacity estimation is done in tokens</strong>, and there's an explicit <strong>LLM pipeline</strong> step where you lay out how a request becomes a prompt and a prompt becomes a response.</p>
+
+<figure class="dg" data-diagram="delivery-timeline"></figure>
+
+<div class="callout"><span class="ci"></span><p>Your interviewer isn't grading you on following this exact framework. But in practice, candidates who build linearly (requirements → interface → working design → hardening) perform much better than those who start with the most interesting component, usually the vector database, and never finish.</p></div>
+
+<h2>Requirements (~5 minutes)</h2>
+<p>Spend the first few minutes turning the prompt into a clear target. Write requirements on the board where both of you can see them; you'll check off functional ones in the high-level design and use non-functional ones to choose deep dives.</p>
+
+<h3>1) Functional requirements</h3>
+<p>These are the "Users should be able to…" statements. Keep it to the top three. For LLM systems, make each one say <em>what the model is responsible for</em>: generate, answer from a corpus, take an action, classify. For a customer-support assistant:</p>
+<ul>
+<li>Customers should be able to ask questions in natural language and get answers grounded in the help center and their own account data, with citations.</li>
+<li>Customers should be able to take simple actions through the assistant (check order status, start a return), with confirmation before anything changes.</li>
+<li>Customers should be able to escalate to a human agent, who receives the conversation and a summary.</li>
+</ul>
+<p>Out of scope (say it out loud): voice, multilingual support, training a custom model, the agent console UI.</p>
+
+<div class="callout"><span class="ci"></span><span class="ct">Keep your requirements targeted.</span><p>A long feature list doesn't impress anyone. Every requirement you add is something you must design. Prioritize with the interviewer: "I'd focus on grounded answers and safe actions. Is that the right core?"</p></div>
+
+<h3>2) Non-functional requirements</h3>
+<p>Pick the three to five qualities that will shape the design, and quantify them. Classic ones (availability, scale, durability) still apply. These five are the ones that make LLM designs different, and interviewers expect at least the first three:</p>
+<div class="tbl"><table>
+<thead><tr><th>Quality</th><th>How to phrase it</th><th>What it drives</th></tr></thead>
+<tbody>
+<tr><td><strong>Answer quality</strong></td><td>"Answers must be grounded in retrieved sources with citations; when we don't know, say so. Target ≥ 90% faithfulness on our eval set."</td><td>RAG design, reranking, abstention, evaluation pipeline</td></tr>
+<tr><td><strong>Latency</strong></td><td>"First token in under 1 s at p95; full answer streams in under 8 s."</td><td>Streaming, model size, retrieval budget, prompt caching</td></tr>
+<tr><td><strong>Cost</strong></td><td>"Under $0.02 per conversation on average."</td><td>Model routing, caching, context trimming, self-host vs API</td></tr>
+<tr><td><strong>Safety &amp; privacy</strong></td><td>"No cross-customer data leakage; PII never leaves our region; actions require confirmation; resistant to prompt injection."</td><td>Permission-aware retrieval, guardrails, tool authorization</td></tr>
+<tr><td><strong>Freshness</strong></td><td>"Help-center edits visible within 10 minutes."</td><td>Incremental ingestion, change data capture</td></tr>
+</tbody></table></div>
+
+<h3>3) Capacity estimation</h3>
+<p>As in classic interviews, only do math when it changes the design. With LLMs it often does, because tokens drive cost and GPU count. Tell the interviewer you'll estimate the few numbers that matter:</p>
+<pre><code><span class="c"># Support assistant, back-of-envelope</span>
+2M conversations/day × 4 turns          = 8M LLM calls/day ≈ 93 calls/s avg, ~300/s peak
+Prompt per call: 1.5K system + 3K retrieved + 1K history  ≈ 5.5K input tokens
+Output per call                         ≈ 300 tokens
+Daily tokens: 8M × 5.5K = 44B input, 8M × 300 = 2.4B output
+<span class="c"># At $3 / M input and $15 / M output (frontier mid-tier list prices):</span>
+44,000 × $3 + 2,400 × $15 = $132K + $36K ≈ <span class="k">$168K/day</span>  → caching and routing are mandatory
+<span class="c"># Caching the shared system prompt (0.1× reads) and routing easy turns to a small model cut this sharply.</span></code></pre>
+<p>That one calculation justifies two deep dives (prompt caching and model routing) and tells you whether self-hosting is worth discussing. For infrastructure prompts, estimate GPU memory instead: weights plus KV cache per token times concurrent tokens (see <a href="#core-concepts">Core Concepts</a>).</p>
+
+<h3>Clarifying questions worth asking</h3>
+<ul>
+<li><strong>Model:</strong> Can we use a hosted API, or must we self-host (privacy, cost, latency)? Is there a model we must use?</li>
+<li><strong>Data:</strong> What sources does the model need? How big, how often do they change, and who is allowed to see what?</li>
+<li><strong>Actions:</strong> Does the system only answer, or does it act? Which actions are irreversible?</li>
+<li><strong>Interaction:</strong> Synchronous chat, async background jobs, or both? Is streaming expected?</li>
+<li><strong>Quality bar:</strong> What's worse here, a wrong answer or no answer? Is there a human fallback?</li>
+</ul>
+
+<h2>Core Entities (~2 minutes)</h2>
+<p>List the main nouns your API exchanges and your system persists. Don't design schemas yet; a bulleted list is enough and will evolve. Common LLM-system entities:</p>
+<div class="tbl"><table>
+<thead><tr><th>Entity</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>User / Tenant</td><td>Tenant boundaries matter for retrieval permissions, quotas and caching.</td></tr>
+<tr><td>Conversation, Message</td><td>Messages have roles (user, assistant, tool) and token counts. Conversations may carry a summary.</td></tr>
+<tr><td>Document, Chunk</td><td>Chunks carry embeddings, source, ACLs and version for citations and freshness.</td></tr>
+<tr><td>Tool call / Action</td><td>Arguments, status, idempotency key, approval state.</td></tr>
+<tr><td>Run / Task</td><td>For agents and long jobs: state, step count, budget, checkpoints.</td></tr>
+<tr><td>Feedback, Eval case</td><td>Thumbs, edits, escalations; golden examples for regression tests.</td></tr>
+</tbody></table></div>
+
+<h2>API or System Interface (~5 minutes)</h2>
+<p>Define the contract between your system and its clients. Default to REST, and add streaming for anything that generates text. Two shapes cover most prompts:</p>
+<h4>Interactive (chat-style) with streaming</h4>
+<pre><code>POST /conversations                          → { conversationId }
+POST /conversations/{id}/messages            <span class="c">// Accept: text/event-stream</span>
+  body: { content, attachments?, clientMessageId }
+  stream: event: message_start   data: { messageId }
+          event: content_delta   data: { text: "…" }
+          event: citation        data: { chunkId, url, title }
+          event: tool_call       data: { name, status }
+          event: message_stop    data: { usage: { inputTokens, outputTokens } }
+GET  /conversations/{id}/messages?cursor=…   → paginated history
+POST /messages/{id}/feedback                 → { rating, comment }</code></pre>
+<h4>Long-running (agent or batch) jobs</h4>
+<pre><code>POST /runs        body: { task, inputs, idempotencyKey }   → 202 { runId }
+GET  /runs/{id}                                           → { status, steps, result? }
+GET  /runs/{id}/events                                    <span class="c">// SSE progress stream</span>
+POST /runs/{id}/approvals   body: { stepId, decision }     <span class="c">// human-in-the-loop</span></code></pre>
+<ul>
+<li>Derive the user and tenant from the auth token, never from the request body.</li>
+<li>Keep model choice, system prompt and temperature server-side. Clients pick a product tier, not a raw model.</li>
+<li>Use a client-supplied message ID so retries don't create duplicate turns or double-charge tokens.</li>
+<li>Return token usage. It's what you meter, bill and rate-limit on.</li>
+</ul>
+
+<h2>LLM Pipeline (~5 minutes)</h2>
+<p>For most LLM prompts, this replaces the optional "data flow" step of a classic interview. Sketch how a request turns into model calls and back, as a short list or a quick diagram. It forces you to decide what goes into the context window and where the guardrails sit, and it becomes the skeleton of your high-level design.</p>
+<figure class="dg" data-diagram="request-path"></figure>
+<ol>
+<li><strong>Admit:</strong> authenticate, resolve tenant, check token quota.</li>
+<li><strong>Guard input:</strong> moderation, PII redaction, injection heuristics.</li>
+<li><strong>Assemble context:</strong> system prompt + conversation history (trimmed or summarized) + retrieved chunks + tool definitions.</li>
+<li><strong>Route:</strong> choose a model tier by task difficulty, tenant plan and current capacity.</li>
+<li><strong>Generate:</strong> call the model, streaming tokens back; execute tool calls in a loop if needed.</li>
+<li><strong>Guard output:</strong> schema validation, policy checks, citation checks.</li>
+<li><strong>Record:</strong> persist messages, emit a trace (prompt version, retrieval results, tokens, latency, cost) for evaluation.</li>
+</ol>
+<p>For RAG systems, also sketch the <em>offline</em> path: sources → parse → chunk → embed → index. It has different scaling and freshness concerns from the online path.</p>
+
+<h2>High-Level Design (~10–15 minutes)</h2>
+<p>Now draw the components and connect them. Go through your API one endpoint at a time and add only what each functional requirement needs. Start almost embarrassingly simple: a client, an API service, a model provider and a database is a valid first drawing. Then grow it.</p>
+<figure class="dg" data-diagram="reference-arch"></figure>
+<p>The diagram above is a reference shape that most LLM application answers converge to. Don't draw all of it on day one. Each box should arrive because a requirement asked for it:</p>
+<ul>
+<li>The <strong>LLM gateway</strong> arrives when you need provider fallback, per-tenant token quotas, central logging or caching.</li>
+<li>The <strong>retrieval service</strong> arrives with "answers grounded in our data."</li>
+<li>The <strong>tool executor</strong> arrives with "users can take actions," and it lives outside the model's control.</li>
+<li>The <strong>trace store and eval pipeline</strong> arrive with your quality requirement.</li>
+</ul>
+<div class="callout"><span class="ci"></span><span class="ct">Talk through your reasoning while you draw.</span><p>"I'm putting authorization in the tool executor, not the prompt, because the model can be talked into anything. The executor checks the user's permissions and requires confirmation for refunds." One sentence like that shows more judgment than three extra boxes.</p></div>
+<p>As in classic interviews, note complexity you'll come back to and move on: "Retrieval quality is going to be the hard part. I'll keep it simple now and deep dive later." Only document the database fields that matter for the design (for example, ACLs and version on chunks).</p>
+
+<h2>Deep Dives (~10 minutes)</h2>
+<p>With a working design on the board, harden it against your non-functional requirements. Senior candidates should propose where to go; mid-level candidates can let the interviewer lead. Either way, pick two or three. These are the deep dives LLM interviewers probe most, and where to take each one:</p>
+<div class="tbl"><table>
+<thead><tr><th>If the interviewer asks…</th><th>Talk about</th></tr></thead>
+<tbody>
+<tr><td>"How do you make answers accurate?"</td><td>Chunking, hybrid search, reranking, contextual retrieval, citations, abstention, eval metrics (context recall, faithfulness).</td></tr>
+<tr><td>"How do you make it fast?"</td><td>Streaming, TTFT budget, parallel retrieval, prompt caching, smaller or speculative models, avoiding sequential LLM calls.</td></tr>
+<tr><td>"It costs too much."</td><td>Model routing and cascades, prompt caching, semantic caching, context trimming, batch APIs for offline work, self-hosting break-even.</td></tr>
+<tr><td>"How do you know it works?"</td><td>Golden sets, LLM-as-judge with calibration, regression gates on prompt and model changes, online metrics, feedback loops.</td></tr>
+<tr><td>"What if someone attacks it?"</td><td>Direct and indirect prompt injection, least-privilege tools, confirmation for irreversible actions, output handling, tenant isolation.</td></tr>
+<tr><td>"What happens at 10× traffic?"</td><td>Token-based admission control, priority tiers, GPU autoscaling lag, continuous batching, KV cache limits, multi-provider capacity.</td></tr>
+<tr><td>"The provider goes down."</td><td>Gateway fallback to a second provider or model, graceful degradation (search results without generation), circuit breakers, idempotent retries.</td></tr>
+</tbody></table></div>
+<p>Don't talk over your interviewer. If they probe something specific, follow them there. Deep dives are where they decide your level.</p>
+
+<h2>Wrapping up</h2>
+<p>If you have a minute left, summarize: the request path in one sentence, the two biggest risks, and what you'd do next (usually: build the eval set first, ship to a small cohort, watch quality and cost dashboards, then expand). Ending on how you'd measure and iterate is a strong senior signal.</p>
+</section>

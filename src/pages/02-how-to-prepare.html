@@ -1,0 +1,103 @@
+<section class="page" id="p-how-to-prepare" data-title="How to Prepare" data-kw="study plan preparation schedule practice mock interview week">
+<div class="banner" style="--banner:#7fb3d5" data-bt="How to Prepare" data-bs="a plan that fits your calendar"></div>
+<p class="eyebrow">LLM System Design · Fast Track</p>
+<h1>How to Prepare</h1>
+<p class="lead">A step-by-step preparation pipeline for LLM system design interviews: what to learn, in what order, and how to practice so it sticks.</p>
+<hr class="sep">
+
+<p>Preparing for an LLM design round is mostly about building two things: a <strong>vocabulary of building blocks</strong> you can reach for without thinking (retrieval, caching, routing, guardrails, batching), and the <strong>judgment to pick between them</strong> under time pressure. Reading builds the first. Only practice builds the second. The pipeline below moves you from one to the other.</p>
+
+<figure class="dg" data-diagram="prep-pipeline"></figure>
+
+<h2>Step 1: Figure out which interview you're getting</h2>
+<p>"LLM system design" means different things at different companies. Before you study, find out which family of prompt you'll face. Ask your recruiter directly: "Is the system design round product-focused, infrastructure-focused, or ML-focused? Is it on a whiteboard tool?" Recruiters usually answer. Then calibrate:</p>
+<div class="tbl"><table>
+<thead><tr><th>Where you're interviewing</th><th>What candidates report</th><th>Where to spend time</th></tr></thead>
+<tbody>
+<tr><td><strong>Frontier labs, SWE roles</strong></td><td>Inference batching, high-concurrency inference APIs, model/file distribution, plus classic prompts (KV store, web crawler, webhooks, CI/CD). Questions wear AI vocabulary but test infrastructure fundamentals (<a href="https://www.aced.io/blog/anthropic-system-design-interview">Exponent: Anthropic</a>, <a href="https://www.designgurus.io/answers/detail/what-to-expect-in-the-openai-system-design-interview">DesignGurus: OpenAI</a>).</td><td>Classic distributed systems first, then inference concepts (batching, KV cache, routing). Practice the <a href="#design-inference-batching">batching breakdown</a>.</td></tr>
+<tr><td><strong>Frontier labs, product / full-stack roles</strong></td><td>Design ChatGPT, a ChatGPT-style homepage with streaming, the Playground with presets, enterprise search with permission-aware indexing.</td><td>Streaming, conversation state, API design, rate limits. Practice <a href="#design-chatgpt">Design ChatGPT</a>.</td></tr>
+<tr><td><strong>Big tech, AI/ML engineer roles</strong></td><td>"Design an LLM-based system for X": support assistant, document Q&amp;A, code review, enterprise search, on-device small model.</td><td>RAG end to end, evaluation, guardrails, cost. Practice the <a href="#design-support-assistant">Support Assistant</a>.</td></tr>
+<tr><td><strong>AI-native startups &amp; forward-deployed roles</strong></td><td>Domain-specific: document-processing pipelines, agent workflows, voice assistants, "our provider goes down, what happens?"</td><td>Agents, durable workflows, provider fallback, cost per task. Practice the <a href="#design-coding-agent">Coding Agent</a>.</td></tr>
+</tbody></table></div>
+
+<div class="callout"><span class="ci"></span><p>If your role is infrastructure-flavored, the trick interviewers look for is abstraction: within the first few minutes, restate the AI-sounding problem as a familiar one. "Batching inference requests for a GPU" is a queue, a batcher with a size-or-timeout trigger, and a way to route each result back to the caller who is waiting for it.</p></div>
+
+<h2>Step 2: Build your foundation</h2>
+<p>LLM questions sit on top of classic system design, so close any gaps there first: load balancing, caching, sharding, queues, consistency, API design, real-time delivery (SSE and WebSockets). If those feel shaky, spend two or three days on <a href="https://www.hellointerview.com/learn/system-design/in-a-hurry/core-concepts">classic core concepts</a> before continuing.</p>
+<p>Then work through this guide's <a href="#core-concepts">Core Concepts</a>, <a href="#key-technologies">Key Technologies</a> and <a href="#common-patterns">Common Patterns</a>. Aim for a level where you can explain each item in two sentences and say when you would <em>not</em> use it. You're done with foundations when you can answer these without notes:</p>
+<ul>
+<li>Why does decoding get faster per GPU but slower per user as batch size grows?</li>
+<li>How many tokens of KV cache does an 80 GB GPU hold for an 8B model, roughly?</li>
+<li>Why combine BM25 with vector search, and what does a reranker add?</li>
+<li>What is indirect prompt injection, and which three controls limit its blast radius?</li>
+<li>When would you fine-tune instead of adding retrieval?</li>
+<li>How would you know if yesterday's prompt change made answers worse?</li>
+</ul>
+
+<h2>Step 3: Study worked examples actively</h2>
+<p>Read the <a href="#question-breakdowns">Question Breakdowns</a>, but don't read them like articles. For each one:</p>
+<ol>
+<li>Read only the problem statement. Close the page.</li>
+<li>Spend 25 minutes sketching your own requirements, API and high-level design.</li>
+<li>Compare against the breakdown. Note every component you missed and every deep dive you couldn't have answered.</li>
+<li>Write the missing concepts on a "gaps" list and revisit them in Core Concepts.</li>
+</ol>
+<p>The Bad / Good / Great solution format in each deep dive is there to show you the ladder interviewers climb. Mid-level candidates who reach "Good" pass. Senior candidates are expected to reach "Great" on at least two deep dives without being led there.</p>
+
+<h2>Step 4: Build one small thing</h2>
+<p>A single weekend project will make your answers more concrete than any amount of reading, because you'll quote numbers you measured. A good scope:</p>
+<ul>
+<li><strong>RAG over a doc set you know</strong> (your company's public docs, a framework's documentation). Chunk, embed, store in pgvector or a hosted vector DB, add BM25, add a reranker.</li>
+<li><strong>A 30-question eval set</strong> with expected answers. Measure recall@20 for retrieval and use an LLM judge for faithfulness. Change one thing (chunk size, reranker on or off) and watch the numbers move.</li>
+<li><strong>Streaming and tracing.</strong> Stream responses over SSE and log every step (retrieval latency, TTFT, tokens in and out, cost) to an open-source tracer such as Langfuse.</li>
+<li><strong>One tool.</strong> Let the model call a single function, and validate its arguments in code before executing.</li>
+</ul>
+<p>In the interview, A sentence like "when I tried it, the reranker lifted recall@5 noticeably and cost about this much latency", with your own measured numbers, lands far better than a recited benchmark.</p>
+
+<h2>Step 5: Practice under real conditions</h2>
+<p>Pick prompts from the <a href="#question-bank">Question Bank</a> you haven't seen worked through. Set a 45-minute timer, talk out loud, and draw in the tool your company uses (Excalidraw is common). Record yourself if you can. Afterwards, grade yourself against this checklist:</p>
+<div class="tbl"><table>
+<thead><tr><th>Check</th><th>Did you…</th></tr></thead>
+<tbody>
+<tr><td>Scope</td><td>State 3 functional requirements and quantified non-functional ones (latency, cost per request, quality bar, safety) before drawing?</td></tr>
+<tr><td>Interface</td><td>Define the API, including streaming and how long-running work is handled?</td></tr>
+<tr><td>Working design</td><td>Have an end-to-end design that satisfies every functional requirement by minute 25?</td></tr>
+<tr><td>LLM boundary</td><td>Explain what the model decides versus what code enforces (permissions, validation, control flow)?</td></tr>
+<tr><td>Quality</td><td>Describe how you'd evaluate offline and monitor online?</td></tr>
+<tr><td>Cost &amp; latency</td><td>Estimate tokens per request and name at least two levers (caching, routing, smaller model, batching)?</td></tr>
+<tr><td>Failure modes</td><td>Cover provider outage, bad retrieval, injection and runaway agents?</td></tr>
+<tr><td>Driving</td><td>Pick deep dives yourself rather than waiting to be asked (senior and above)?</td></tr>
+</tbody></table></div>
+<p>Then do mock interviews with peers or paid coaches. Interviewers at AI labs often give a one-line prompt and stay quiet, so practice with a partner who does the same. Filling 45 minutes yourself is a skill.</p>
+
+<h2>Study plans</h2>
+<h3>One week (you have an interview on Monday)</h3>
+<div class="tbl"><table>
+<thead><tr><th>Day</th><th>Focus</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><a href="#introduction">Introduction</a> and <a href="#delivery-framework">Delivery Framework</a>. Do one cold attempt at "Design ChatGPT" to find your baseline.</td></tr>
+<tr><td>2</td><td>Core Concepts: tokens, inference, KV cache, batching, streaming.</td></tr>
+<tr><td>3</td><td>Core Concepts: embeddings, RAG, caching, routing. Read the Support Assistant breakdown.</td></tr>
+<tr><td>4</td><td>Core Concepts: evaluation, guardrails, agents. Read the Coding Agent breakdown.</td></tr>
+<tr><td>5</td><td>Common Patterns and Key Technologies (skim). Read the breakdown that matches your interview type.</td></tr>
+<tr><td>6</td><td>Two timed mocks from the Question Bank. Fix gaps.</td></tr>
+<tr><td>7</td><td>One more mock, then rest. Re-read the Delivery Framework and red flags.</td></tr>
+</tbody></table></div>
+<h3>Four weeks</h3>
+<ul>
+<li><strong>Week 1:</strong> classic system design refresh plus the whole Fast Track.</li>
+<li><strong>Week 2:</strong> all four breakdowns, done actively (cold attempt first). Start the weekend RAG project.</li>
+<li><strong>Week 3:</strong> finish the project with evals and tracing. Read three engineering write-ups from <a href="#resources">Resources</a>. Four timed practice questions.</li>
+<li><strong>Week 4:</strong> four to six mocks, focused on your interview family. Polish your opening five minutes.</li>
+</ul>
+<h3>Eight weeks (career switch or first AI role)</h3>
+<p>Do the four-week plan at half speed, add a second project (an agent with three tools, a sandbox, and a step budget), and read primary sources: the vLLM paper, Anthropic's agent and context-engineering posts, and the OWASP Top 10 for LLM Applications. Write a one-page design doc for each project. Those docs double as talking points for behavioral and project-deep-dive rounds.</p>
+
+<h2>If you only have a few hours</h2>
+<ol>
+<li>Memorize the <a href="#delivery-framework">Delivery Framework</a> timings and the LLM-specific non-functional requirements.</li>
+<li>Learn the reference request path: gateway → guard → context assembly (history + retrieval) → model router → LLM → output guard → stream → trace.</li>
+<li>Know four numbers: tokens per word, TTFT vs decode speed, KV cache per token for a 70B model, and that a cache read is about a tenth of the input price on major APIs.</li>
+<li>Have one sentence each on evaluation, prompt injection, and provider fallback.</li>
+</ol>
+</section>

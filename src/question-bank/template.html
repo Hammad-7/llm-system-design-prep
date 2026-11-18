@@ -1,0 +1,56 @@
+<section class="page" id="p-question-bank" data-title="Question Bank" data-kw="practice questions list prompts openai anthropic google xai salesforce cohere">
+<div class="banner" style="--banner:#86c5a8" data-bt="Question Bank" data-bs="{{N}} prompts to practice cold"></div>
+<p class="eyebrow">Practice</p>
+<h1>Question Bank</h1>
+<p class="lead">LLM system design prompts reported by candidates at AI labs, big tech and AI startups, plus the common prompts practitioner guides see most. Filter by type and difficulty, set a 45-minute timer, and go.</p>
+<hr class="sep">
+
+<p>Where a company is named, the prompt comes from candidate reports collected by the linked source; treat these as themes rather than guaranteed questions, since question banks change. "Common" means the prompt appears across many companies or guides. Linked question titles have a full worked breakdown in this guide.</p>
+
+<div class="callout"><span class="ci"></span><span class="ct">How to use this list</span>
+<ol>
+<li>Pick a prompt in your interview's family that you haven't studied.</li>
+<li>Run the <a href="#delivery-framework">Delivery Framework</a> out loud in 45 minutes, drawing as you go.</li>
+<li>Grade yourself with the checklist below, then look up the concepts you missed.</li>
+<li>Repeat the same prompt a week later. The second attempt is where the learning shows.</li>
+</ol></div>
+
+<h2>Questions</h2>
+<div class="qb-controls" role="group" aria-label="Filter by type">{{CHIPS}}</div>
+<div class="qb-controls" role="group" aria-label="Filter by level">{{LCHIPS}}<input id="qb-search" class="qb-search" type="search" placeholder="Filter by keyword, e.g. GPU, RAG, Anthropic" aria-label="Filter questions by keyword"></div>
+<p class="qb-count" id="qb-count"></p>
+<div class="tbl"><table id="qb-table">
+<thead><tr><th>Prompt</th><th>Type</th><th>Level</th><th>Reported at</th><th>What it probes</th></tr></thead>
+<tbody>
+{{ROWS}}
+</tbody></table></div>
+
+<h2>Self-grading checklist</h2>
+<div class="tbl"><table>
+<thead><tr><th>Area</th><th>Strong signal</th></tr></thead>
+<tbody>
+<tr><td>Requirements</td><td>Three crisp functional requirements; quantified latency, cost, quality and safety targets; scope cut out loud.</td></tr>
+<tr><td>Estimation</td><td>Tokens per request, requests per second, and the one derived number that drives the design (GPUs, cost/day, KV memory).</td></tr>
+<tr><td>API</td><td>Streaming or async job shape chosen deliberately; idempotency; user from auth.</td></tr>
+<tr><td>High-level design</td><td>Every functional requirement satisfied by minute ~25; model boundary clear; authorization in code.</td></tr>
+<tr><td>Deep dives</td><td>Two or three, each with an explicit trade-off and a failure mode; at least one quantified.</td></tr>
+<tr><td>Quality</td><td>Offline eval set, metrics, release gate, online signals.</td></tr>
+<tr><td>Safety</td><td>Injection, data leakage, excessive agency, abuse each addressed where relevant.</td></tr>
+<tr><td>Communication</td><td>Assumptions stated, interviewer's probes followed, a crisp summary at the end.</td></tr>
+</tbody></table></div>
+
+<h2>Follow-up questions interviewers love</h2>
+<p>Have a one-minute answer ready for each. They show up as probes in almost any prompt.</p>
+<ul>
+<li>Your model provider has a 30-minute outage. What happens?</li>
+<li>Cost doubled last month. How do you find out why, and what do you change first?</li>
+<li>A customer reports the assistant showed them another customer's data. Walk through how that could happen.</li>
+<li>Yesterday's prompt change made answers worse, and nobody noticed for a week. What would have caught it?</li>
+<li>We're switching to a new model version. How do you roll it out?</li>
+<li>Traffic grows 10×. What breaks first?</li>
+<li>Would you fine-tune here? What would convince you?</li>
+<li>How would you know whether the reranker is worth its latency?</li>
+<li>A web page the agent reads contains instructions to email the user's files somewhere. What stops it?</li>
+<li>How many concurrent conversations can one GPU server handle for this model? Show the math.</li>
+</ul>
+</section>

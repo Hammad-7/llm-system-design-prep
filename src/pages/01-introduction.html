@@ -1,0 +1,100 @@
+<section class="page" id="p-introduction" data-title="Introduction" data-kw="overview what is llm system design interview types rubric assessment levels">
+<div class="banner" style="--banner:#f2a65a" data-bt="LLM System Design" data-bs="the fast track"></div>
+<p class="eyebrow">LLM System Design · Fast Track</p>
+<h1>Introduction</h1>
+<p class="lead">Learn to design LLM-powered applications for interviews, fast. The essentials of retrieval, agents, inference, evaluation and safety, organized the way interviewers actually grade.</p>
+<hr class="sep">
+
+<p>A few years ago the canonical system design prompt was "Design YouTube." Today a growing share of loops open with "Design ChatGPT," "Design a support bot over our knowledge base," or "Design an inference batching service." Prep companies now report that LLM infrastructure prompts have spread beyond ML roles into general software engineering loops (<a href="https://www.tryexponent.com/blog/system-design-interview-guide">Exponent, 2026</a>), and practitioner guides describe "design an LLM-based system for X" as the most common ML system design question of 2026 (<a href="https://www.techinterview.org/post/3233474925/ml-engineer-interview-post-llm-era/">techinterview.org</a>).</p>
+<p>This guide works backwards from those interviews. It keeps the bones of a classic system design interview (requirements, APIs, data, scale) and adds the parts that are new when one of your components is a probabilistic, expensive, GPU-bound text generator. It's useful for two reasons:</p>
+<ol>
+<li>If your interview is soon, you get the highest-leverage material first: a delivery framework, the concepts that come up every time, and four fully worked examples.</li>
+<li>If you build LLM features at work, everything here maps to real production decisions. Nothing is interview theater.</li>
+</ol>
+
+<div class="callout info"><span class="ci"></span><span class="ct">Not the right spot?</span>
+<ul>
+<li>Need classic distributed-systems fundamentals first (sharding, caching, queues)? Start with <a href="https://www.hellointerview.com/learn/system-design/in-a-hurry/introduction">Hello Interview's System Design in a Hurry</a>, then come back.</li>
+<li>Interviewing for model training, ranking or recommendation roles? Classic ML system design still applies; this guide focuses on applications built <em>on top of</em> LLMs and on the infrastructure that serves them.</li>
+</ul></div>
+
+<h2>What are LLM system design interviews?</h2>
+<p>An LLM system design interview asks you to design a production system where a large language model does part of the work. Like any design round it's open-ended: you get a vague prompt and are expected to drive toward a working architecture in about 45 minutes while explaining your trade-offs.</p>
+<p>What changes is the shape of the hard problems. Your new component is <strong>non-deterministic</strong> (the same input can produce different outputs), <strong>slow and expensive per call</strong> (seconds and fractions of a cent, metered in tokens), <strong>bounded by a context window</strong>, <strong>wrong in fluent ways</strong> (hallucination), and <strong>steerable by its inputs</strong>, including attacker-controlled inputs. Most of the interview is about building deterministic scaffolding around that component so the overall system is fast, affordable, measurable and safe.</p>
+
+<div class="tbl"><table>
+<thead><tr><th>Classic concern</th><th>What it becomes with an LLM in the loop</th></tr></thead>
+<tbody>
+<tr><td>Throughput in requests/sec</td><td>Tokens/sec, concurrent sequences, GPU-hours. One request can cost 100× another.</td></tr>
+<tr><td>p99 latency</td><td>Time to first token (TTFT) + time per output token. Streaming changes what "fast" means.</td></tr>
+<tr><td>Cache by key</td><td>Prompt/prefix caching, semantic caching, KV-cache-aware routing.</td></tr>
+<tr><td>Database index</td><td>Vector index + keyword index + reranker, with permission filters.</td></tr>
+<tr><td>Correctness via unit tests</td><td>Evaluation suites, LLM-as-judge, online quality metrics, regression gates.</td></tr>
+<tr><td>Rate limiting by request</td><td>Token budgets, per-tenant quotas, cost ceilings, concurrency caps.</td></tr>
+<tr><td>Input validation</td><td>Prompt-injection defenses, PII redaction, output validation, least-privilege tools.</td></tr>
+<tr><td>Background jobs</td><td>Long-running, multi-step agent runs that need checkpoints, budgets and human approval.</td></tr>
+</tbody></table></div>
+
+<h3>Types of LLM system design interviews</h3>
+<p>Prompts cluster into six families. Knowing which one you're in tells you where the deep dives will go.</p>
+<figure class="dg" data-diagram="six-types"></figure>
+<ol>
+<li><strong>LLM product design.</strong> "Design ChatGPT," "Design the Claude chat service," "Design the OpenAI Playground." Conversation state, streaming, model selection, storage, rate limits and safety at consumer scale.</li>
+<li><strong>Retrieval &amp; knowledge systems.</strong> "Design a RAG system for a customer-support chatbot," "Design LLM-powered enterprise search." Ingestion, chunking, hybrid retrieval, reranking, permissions, citations, freshness, evaluation. This is the single most common family.</li>
+<li><strong>Agentic systems.</strong> "Design an AI coding agent," "Design an agent that takes actions across tools." The agent loop, tool contracts, sandboxes, budgets, durable execution and human-in-the-loop.</li>
+<li><strong>Inference &amp; platform infrastructure.</strong> "Design an inference batching system," "Design a high-concurrency inference API," "Design GPU scheduling." Queues, batching, KV cache, routing, autoscaling, failover. Common at frontier labs, where interviewers want you to strip away the AI vocabulary and solve the infrastructure problem underneath (<a href="https://www.aced.io/blog/anthropic-system-design-interview">Exponent's Anthropic guide</a>).</li>
+<li><strong>Evaluation, safety &amp; governance platforms.</strong> "Design an LLM evaluation pipeline," "Design content-policy detection," "Design guardrails for an enterprise assistant."</li>
+<li><strong>AI-flavored classic design.</strong> A classic prompt with an LLM somewhere in the path: a distributed search system with LLM inference in the query path, a token-based rate limiter, a prompt-management platform, a model-artifact distribution system.</li>
+</ol>
+
+<div class="callout"><span class="ci"></span><p>Many AI companies, frontier labs included, still ask plenty of classic prompts (webhooks, payments, CI/CD, chat, rate limiters) for general software roles. Treat this guide as an add-on to classic preparation, not a replacement.</p></div>
+
+<h3>Assessment</h3>
+<p>Rubrics vary by company, but they converge on four areas. Under each, here's what changes when the system contains an LLM.</p>
+<figure class="dg" data-diagram="rubric"></figure>
+
+<h4>Problem Navigation</h4>
+<p>Can you turn a vague prompt into measurable goals, and focus on what matters? For LLM systems this starts with questions most candidates skip: does this even need an LLM, or just a part of it? What does "good answer" mean and how will we measure it? Which mistakes are reversible (a bad summary) and which are not (a refund, a deleted file, a leaked document)? Clarifying requirements before drawing boxes is the most commonly reported gap in these rounds (<a href="https://www.kdnuggets.com/how-to-answer-ai-system-design-interview-questions">KDnuggets field guide</a>).</p>
+
+<h4>Solution Design</h4>
+<p>Can you produce a working architecture with sensible components? Strong candidates put the model where judgment is needed and deterministic code everywhere else. They keep control flow in an orchestrator rather than in a prompt, validate every tool call in application code, and know when retrieval beats fine-tuning.</p>
+
+<h4>Technical Excellence</h4>
+<p>Do you know the mechanics that drive cost, latency and quality? Expect probes on tokens and context windows, KV cache and batching, embeddings and vector indexes, hybrid retrieval and reranking, caching layers, evaluation methods and prompt injection. You don't need to derive attention math, but you should be able to estimate how many concurrent conversations a GPU can hold, or why a reranker helps.</p>
+
+<h4>Communication and Collaboration</h4>
+<p>Can you explain trade-offs clearly and adapt when the interviewer pushes? LLM rounds reward stating assumptions out loud ("I'll assume a hosted frontier model behind an API, and revisit self-hosting if cost becomes the constraint") and naming what you'd measure to decide.</p>
+
+<h4>How expectations change by level</h4>
+<div class="levels">
+<div><h4>Mid-level</h4>A clean, working end-to-end design. Correct use of retrieval, streaming and a basic eval story. Reasonable answers when probed, even if the interviewer leads the deep dives.</div>
+<div><h4>Senior</h4>Drives the design and picks the deep dives. Quantifies latency and cost, explains retrieval quality trade-offs, designs evaluation and guardrails, anticipates failure modes (provider outage, injection, bad retrieval).</div>
+<div><h4>Staff+</h4>Sets scope in a near-silent interview. Reasons about the platform (shared gateway, eval flywheel, multi-tenant isolation), build-vs-buy for models, migration between model versions, and how the system degrades safely.</div>
+</div>
+
+<div class="callout warn"><span class="ci w"></span><span class="ct">Red flags interviewers report</span>
+<ul>
+<li>Treating the LLM as a source of truth instead of grounding it in data you control.</li>
+<li>No evaluation plan, or "we'll look at outputs."</li>
+<li>Reaching for fine-tuning before trying prompting and retrieval.</li>
+<li>Ignoring prompt injection, data leakage between tenants, and abuse.</li>
+<li>Ignoring cost and latency until the interviewer asks.</li>
+<li>Putting business logic and permissions in the prompt instead of in code.</li>
+</ul>
+<p>These recur across interviewer write-ups such as <a href="https://igotanoffer.com/en/advice/generative-ai-system-design-interview">IGotAnOffer's GenAI guide</a> and the <a href="https://github.com/alexeygrigorev/ai-engineering-field-guide/blob/main/interview/questions/04-ai-system-design.md">AI Engineering Field Guide</a>.</p></div>
+
+<h2>How to Use This Guide</h2>
+<p>Read the Fast Track in order. Each section builds on the previous one:</p>
+<figure class="dg" data-diagram="structure"></figure>
+<ul>
+<li><a href="#how-to-prepare">How to Prepare</a> gives you a plan for one, four or eight weeks.</li>
+<li><a href="#delivery-framework">Delivery Framework</a> is the step-by-step structure you'll use in the room, adapted for LLM systems.</li>
+<li><a href="#core-concepts">Core Concepts</a>, <a href="#key-technologies">Key Technologies</a> and <a href="#common-patterns">Common Patterns</a> are the building blocks every answer reuses.</li>
+<li><a href="#question-breakdowns">Question Breakdowns</a> walks through four complete interviews with Bad / Good / Great options for each deep dive.</li>
+<li>The <a href="#question-bank">Question Bank</a> has 50+ prompts to practice cold, filterable by type and difficulty.</li>
+</ul>
+<p>Short on time? Read the Delivery Framework, the Core Concepts sections on inference, RAG and evaluation, and the ChatGPT and Support Assistant breakdowns. That covers the majority of what gets asked.</p>
+
+<h2>Conclusion</h2>
+<p>LLM system design is classic system design with a new, strange component in the middle. If you can reason about tokens the way you reason about bytes, treat quality as something you measure, and treat every model input as untrusted, you'll stand out. Mark this page as read and move on to preparation.</p>
+</section>

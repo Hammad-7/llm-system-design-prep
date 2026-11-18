@@ -1,0 +1,120 @@
+<section class="page" id="p-key-technologies" data-title="Key Technologies" data-kw="vllm sglang tensorrt-llm llm-d pgvector pinecone qdrant weaviate milvus elasticsearch opensearch vespa litellm portkey langgraph temporal mcp langfuse langsmith phoenix ragas llama guard nemo guardrails presidio firecracker gvisor e2b redis kafka postgres">
+<div class="banner" style="--banner:#9aa7e0" data-bt="Key Technologies" data-bs="what to name, and when"></div>
+<p class="eyebrow">LLM System Design · Fast Track</p>
+<h1>Key Technologies</h1>
+<p class="lead">The tools that show up in LLM system design answers: model providers and serving engines, vector stores, gateways, orchestration, evaluation and guardrails. What each one is for, and the one sentence to say about it.</p>
+<hr class="sep">
+
+<p>Interviewers don't expect you to know every product, and they care far more about <em>why</em> you'd use a category than which logo you pick. Still, naming a concrete, well-known technology makes your design feel real and opens the door to deeper questions you can answer. Learn one or two options per category well, plus the trade-off that separates them.</p>
+<p>The classic building blocks don't go away. Conversation history lives in a database, traces flow through a queue, and session state sits in a cache. If you need refreshers, Hello Interview's key technology pages on <a href="https://www.hellointerview.com/learn/system-design/deep-dives/redis">Redis</a>, <a href="https://www.hellointerview.com/learn/system-design/deep-dives/kafka">Kafka</a>, <a href="https://www.hellointerview.com/learn/system-design/deep-dives/postgres">PostgreSQL</a> and <a href="https://www.hellointerview.com/learn/system-design/deep-dives/temporal">Temporal</a> pair well with this page.</p>
+
+<figure class="dg" data-diagram="tech-map"></figure>
+
+<h2>Model providers (hosted APIs)</h2>
+<div class="tech">
+<h4>Frontier model APIs</h4>
+<p><span class="pill">Anthropic Claude</span><span class="pill">OpenAI</span><span class="pill">Google Gemini</span><span class="pill">via AWS Bedrock / Google Vertex / Azure</span></p>
+<div class="kv"><b>Use when</b><span>Almost always as your default. Best quality, zero GPU operations, pay per token.</span>
+<b>Know about</b><span>Streaming, tool use, structured outputs, prompt caching, batch APIs (commonly 50% off for async work), tiered rate limits (tokens per minute), regional data residency, zero-data-retention options.</span>
+<b>Say</b><span>"I'll start with a hosted model behind our own gateway so we can switch providers or add a self-hosted tier later without touching application code."</span></div>
+</div>
+<div class="tech">
+<h4>Open-weight models</h4>
+<p><span class="pill">Llama</span><span class="pill">Qwen</span><span class="pill">Mistral</span><span class="pill">DeepSeek</span><span class="pill">Gemma</span></p>
+<div class="kv"><b>Use when</b><span>Data can't leave your infrastructure, you need fine-tuning control, or volume is high enough that GPUs you keep busy are cheaper than per-token pricing.</span>
+<b>Trade-off</b><span>You now own capacity planning, autoscaling, upgrades and on-call. Idle GPUs are expensive; self-hosting wins only at sustained high utilization or with strict privacy needs.</span></div>
+</div>
+
+<h2>Inference serving</h2>
+<div class="tech">
+<h4>Serving engines</h4>
+<p><span class="pill">vLLM</span><span class="pill">SGLang</span><span class="pill">TensorRT-LLM</span></p>
+<div class="kv"><b>What they do</b><span>Turn model weights into a high-throughput, OpenAI-compatible endpoint: continuous batching, paged KV cache, prefix caching, quantization, speculative decoding, multi-GPU parallelism, multi-LoRA serving.</span>
+<b>Differences</b><span><a href="https://github.com/vllm-project/vllm">vLLM</a> (PagedAttention) is the broadest default. <a href="https://github.com/sgl-project/sglang">SGLang</a> centers its scheduler on prefix reuse (RadixAttention) and does well on multi-turn and shared-prefix workloads. TensorRT-LLM is NVIDIA's compiled, highly tuned option.</span>
+<b>Say</b><span>"Each replica runs vLLM with continuous batching and prefix caching; the router is what makes the fleet efficient."</span></div>
+</div>
+<div class="tech">
+<h4>Cluster orchestration for inference</h4>
+<p><span class="pill">llm-d</span><span class="pill">NVIDIA Dynamo</span><span class="pill">KServe</span><span class="pill">Ray Serve</span><span class="pill">Kubernetes + GPU autoscaling</span></p>
+<div class="kv"><b>What they add</b><span>Fleet-level concerns the engine doesn't handle: cache-aware and load-aware request routing, prefill/decode disaggregation across pools, model rollout, autoscaling on queue depth or KV utilization. <a href="https://github.com/llm-d/llm-d">llm-d</a>, a CNCF sandbox project, scores replicas on prefix-cache locality and load instead of round-robin.</span>
+<b>Say</b><span>"Round-robin wastes prefix caches. I'd route by conversation or prefix hash with a load-aware fallback."</span></div>
+</div>
+
+<h2>Retrieval</h2>
+<div class="tech">
+<h4>Vector databases and search engines</h4>
+<p><span class="pill">pgvector</span><span class="pill">Pinecone</span><span class="pill">Qdrant</span><span class="pill">Weaviate</span><span class="pill">Milvus</span><span class="pill">Elasticsearch / OpenSearch</span><span class="pill">Vespa</span><span class="pill">turbopuffer</span></p>
+<div class="kv"><b>Choose by</b><span>Scale (millions vs billions of vectors), need for hybrid keyword + vector search, filtering and multi-tenancy model, operational appetite (managed vs self-run), and whether you already run Postgres or Elasticsearch.</span>
+<b>Defaults</b><span><strong>pgvector</strong> when data is already in Postgres and the corpus is up to tens of millions of chunks: transactions, joins and ACLs come for free. <strong>A dedicated vector DB</strong> (Pinecone, Qdrant, Weaviate, Milvus) for larger scale, many tenants or heavy filtering. <strong>Elasticsearch/OpenSearch or Vespa</strong> when keyword search and ranking matter as much as vectors.</span>
+<b>Say</b><span>"I'll use one engine that does BM25 and vectors together so hybrid search is a single query with ACL filters applied inside the search."</span></div>
+</div>
+<figure class="dg" data-diagram="vector-choice"></figure>
+<div class="tech">
+<h4>Embedding and reranking models</h4>
+<p><span class="pill">OpenAI embeddings</span><span class="pill">Cohere Embed &amp; Rerank</span><span class="pill">Voyage</span><span class="pill">BGE / open models</span><span class="pill">cross-encoders</span></p>
+<div class="kv"><b>Know</b><span>Embedding dimension drives storage and search cost. Changing embedding models means re-embedding the whole corpus, so version embeddings and plan migrations as dual-write plus backfill. Rerankers are slower per document but far more accurate; run them on the top 50–100 candidates only.</span></div>
+</div>
+<div class="tech">
+<h4>Document parsing and ingestion</h4>
+<p><span class="pill">Unstructured</span><span class="pill">Docling</span><span class="pill">Apache Tika</span><span class="pill">OCR / vision models</span><span class="pill">Kafka, Debezium (CDC)</span></p>
+<div class="kv"><b>Why it matters</b><span>Garbage in, garbage retrieved. PDFs, tables and slides need layout-aware parsing; scanned documents need OCR or a vision model. Ingestion is a pipeline (fetch → parse → chunk → enrich → embed → upsert) run by workers off a queue, triggered by change events.</span></div>
+</div>
+
+<h2>Gateways and orchestration</h2>
+<div class="tech">
+<h4>LLM gateways</h4>
+<p><span class="pill">LiteLLM</span><span class="pill">Portkey</span><span class="pill">Envoy AI Gateway</span><span class="pill">Kong AI Gateway</span><span class="pill">Cloudflare AI Gateway</span></p>
+<div class="kv"><b>What it does</b><span>A single internal API in front of every model: provider keys, routing and fallback, per-tenant token quotas and budgets, caching, PII redaction, logging and cost attribution.</span>
+<b>Say</b><span>"Every model call goes through the gateway, which gives us one place for quotas, fallbacks and cost tracking. Uber built exactly this kind of GenAI gateway to serve dozens of internal use cases."</span></div>
+</div>
+<div class="tech">
+<h4>Agent and LLM application frameworks</h4>
+<p><span class="pill">LangGraph</span><span class="pill">LlamaIndex</span><span class="pill">OpenAI Agents SDK</span><span class="pill">Claude Agent SDK</span><span class="pill">Pydantic AI</span></p>
+<div class="kv"><b>Use when</b><span>You want a graph or loop abstraction for multi-step LLM workflows, built-in tool calling, state and streaming. Many teams use plain code plus the provider SDK; frameworks are optional.</span>
+<b>Interview tip</b><span>Don't make the framework the architecture. Draw the orchestrator as a service with clear responsibilities; mention the framework as an implementation detail.</span></div>
+</div>
+<div class="tech">
+<h4>Durable execution and queues</h4>
+<p><span class="pill">Temporal</span><span class="pill">AWS Step Functions</span><span class="pill">Kafka</span><span class="pill">SQS</span><span class="pill">Redis Streams</span></p>
+<div class="kv"><b>Use when</b><span>Agent runs or document pipelines take minutes to hours, span many LLM and tool calls, and must survive crashes, retries and human approval pauses. Durable workflows checkpoint each step so a failure resumes instead of restarting.</span>
+<b>Say</b><span>"Each agent run is a durable workflow; each LLM call and tool call is an activity with its own timeout and retry policy, and approvals are signals."</span></div>
+</div>
+<div class="tech">
+<h4>Protocols</h4>
+<p><span class="pill">Model Context Protocol (MCP)</span><span class="pill">Agent2Agent (A2A)</span><span class="pill">OpenAI-compatible APIs</span></p>
+<div class="kv"><b>Know</b><span>MCP standardizes how models discover and call tools and data sources; its 2026-07-28 spec made the core stateless and standardized OAuth-based authorization for remote servers. A2A covers agent-to-agent communication. The OpenAI-compatible HTTP API is the de facto interface most serving engines and gateways expose.</span></div>
+</div>
+
+<h2>Evaluation and observability</h2>
+<div class="tech">
+<h4>Tracing, evals and prompt management</h4>
+<p><span class="pill">Langfuse</span><span class="pill">LangSmith</span><span class="pill">Arize Phoenix</span><span class="pill">Braintrust</span><span class="pill">Ragas</span><span class="pill">promptfoo</span><span class="pill">OpenTelemetry GenAI conventions</span></p>
+<div class="kv"><b>What they do</b><span>Capture each request as a trace (prompt version, retrieved chunks, tool calls, tokens, latency, cost), run offline eval suites with LLM judges, compare prompt and model versions, and collect user feedback. <a href="https://langfuse.com/">Langfuse</a> and Phoenix are open source; LangSmith and Braintrust are managed.</span>
+<b>Say</b><span>"Every trace is tagged with prompt and model version, so we can slice quality and cost by release and replay failures into the eval set."</span></div>
+</div>
+
+<h2>Safety and security</h2>
+<div class="tech">
+<h4>Guardrails</h4>
+<p><span class="pill">Llama Guard</span><span class="pill">NeMo Guardrails</span><span class="pill">Microsoft Presidio (PII)</span><span class="pill">provider moderation APIs</span><span class="pill">schema validators</span></p>
+<div class="kv"><b>Use for</b><span>Input and output classification (toxicity, self-harm, policy), PII detection and redaction, jailbreak and injection heuristics, topical rails. Run cheap classifiers in parallel with the main call to avoid adding latency.</span>
+<b>Remember</b><span>Classifiers reduce risk; architecture (least privilege, confirmation, isolation) contains it.</span></div>
+</div>
+<div class="tech">
+<h4>Sandboxes for code and tools</h4>
+<p><span class="pill">Firecracker microVMs</span><span class="pill">gVisor</span><span class="pill">E2B</span><span class="pill">containers with no network egress</span></p>
+<div class="kv"><b>Use when</b><span>The model writes and runs code, browses, or touches files. Each run gets an isolated, short-lived environment with CPU/memory/time limits, no secrets, and an egress allowlist.</span></div>
+</div>
+
+<h2>Classic infrastructure, LLM-flavored</h2>
+<div class="tbl"><table>
+<thead><tr><th>Technology</th><th>Typical role in an LLM system</th></tr></thead>
+<tbody>
+<tr><td>PostgreSQL</td><td>Users, tenants, conversations, messages, documents metadata, ACLs; pgvector for small-to-mid corpora.</td></tr>
+<tr><td>DynamoDB / Cassandra</td><td>Very high-volume conversation and message history keyed by conversation ID.</td></tr>
+<tr><td>Redis</td><td>Token-bucket rate limits, session state, stream resume buffers, semantic or exact response cache, distributed locks for runs.</td></tr>
+<tr><td>Kafka</td><td>Ingestion change events, trace and feedback pipelines, async eval jobs.</td></tr>
+<tr><td>S3 / object storage</td><td>Raw documents, uploaded files, model weights, eval datasets, trace archives.</td></tr>
+<tr><td>Flink / Spark</td><td>Batch embedding backfills, analytics over traces, offline evaluation at scale.</td></tr>
+</tbody></table></div>
+</section>

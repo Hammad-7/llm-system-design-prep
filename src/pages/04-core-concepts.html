@@ -1,0 +1,237 @@
+<section class="page" id="p-core-concepts" data-title="Core Concepts" data-kw="tokens inference prefill decode kv cache batching context window embeddings vector search hnsw rag chunking hybrid rerank caching routing evaluation guardrails prompt injection fine-tuning lora streaming rate limiting numbers">
+<div class="banner" style="--banner:#86c5a8" data-bt="Core Concepts" data-bs="the ideas every answer reuses"></div>
+<p class="eyebrow">LLM System Design · Fast Track</p>
+<h1>Core Concepts</h1>
+<p class="lead">The concepts that come up in nearly every LLM system design interview, from how tokens become latency and cost to how retrieval, caching, evaluation and guardrails work.</p>
+<hr class="sep">
+
+<p>You don't need to be an ML researcher to pass an LLM design round. You do need a working model of what happens inside a model call, because almost every trade-off you'll discuss (latency, cost, concurrency, quality) traces back to it. Work through these in order; later sections build on earlier ones.</p>
+
+<h2>Tokens: the unit of everything</h2>
+<p>LLMs read and write <strong>tokens</strong>, sub-word pieces produced by a tokenizer. In English a token averages around four characters, so 1,000 tokens is roughly 750 words; code, non-English text and numbers usually take more tokens per word. Tokens are the unit of:</p>
+<ul>
+<li><strong>Cost.</strong> APIs bill per million input and output tokens, and output tokens typically cost several times more than input tokens.</li>
+<li><strong>Latency.</strong> Input tokens are processed in parallel (fast); output tokens are generated one at a time (slow).</li>
+<li><strong>Limits.</strong> The context window (input + output) caps how much the model can see at once, from tens of thousands of tokens up to a million or more on current frontier models. Providers also enforce tokens-per-minute rate limits.</li>
+</ul>
+<pre><code>cost per call  = input_tokens × input_price + output_tokens × output_price
+latency        ≈ queue_wait + TTFT(input_tokens) + output_tokens × time_per_output_token</code></pre>
+<div class="callout"><span class="ci"></span><p>In interviews, convert everything to tokens early. "Each support turn sends about 5K tokens and gets back 300" lets you estimate cost, latency and capacity in one breath, and tells the interviewer you think about LLMs as a metered resource.</p></div>
+
+<h2>How LLM inference works</h2>
+<p>A model call has two phases with very different performance profiles:</p>
+<figure class="dg" data-diagram="prefill-decode"></figure>
+<ul>
+<li><strong>Prefill</strong> processes the entire prompt in one parallel pass and produces the first output token. It's <em>compute-bound</em>: longer prompts take proportionally longer. Its duration (plus queueing) is the <strong>time to first token (TTFT)</strong>.</li>
+<li><strong>Decode</strong> generates the remaining tokens one at a time, each step reading all the model weights and the cached attention state. It's <em>memory-bandwidth-bound</em>: the GPU's arithmetic units mostly wait on memory. Its speed is <strong>time per output token (TPOT)</strong>, also called inter-token latency.</li>
+</ul>
+<p>Two consequences show up in every design. First, <strong>streaming</strong> is nearly free and hugely improves perceived latency: the user starts reading after TTFT instead of waiting for the whole answer. Second, <strong>output length dominates total latency</strong>. A 500-token answer at 50 tokens/s takes 10 seconds no matter how fast prefill was, which is why "be concise" in a system prompt is a latency optimization.</p>
+
+<h3>The KV cache</h3>
+<p>During decode, each new token attends to every previous token. Recomputing the keys and values for all previous tokens at every step would be wasteful, so the server keeps them in GPU memory: the <strong>KV cache</strong>. Its size per token is:</p>
+<pre><code>KV bytes per token = 2 (K and V) × layers × kv_heads × head_dim × bytes_per_value
+
+Llama 3 70B (80 layers, 8 KV heads, head_dim 128, FP16):
+  2 × 80 × 8 × 128 × 2 bytes = 327,680 bytes ≈ <span class="k">320 KB per token</span>
+Llama 3 8B (32 layers): ≈ <span class="k">128 KB per token</span></code></pre>
+<p>That number is the key to capacity questions. Every concurrent conversation holds its whole context in KV cache for as long as it's generating, so <strong>GPU memory, not compute, usually caps how many users one server can serve</strong>.</p>
+<div class="chart" data-chart="kv-capacity"><h5>Long contexts eat concurrency</h5><p class="sub">How many sequences fit in KV cache for Llama 3 70B (FP16 weights) on one 8×H100 80 GB server, after weights and ~10% overhead. ≈435 GB free ÷ 320 KB/token ≈ 1.33M cached tokens.</p></div>
+<details class="data"><summary>Show the numbers</summary><div class="tbl"><table><thead><tr><th>Context per sequence</th><th class="num">Concurrent sequences</th></tr></thead><tbody><tr><td>2K</td><td class="num">647</td></tr><tr><td>4K</td><td class="num">323</td></tr><tr><td>8K</td><td class="num">161</td></tr><tr><td>32K</td><td class="num">40</td></tr><tr><td>128K</td><td class="num">10</td></tr></tbody></table></div><p class="src">Computed: 8 × 80 GB × 0.9 − 141 GB weights ≈ 435 GB for KV. FP8 KV cache or quantized weights roughly double these numbers.</p></details>
+<p>This is why long-context features are expensive to serve, why providers charge more for very long prompts, and why techniques that shrink or share the KV cache (grouped-query attention, FP8 KV, prefix sharing, paging) matter so much.</p>
+
+<h3>Batching</h3>
+<p>Because decode is memory-bound, a GPU can generate tokens for many sequences in nearly the same time as for one: the weights are read once per step and shared across the batch. Batching is the single biggest lever on serving cost. There are three generations of it:</p>
+<figure class="dg" data-diagram="batching"></figure>
+<ul>
+<li><strong>Static batching:</strong> wait for N requests, run them together until all finish. Short requests wait for long ones; new arrivals wait for the whole batch.</li>
+<li><strong>Dynamic batching:</strong> form a batch when it's full <em>or</em> a timeout expires. Good for fixed-size work such as embeddings or classification.</li>
+<li><strong>Continuous (in-flight) batching:</strong> schedule at every decode step. Finished sequences leave immediately and waiting ones join, so the GPU stays full. This is standard in modern LLM servers.</li>
+</ul>
+<p>Batching trades per-user speed for total throughput. Bigger batches mean more tokens per second per GPU, but each step takes longer, so each user's stream slows down. The <a href="#design-inference-batching">Inference Batching breakdown</a> charts this curve.</p>
+<p>Memory management makes large batches possible. Older servers reserved a contiguous KV block for each request's maximum length, and the vLLM authors measured that only 20.4%–38.2% of KV memory held actual token state. Their <strong>PagedAttention</strong> stores the KV cache in fixed-size blocks, like virtual memory pages, achieving near-zero waste and 2–4× higher throughput than prior systems at the same latency (<a href="https://arxiv.org/abs/2309.06180">Kwon et al., SOSP 2023</a>).</p>
+
+<h3>Other serving optimizations worth naming</h3>
+<div class="tbl"><table>
+<thead><tr><th>Technique</th><th>What it does</th><th>What it buys</th></tr></thead>
+<tbody>
+<tr><td>Prefix (prompt) caching</td><td>Reuse the KV cache of a shared prompt prefix across requests</td><td>Lower TTFT and cost for long system prompts, documents, multi-turn chats</td></tr>
+<tr><td>Quantization (FP8, INT4)</td><td>Store weights and/or KV in fewer bits</td><td>Fits bigger models or more sequences per GPU; small quality risk</td></tr>
+<tr><td>Speculative decoding</td><td>A cheap draft (small model or extra heads) proposes several tokens; the big model verifies them in one pass</td><td>Lower per-user latency with identical output distribution</td></tr>
+<tr><td>Chunked prefill</td><td>Split long prompts into chunks interleaved with decode steps</td><td>Long prompts stop stalling everyone else's token stream</td></tr>
+<tr><td>Prefill/decode disaggregation</td><td>Run prefill and decode on separate GPU pools and ship the KV cache between them</td><td>Each phase gets hardware and batch sizes suited to it; steadier inter-token latency</td></tr>
+<tr><td>Tensor / pipeline / expert parallelism</td><td>Split one model across GPUs by layer slices, layer groups, or experts</td><td>Serve models larger than one GPU; trade-off is interconnect traffic</td></tr>
+</tbody></table></div>
+
+<h2>Context engineering</h2>
+<p>The context window is a budget, not a bucket. Everything you put in it costs money and latency, and models get worse at using information as contexts grow and fill with noise. Anthropic frames the job as finding the smallest set of high-signal tokens that gets the desired behavior (<a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">Effective context engineering for AI agents</a>). A typical context contains:</p>
+<figure class="dg" data-diagram="context-budget"></figure>
+<p>Techniques to keep it under control:</p>
+<ul>
+<li><strong>Truncation and windows:</strong> keep the last N turns verbatim.</li>
+<li><strong>Summarization / compaction:</strong> when history nears a threshold, replace older turns with a model-written summary of decisions and facts.</li>
+<li><strong>Just-in-time retrieval:</strong> give the model tools to fetch information when needed instead of pre-loading everything.</li>
+<li><strong>Structured notes:</strong> agents write progress notes or to-do lists to external storage and re-read them, so state survives beyond the window.</li>
+<li><strong>Sub-agents:</strong> delegate a deep exploration to a separate model call with a clean context that returns a short summary.</li>
+<li><strong>Stable prefix ordering:</strong> put static content (system prompt, tool definitions, documents) first and changing content last so prefix caching can hit.</li>
+</ul>
+
+<h2>Embeddings and vector search</h2>
+<p>An <strong>embedding model</strong> maps text to a fixed-length vector (commonly 384 to 3,072 dimensions) so that semantically similar texts land close together. Retrieval embeds the query and finds the nearest chunk vectors, usually by cosine similarity.</p>
+<p>Exact nearest-neighbor search over millions of vectors is too slow, so vector indexes use <strong>approximate nearest neighbor (ANN)</strong> structures:</p>
+<div class="tbl"><table>
+<thead><tr><th>Index</th><th>How it works</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><td>HNSW</td><td>Multi-layer proximity graph; search greedily hops toward the query</td><td>Fast and high recall; memory-hungry; the default in most vector DBs</td></tr>
+<tr><td>IVF</td><td>Cluster vectors; search only the nearest clusters</td><td>Less memory, tunable speed/recall via clusters probed</td></tr>
+<tr><td>Product quantization (PQ)</td><td>Compress vectors into short codes</td><td>Large memory savings, some recall loss; often combined with IVF</td></tr>
+<tr><td>Disk-based (DiskANN-style)</td><td>Graph on SSD with compressed vectors in RAM</td><td>Billion-scale on modest RAM, higher latency</td></tr>
+</tbody></table></div>
+<p>Two practical details interviewers probe: <strong>storage math</strong> (10M chunks × 1,024 dims × 4 bytes ≈ 41 GB of raw float32 vectors, before index overhead) and <strong>metadata filtering</strong>. Filtering by tenant, permissions or date after the ANN search can return too few results; filtering during the search (supported by most vector DBs) or partitioning by tenant avoids that. For a deeper treatment see Hello Interview's <a href="https://www.hellointerview.com/learn/system-design/deep-dives/vector-databases">vector databases deep dive</a>.</p>
+
+<h2>Retrieval-augmented generation (RAG)</h2>
+<p>RAG grounds the model in your data: retrieve relevant passages at query time and put them in the prompt with instructions to answer from them and cite them. It's the default way to give an LLM private, fresh or large knowledge, and the most common pattern behind interview prompts. The full architecture is in <a href="#common-patterns">Common Patterns</a>; here are the concepts you'll be asked about.</p>
+<h3>Chunking</h3>
+<p>Documents are split into chunks small enough to retrieve precisely but large enough to carry meaning. Common choices: fixed-size windows of a few hundred tokens with overlap; structure-aware splitting on headings, paragraphs or code functions; and parent-child chunking (retrieve small chunks, then pass their larger parent section to the model). Store source, section title, URL, version and access-control metadata with each chunk.</p>
+<h3>Hybrid search and reranking</h3>
+<p>Embeddings capture meaning but miss exact tokens: error codes, SKUs, names, rare terms. Keyword search (BM25) is the opposite. Production systems run both and merge results, often with <strong>reciprocal rank fusion</strong>. A <strong>reranker</strong> (a cross-encoder that reads the query and each candidate together) then re-scores the top 50–100 candidates far more accurately than vector similarity, and you pass only the best handful to the LLM.</p>
+<p>Anthropic's <strong>contextual retrieval</strong> adds one more step at ingestion time: an LLM writes a short sentence situating each chunk within its document ("This chunk is from ACME's Q2 2023 10-Q; revenue grew 3%…") before embedding and BM25 indexing. Their measurements show how the layers stack:</p>
+<div class="chart" data-chart="contextual-retrieval"><h5>Each retrieval layer removes failures</h5><p class="sub">Top-20 retrieval failure rate (1 − recall@20), averaged across Anthropic's test domains.</p></div>
+<p class="src">Source: <a href="https://www.anthropic.com/news/contextual-retrieval">Anthropic, Introducing Contextual Retrieval</a>. Anthropic also notes that for a knowledge base under ~200K tokens you can skip retrieval and put everything in the prompt, using prompt caching to keep it fast and cheap.</p>
+<h3>Other RAG concepts to know</h3>
+<ul>
+<li><strong>Query rewriting:</strong> turn "what about the second one?" into a standalone query using conversation history; split multi-part questions; generate a hypothetical answer to embed (HyDE).</li>
+<li><strong>Permission-aware retrieval:</strong> filter by the caller's ACLs inside the search, never after generation. A RAG system without this leaks documents.</li>
+<li><strong>Freshness:</strong> incremental re-indexing via change events (CDC, webhooks) rather than nightly full rebuilds; version chunks so citations point to what was actually used.</li>
+<li><strong>Abstention:</strong> if retrieval scores are low, say "I don't know" or hand off, rather than letting the model improvise.</li>
+<li><strong>Long context vs RAG:</strong> long windows don't remove the need for retrieval at scale. They make it cheaper to pass more, larger chunks.</li>
+</ul>
+
+<h2>Prompts and structured output</h2>
+<p>Treat prompts as code: version them in a registry, review changes, and roll them out behind the same eval gates as model changes. Keep a clear separation between <strong>trusted instructions</strong> (your system prompt) and <strong>untrusted content</strong> (user input, retrieved documents, tool results), for example with explicit delimiters, and never put secrets or authorization logic in a prompt.</p>
+<p>When code consumes model output, ask for <strong>structured output</strong>: JSON that conforms to a schema. Most providers and open-source servers support schema-constrained decoding, which guarantees parseable output. Validate the content anyway; a valid JSON object can still contain a wrong refund amount.</p>
+
+<h2>Tool use and agents</h2>
+<p>With <strong>tool use</strong> (function calling), you describe functions to the model; it responds with a structured request to call one; your code executes it and returns the result; the model continues. Loop that until the model produces a final answer and you have an <strong>agent</strong>.</p>
+<p>Anthropic distinguishes <strong>workflows</strong>, where LLM calls follow predefined code paths, from <strong>agents</strong>, where the model decides its own steps and tool calls. Workflows are more predictable and cheaper; agents handle open-ended tasks. Their advice, which interviewers like to hear: start with the simplest pattern that works and add autonomy only when it demonstrably helps (<a href="https://www.anthropic.com/engineering/building-effective-agents">Building effective agents</a>). The five workflow patterns are covered in <a href="#common-patterns">Common Patterns</a>.</p>
+<p>Agent-specific concerns to raise:</p>
+<ul>
+<li><strong>Budgets:</strong> cap steps, tokens, wall-clock time and cost per run. Agents can loop.</li>
+<li><strong>Tool design:</strong> few, clearly distinct tools with typed parameters and helpful error messages. If a human can't tell which tool to use, neither can the model.</li>
+<li><strong>Authorization lives in code:</strong> the executor checks permissions, validates arguments and requires confirmation for irreversible actions.</li>
+<li><strong>Durability:</strong> long runs need checkpoints so a crash doesn't restart a 40-step task.</li>
+<li><strong>Cost:</strong> Anthropic reported agents using about 4× the tokens of chat, and multi-agent systems about 15× (<a href="https://www.anthropic.com/engineering/built-multi-agent-research-system">How we built our multi-agent research system</a>).</li>
+</ul>
+<p>The <strong>Model Context Protocol (MCP)</strong> is the common standard for connecting models to tools and data sources. Its 2026-07-28 specification moved to a stateless request/response core so remote MCP servers can sit behind ordinary load balancers, and tightened authorization around OAuth 2.1 (<a href="https://claude.com/blog/bringing-mcp-2026-07-28-to-claude">Anthropic</a>, <a href="https://workos.com/blog/mcp-2026-spec-agent-authentication">WorkOS</a>).</p>
+
+<h2>Memory</h2>
+<p>LLMs are stateless; anything they "remember" is something you put back into the context. Design memory as layers:</p>
+<ul>
+<li><strong>Working memory:</strong> the current context window.</li>
+<li><strong>Conversation memory:</strong> stored messages plus a rolling summary, reloaded per turn.</li>
+<li><strong>Long-term memory:</strong> facts and preferences extracted from conversations, stored per user, retrieved by relevance. The hard parts are the write policy (what's worth remembering), updates and deletions (users must be able to see and remove memories), and privacy.</li>
+</ul>
+
+<h2>Caching</h2>
+<p>LLM calls are slow and expensive, so caching pays off, but the layers behave differently:</p>
+<div class="tbl"><table>
+<thead><tr><th>Layer</th><th>Key</th><th>Hit rate</th><th>Risk</th></tr></thead>
+<tbody>
+<tr><td>Exact response cache</td><td>Hash of normalized prompt + model + params</td><td>Low for chat, high for repeated batch prompts</td><td>Stale answers; must include tenant in key</td></tr>
+<tr><td>Semantic cache</td><td>Embedding similarity to past queries</td><td>Medium for FAQ-style traffic</td><td>Wrong answers for subtly different questions; needs a strict threshold and per-tenant scope</td></tr>
+<tr><td>Prompt / prefix cache</td><td>Exact token prefix (system prompt, documents, history)</td><td>High when prompts share a long stable prefix</td><td>Little; only invalidated by prefix changes</td></tr>
+<tr><td>Retrieval / embedding cache</td><td>Query or document hash</td><td>Medium</td><td>Staleness after re-indexing</td></tr>
+</tbody></table></div>
+<p>Provider prompt caching is the easiest big win. On Anthropic's API, for example, writing a prefix to the 5-minute cache costs 1.25× the base input price and each cache read costs 0.1× (lower on some newer models), so caching pays for itself after a single reuse (<a href="https://platform.claude.com/docs/en/about-claude/pricing">Claude pricing docs</a>). Other major providers offer similar discounts.</p>
+<div class="chart" data-chart="prompt-cache"><div class="legend"><span><i style="background:var(--series-2)"></i>No cache</span><span><i style="background:var(--series-1)"></i>Cached (1.25× write, 0.1× reads)</span></div><h5>A shared 20K-token prefix, cached vs not</h5><p class="sub">Cumulative input cost of the shared prefix only, at $3 per million input tokens, assuming every request lands within the cache lifetime.</p></div>
+<details class="data"><summary>Show the numbers</summary><div class="tbl"><table><thead><tr><th class="num">Requests</th><th class="num">No cache</th><th class="num">Cached</th></tr></thead><tbody><tr><td class="num">1</td><td class="num">$0.06</td><td class="num">$0.075</td></tr><tr><td class="num">2</td><td class="num">$0.12</td><td class="num">$0.081</td></tr><tr><td class="num">10</td><td class="num">$0.60</td><td class="num">$0.129</td></tr><tr><td class="num">100</td><td class="num">$6.00</td><td class="num">$0.669</td></tr></tbody></table></div></details>
+<p>For self-hosted models, the same idea appears as automatic prefix caching in the serving engine, plus <strong>cache-aware routing</strong>: send requests that share a prefix (same conversation, same document) to the replica that already holds it.</p>
+
+<h2>Model selection, routing and fallbacks</h2>
+<p>Not every request needs the biggest model. Common strategies:</p>
+<ul>
+<li><strong>Tiering by task:</strong> small, fast models for classification, extraction, query rewriting and summaries; frontier models for hard reasoning and final answers.</li>
+<li><strong>Routing:</strong> a classifier or rules pick the model per request, by difficulty, tenant plan, or latency budget.</li>
+<li><strong>Cascades:</strong> try the cheap model first; escalate when a confidence check or validator fails.</li>
+<li><strong>Reasoning effort:</strong> many models expose a thinking budget; spend it only where accuracy matters more than latency.</li>
+<li><strong>Fallbacks:</strong> on timeout, 429 or 5xx, fail over to another region, provider or model through the gateway, with circuit breakers so you don't hammer a struggling backend. Keep prompts portable enough to make this real.</li>
+<li><strong>Batch APIs:</strong> offline work (backfills, nightly evals, document enrichment) can use providers' asynchronous batch endpoints at a discount, commonly 50%.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<p>You can't unit-test a paragraph, so LLM systems need an evaluation practice. Interviewers treat a missing eval story as a major red flag. Cover both sides:</p>
+<h3>Offline evaluation (before you ship)</h3>
+<ul>
+<li><strong>Golden datasets:</strong> a few hundred representative inputs with expected answers or rubrics, grown from real failures. Run on every prompt, model or retrieval change as a regression gate.</li>
+<li><strong>Component metrics:</strong> for retrieval, recall@k, MRR, nDCG, and context precision/recall; for generation, faithfulness (is every claim supported by the context?) and answer relevance. <a href="https://docs.ragas.io/">Ragas</a> popularized LLM-judged versions of these.</li>
+<li><strong>LLM-as-judge:</strong> a strong model grades outputs against a rubric. It scales, but judges have known biases (position, verbosity, preferring their own outputs), so calibrate against human labels, use pairwise comparisons with swapped order, and keep rubrics specific.</li>
+<li><strong>Task-level checks:</strong> for agents and code, deterministic checks are best: did the tests pass, was the right record updated.</li>
+</ul>
+<h3>Online evaluation (after you ship)</h3>
+<ul>
+<li>User signals: thumbs, edits, copy events, follow-up rephrasing, escalation to a human, suggestion acceptance rate.</li>
+<li>Sampled LLM-judge scoring of production traces for faithfulness and policy compliance.</li>
+<li>A/B tests and canaries for prompt and model changes, watching quality, latency and cost together.</li>
+<li>Drift monitoring: input topics, retrieval score distributions, refusal rates.</li>
+</ul>
+<p>The loop that connects them (production failures become new golden examples) is the <a href="#common-patterns">eval flywheel</a>.</p>
+
+<h2>Guardrails and security</h2>
+<p>An LLM follows instructions wherever they appear, including inside a web page, email, PDF or tool result it was asked to read. That's <strong>prompt injection</strong>, and it is #1 on the <a href="https://genai.owasp.org/llm-top-10/">OWASP Top 10 for LLM Applications 2025</a>:</p>
+<div class="tbl"><table>
+<thead><tr><th>ID</th><th>Risk</th><th>Design response</th></tr></thead>
+<tbody>
+<tr><td>LLM01</td><td>Prompt Injection</td><td>Treat all non-system content as untrusted; least-privilege tools; confirmation for consequential actions</td></tr>
+<tr><td>LLM02</td><td>Sensitive Information Disclosure</td><td>Permission-aware retrieval, PII redaction, tenant isolation in caches and logs</td></tr>
+<tr><td>LLM03</td><td>Supply Chain</td><td>Vet models, datasets, plugins and MCP servers; pin versions</td></tr>
+<tr><td>LLM04</td><td>Data and Model Poisoning</td><td>Control what enters training data and retrieval indexes</td></tr>
+<tr><td>LLM05</td><td>Improper Output Handling</td><td>Never pass model output unescaped into SQL, shells, HTML or eval</td></tr>
+<tr><td>LLM06</td><td>Excessive Agency</td><td>Narrow tools, scoped credentials, human approval, rate limits on actions</td></tr>
+<tr><td>LLM07</td><td>System Prompt Leakage</td><td>Assume the system prompt is public; keep secrets and authz out of it</td></tr>
+<tr><td>LLM08</td><td>Vector and Embedding Weaknesses</td><td>ACLs on embeddings, per-tenant indexes or filters, validate ingested content</td></tr>
+<tr><td>LLM09</td><td>Misinformation</td><td>Grounding, citations, abstention, human review for high-stakes output</td></tr>
+<tr><td>LLM10</td><td>Unbounded Consumption</td><td>Token quotas, max output tokens, agent budgets, abuse detection</td></tr>
+</tbody></table></div>
+<p>No filter reliably stops injection, so design for <strong>blast-radius reduction</strong>: the model can only do what the current user could do, through narrow tools, with confirmation before anything irreversible, and with no ability to send data to arbitrary destinations. Add input and output classifiers (moderation, PII detection, jailbreak heuristics) as layers, not as the defense.</p>
+
+<h2>Fine-tuning vs RAG vs prompting</h2>
+<p>A favorite interview question. A good rule of thumb: <strong>retrieval for knowledge, fine-tuning for behavior</strong>.</p>
+<div class="tbl"><table>
+<thead><tr><th>Approach</th><th>Use when</th><th>Avoid when</th></tr></thead>
+<tbody>
+<tr><td>Prompting (+ few-shot)</td><td>Always first; cheap to iterate; instructions and examples fit in context</td><td>You need consistent style or format at scale and the prompt keeps growing</td></tr>
+<tr><td>RAG</td><td>Knowledge is private, large, changing, or needs citations and access control</td><td>The problem is reasoning or formatting, not missing facts</td></tr>
+<tr><td>Fine-tuning (often LoRA)</td><td>Consistent format, tone or domain behavior; distilling a big model into a small cheap one; latency-critical narrow tasks</td><td>Facts change often; you lack a few thousand quality examples; you can't run evals</td></tr>
+<tr><td>Pre-training / continued pre-training</td><td>Rarely in interviews: new languages or huge proprietary domains</td><td>Almost always</td></tr>
+</tbody></table></div>
+<p><strong>LoRA</strong> (low-rank adaptation) trains small adapter matrices instead of all the weights; many adapters can be served on one base model, which makes per-customer fine-tunes practical.</p>
+
+<h2>Streaming and real-time delivery</h2>
+<ul>
+<li><strong>Server-Sent Events (SSE)</strong> are the default for token streaming: one-way, plain HTTP, easy through proxies. Send typed events (deltas, tool status, citations, usage).</li>
+<li><strong>WebSockets</strong> when the client also streams (collaborative editing, interruptions); <strong>WebRTC</strong> for real-time voice.</li>
+<li><strong>Resumability:</strong> number events and persist generated text as it streams, so a dropped connection can reconnect with <code>Last-Event-ID</code> instead of regenerating.</li>
+<li><strong>Partial failure:</strong> once tokens are on screen you can't silently retry. Mark the message incomplete and offer "continue" or "regenerate."</li>
+<li><strong>Cancellation:</strong> propagate client disconnects to the model server to stop paying for tokens nobody reads.</li>
+</ul>
+
+<h2>Rate limiting and quotas</h2>
+<p>Request counts are a poor proxy when one request can be 100× another. Limit on <strong>tokens</strong> (per minute, per day) and <strong>concurrency</strong>, per user and per tenant. Since output length is unknown up front, <strong>reserve</strong> an estimate (input tokens + max_tokens) when admitting a request and <strong>reconcile</strong> with actual usage when it finishes. Add priority tiers so paying or interactive traffic is admitted before free or batch traffic when GPUs are saturated, and return <code>429</code> with <code>Retry-After</code> rather than queueing forever.</p>
+
+<h2>Numbers to know</h2>
+<p>Order-of-magnitude figures for back-of-envelope math. Check current provider docs for exact prices; these drift quickly.</p>
+<div class="tbl"><table>
+<thead><tr><th>Quantity</th><th>Rough value</th></tr></thead>
+<tbody>
+<tr><td>Tokens per English word</td><td>~1.3 (≈ 4 characters per token)</td></tr>
+<tr><td>Human reading speed</td><td>~4–5 words/s, so streaming faster than ~10 tokens/s already outpaces most readers</td></tr>
+<tr><td>Time to first token, hosted API</td><td>~0.2–2 s depending on model, prompt length and load</td></tr>
+<tr><td>Decode speed per stream</td><td>~30–150 tokens/s for typical hosted models; small models faster</td></tr>
+<tr><td>H100 SXM</td><td>80 GB HBM, ~3.35 TB/s memory bandwidth</td></tr>
+<tr><td>Weights in memory</td><td>~2 bytes/param at FP16/BF16, ~1 at FP8, ~0.5 at INT4 (70B ≈ 140 GB at FP16)</td></tr>
+<tr><td>KV cache per token</td><td>~128 KB (8B-class), ~320 KB (70B-class) at FP16</td></tr>
+<tr><td>Embedding call</td><td>~10–50 ms; vector search ~5–50 ms; reranking 50–100 docs ~50–200 ms</td></tr>
+<tr><td>Prompt cache read price</td><td>~0.1× base input on major APIs</td></tr>
+<tr><td>Output vs input price</td><td>Output commonly 4–5× input per token</td></tr>
+<tr><td>Agent token usage</td><td>~4× chat; multi-agent ~15× (Anthropic)</td></tr>
+</tbody></table></div>
+</section>

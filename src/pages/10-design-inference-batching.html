@@ -1,0 +1,100 @@
+<section class="page" id="p-design-inference-batching" data-title="Inference Batching Service" data-kw="anthropic inference batching gpu batch queue futures correlation id failover partial batch failure overload backpressure continuous batching throughput latency">
+<div class="banner" style="--banner:#e8907a" data-bt="Inference Batching" data-bs="worked example · infrastructure"></div>
+<p class="eyebrow">Question Breakdown · Hard</p>
+<h1>Design an Inference Batching Service</h1>
+<p class="lead">Batch synchronous inference requests onto GPUs and route every result back to the right caller. Candidates report this as the most common Anthropic system design prompt, in several variants (<a href="https://www.aced.io/blog/anthropic-system-design-interview">Exponent</a>, <a href="https://prachub.com/interview-questions/design-a-batched-llm-inference-service-assuming-each-batch-takes-100-ms">PracHub</a>).</p>
+<hr class="sep">
+
+<h2>Understanding the Problem</h2>
+<p>We run a model on a fleet of GPUs. A GPU processes a <strong>batch of up to 100 inputs</strong> in one pass, and a pass takes roughly <strong>100 ms regardless of how many inputs are in it</strong>. Callers hit a synchronous API: they send one input and wait for its output. Design the system that accepts requests, forms batches, runs them, and returns each result to the caller who's waiting for it.</p>
+<div class="callout"><span class="ci"></span><p>Interviewers use AI vocabulary here, but they're testing classic infrastructure: queues, batching, request/response correlation, load balancing, failure handling and backpressure. Say so early: "The model is a black box that takes up to 100 inputs and 100 ms. This is a batching queue with a fan-in/fan-out correlation problem." That framing is the abstraction signal they look for.</p></div>
+
+<h3>Functional Requirements</h3>
+<ol>
+<li>Clients should be able to submit a single input and synchronously receive its output.</li>
+<li>The system should group requests into batches of up to 100 and run them on available GPUs.</li>
+<li>Each output should be returned to exactly the caller that submitted the input.</li>
+</ol>
+<p><strong>Below the line:</strong> model loading and versioning, multi-model routing, streaming outputs (we'll revisit for LLMs at the end), billing.</p>
+
+<h3>Non-Functional Requirements</h3>
+<ol>
+<li><strong>Latency:</strong> p99 end-to-end under ~300 ms at normal load.</li>
+<li><strong>Throughput / efficiency:</strong> keep GPUs busy; batch as full as latency allows.</li>
+<li><strong>Scale:</strong> 10K requests/s peak.</li>
+<li><strong>Fault tolerance:</strong> GPU, worker or server failures shouldn't lose requests silently; one bad input shouldn't fail 99 others.</li>
+<li><strong>Graceful overload:</strong> above capacity, reject fast instead of letting latency explode.</li>
+</ol>
+
+<h3>Capacity estimation</h3>
+<pre><code>One GPU at full batches: 100 inputs / 100 ms = 1,000 req/s
+Peak 10K req/s → 10 GPUs at 100% utilization
+Target ~60–70% utilization + N+2 for failures → <span class="k">~16–18 GPUs</span>
+Latency floor: 100 ms compute + queue wait + network ≈ 120–200 ms</code></pre>
+
+<h2>The Set Up</h2>
+<h3>Core Entities</h3>
+<ul>
+<li><strong>InferenceRequest</strong>: requestId, input, deadline, origin server, priority.</li>
+<li><strong>Batch</strong>: batchId, request IDs, GPU worker, status, lease expiry.</li>
+<li><strong>Result</strong>: requestId, output or error.</li>
+<li><strong>Worker</strong>: GPU worker ID, health, current batch.</li>
+</ul>
+<h3>API</h3>
+<pre><code>POST /v1/infer
+  headers: Idempotency-Key, X-Deadline-Ms (optional)
+  body:    { input }
+  → 200 { output }    | 429 { retryAfterMs }   | 504 deadline exceeded</code></pre>
+
+<h2>High-Level Design</h2>
+<h3>1) Accept a request and hold the caller</h3>
+<p>Stateless <strong>API servers</strong> behind a load balancer accept the request, assign a <code>requestId</code>, and register a pending future in an in-memory map <code>requestId → future</code>. The HTTP handler awaits that future (with the request's deadline as a timeout). Thousands of waiting requests per server are cheap with async I/O.</p>
+<h3>2) Form batches and run them on GPUs</h3>
+<p>API servers push requests onto a <strong>request queue</strong>. Each <strong>GPU worker</strong> runs a small batcher loop: when its GPU is free, it pulls up to 100 requests from the queue, runs the batch, and emits results. Pull-based workers give us load balancing for free: a GPU only takes work when it has capacity, which answers the interviewer's favorite probe, "how do you find a GPU with spare capacity?"</p>
+<h3>3) Return each result to the right caller</h3>
+<p>Each request carries its <code>originServer</code>. The worker publishes results to that server's <strong>reply channel</strong>. The API server's listener looks up <code>requestId</code> in its map, completes the future, and the handler returns the response.</p>
+<figure class="dg" data-diagram="batch-hld"></figure>
+
+<h2>Potential Deep Dives</h2>
+<h3>1) When should a batch be dispatched?</h3>
+<p>This is the core trade-off: bigger batches are more efficient, but waiting to fill them adds latency.</p>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Wait until 100 requests arrive</h5><p><span class="lbl">Challenges:</span> at low traffic, a request can wait indefinitely. At 50 req/s a batch takes two seconds just to fill.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Size-or-timeout</h5><p><span class="lbl">Approach:</span> dispatch when the batch hits 100 or the oldest request has waited, say, 20 ms. Worst-case added latency is bounded by the timeout.</p><p><span class="lbl">Challenges:</span> a fixed timeout is wrong at both extremes: at low load it adds pointless delay to an idle GPU; at high load batches fill instantly anyway.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Work-conserving, deadline-aware batching</h5><p><span class="lbl">Approach:</span> since a pass costs ~100 ms regardless of size, an idle GPU should start immediately with whatever is queued (up to 100). While a GPU is busy, new arrivals accumulate on their own, so the 100 ms pass <em>is</em> the batching window. Under heavy load batches are naturally full; under light load nobody waits. Order the queue by deadline, drop requests whose deadline has already passed before spending GPU time on them, and only add a short wait when the queue is tiny and a partially full batch would waste a scarce GPU (rarely worth it when compute cost is flat).</p><p><span class="lbl">Challenges:</span> if pass time grows with batch size (as it does for many models), the optimal policy shifts toward bounded waits; measure the pass-time curve and tune.</p></div>
+
+<h3>2) How do results find their way back?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Write results to a database and poll</h5><p><span class="lbl">Challenges:</span> polling adds latency (half the poll interval on average) and a database write and read per inference for no durability benefit.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Per-server reply queues with correlation IDs</h5><p><span class="lbl">Approach:</span> each API server subscribes to its own reply topic; workers publish <code>{requestId, output}</code> there; the server completes the matching future.</p><p><span class="lbl">Challenges:</span> one broker hop each way; if an API server dies, its pending callers' connections die with it and results go nowhere.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Direct streams, deadlines and idempotent retries</h5><p><span class="lbl">Approach:</span> API servers hold long-lived bidirectional gRPC streams to the batch workers (or to a thin dispatcher in front of them). Requests flow down the stream; results come back on the same stream, so routing is implicit and there's no extra broker hop. Every request carries a deadline; servers time out futures and send a cancel so workers skip expired work. If an API server crashes, clients retry with the same <code>Idempotency-Key</code>; workers keep a short-lived result cache by key so a retry that arrives after the original finished is served without recomputing.</p><p><span class="lbl">Challenges:</span> stream management (reconnects, flow control) is more complex than a queue; keep a queue as the buffer for bursts if needed.</p></div>
+
+<h3>3) What happens when GPUs fail or a batch partially fails?</h3>
+<ul>
+<li><strong>Worker crash mid-batch:</strong> workers take batches under a lease (visibility timeout). If the lease expires without results, the requests return to the queue, unless their deadlines have passed. Inference is a pure function of the input, so at-least-once execution is safe; results are de-duplicated by request ID.</li>
+<li><strong>Hung GPU:</strong> a per-batch watchdog (for example 3× the expected pass time) marks the worker unhealthy, re-queues its batch and drains it from rotation.</li>
+<li><strong>Poison input:</strong> one malformed or oversized input can crash the whole batch. Validate size and shape at the API server. If a batch still fails, split it in half and retry each half to isolate the bad request in log₂(100) ≈ 7 rounds; return an error to that caller only.</li>
+<li><strong>Zone failure:</strong> spread workers across zones; queue and API tier are multi-zone; capacity plan for N+2.</li>
+</ul>
+
+<h3>4) What happens above capacity?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Let the queue grow</h5><p><span class="lbl">Challenges:</span> latency grows without bound, callers time out, then retry, so the queue fills with requests nobody is waiting for. The GPUs spend their time on dead work.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Admission control and load shedding by deadline</h5><p><span class="lbl">Approach:</span> estimate wait at admission (<code>queue_depth ÷ fleet_throughput</code>); if it exceeds the request's deadline, reject immediately with 429 and a Retry-After. Bound the queue. Use separate priority queues so interactive traffic preempts batch traffic. Drop expired requests at dequeue. Autoscale on queue depth and wait time, accepting that GPUs take minutes to add. Clients retry with jittered exponential backoff.</p></div>
+
+<h3>5) Follow-up: what changes for an autoregressive LLM?</h3>
+<p>Interviewers often end with "now make it an LLM." Three things change:</p>
+<ol>
+<li><strong>Work is variable-length.</strong> One request generates 10 tokens, another 2,000. A fixed batch holds GPU slots until its longest member finishes, so you move to <strong>continuous batching</strong>: schedule per decode step, admit new sequences as others finish (see <a href="#core-concepts">Core Concepts</a>).</li>
+<li><strong>Memory, not batch size, becomes the limit.</strong> Each active sequence holds its KV cache. Admission control now asks "is there KV memory for this prompt plus its max output?" and the scheduler may preempt and recompute or swap sequences under pressure.</li>
+<li><strong>Latency splits into TTFT and per-token speed,</strong> and batch size trades one user's speed for aggregate throughput:</li>
+</ol>
+<div class="chart" data-chart="batch-curve"><h5>Bigger decode batches: more tokens per GPU, slower tokens per user</h5><p class="sub">Illustrative roofline model for an 8B model at FP16 on one H100 (3.35 TB/s), ~2K tokens of context per sequence. Step time ≈ 4.8 ms to read weights + ~0.1 ms per sequence for its KV cache and compute.</p></div>
+<details class="data"><summary>Show the numbers</summary><div class="tbl"><table><thead><tr><th class="num">Batch size</th><th class="num">Step time (ms)</th><th class="num">Aggregate tok/s</th><th class="num">Per-user tok/s</th></tr></thead><tbody>
+<tr><td class="num">1</td><td class="num">4.9</td><td class="num">205</td><td class="num">205</td></tr><tr><td class="num">16</td><td class="num">6.4</td><td class="num">2,491</td><td class="num">156</td></tr><tr><td class="num">64</td><td class="num">11.4</td><td class="num">5,630</td><td class="num">88</td></tr><tr><td class="num">128</td><td class="num">18.0</td><td class="num">7,128</td><td class="num">56</td></tr><tr><td class="num">256</td><td class="num">31.1</td><td class="num">8,221</td><td class="num">32</td></tr></tbody></table></div><p class="src">A simplified model for intuition; real engines add kernel overheads, attention scaling with context, and scheduling costs.</p></details>
+<p>The right operating point is set by your per-user speed SLO: if users need at least ~50 tokens/s, you cap the batch around 128 in this model. Prefill also competes with decode for the same GPU, which is why engines use chunked prefill and large deployments split prefill and decode onto separate pools.</p>
+
+<h2>What is Expected at Each Level?</h2>
+<div class="levels">
+<div><h4>Mid-level</h4>Queue + batcher with size-or-timeout, request IDs to route results back, horizontal scaling of API servers and GPU workers. Handles basic retries when prompted.</div>
+<div><h4>Senior</h4>Abstracts the problem quickly, derives GPU count from the numbers, explains pull-based dispatch, leases and re-queueing, partial-failure isolation, and deadline-based admission control without being led.</div>
+<div><h4>Staff+</h4>Drives a near-silent interview: work-conserving batching from first principles, end-to-end deadline propagation and cancellation, idempotent retries, overload economics, and a crisp answer to "now it's an LLM" covering continuous batching, KV memory admission and the throughput-latency curve.</div>
+</div>
+</section>

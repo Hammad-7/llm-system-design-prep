@@ -1,0 +1,141 @@
+<section class="page" id="p-design-chatgpt" data-title="Design ChatGPT" data-kw="chatgpt claude chat service conversation streaming sse history context window admission control gpu capacity rate limiting">
+<div class="banner" style="--banner:#f2a65a" data-bt="Design ChatGPT" data-bs="worked example · LLM product"></div>
+<p class="eyebrow">Question Breakdown · Medium</p>
+<h1>Design ChatGPT</h1>
+<p class="lead">A consumer chat assistant serving a frontier LLM to a very large user base. Reported at OpenAI and Anthropic (as "Design the Claude chat service") and widely used elsewhere.</p>
+<hr class="sep">
+
+<h2>Understanding the Problem</h2>
+<p>ChatGPT-style assistants let users hold multi-turn conversations with an LLM, see responses stream in token by token, return to past conversations, and choose between model tiers. Under the chat-app surface, the interesting problems are streaming reliability, managing ever-growing conversations against a finite context window, and admitting traffic to a scarce, expensive GPU fleet fairly.</p>
+
+<h3>Functional Requirements</h3>
+<p><strong>Core requirements</strong></p>
+<ol>
+<li>Users should be able to send a message in a conversation and receive the model's response streamed in real time.</li>
+<li>Users should be able to view their conversation list and continue any past conversation.</li>
+<li>Users should be able to choose a model tier (for example a fast default and a slower, stronger model), subject to their plan's limits.</li>
+</ol>
+<p><strong>Below the line (out of scope)</strong></p>
+<ul><li>File uploads, image generation, voice, web browsing and tools</li><li>Long-term memory across conversations</li><li>Sharing conversations, team workspaces</li><li>Training or fine-tuning the model</li></ul>
+
+<h3>Non-Functional Requirements</h3>
+<ol>
+<li><strong>Low perceived latency:</strong> time to first token under ~1 s at p95 for the default model under normal load; streaming at reading speed or faster.</li>
+<li><strong>High availability:</strong> 99.9%+ for chat; when GPUs are saturated, degrade (queue briefly, fall back to a smaller model, or return a clear retry) rather than fail opaquely.</li>
+<li><strong>Scale:</strong> ~100M daily active users, ~1B messages/day.</li>
+<li><strong>Durability:</strong> conversations are never lost once the response completes; partial responses survive disconnects.</li>
+<li><strong>Fairness and abuse resistance:</strong> per-user and per-plan limits; one heavy user can't starve others. Safety moderation on inputs and outputs.</li>
+</ol>
+
+<div class="callout"><span class="ci"></span><p>Notice what we didn't say: strong consistency. A conversation is written by one user from one device at a time, so per-conversation ordering is enough. That lets us choose a horizontally scalable store partitioned by conversation.</p></div>
+
+<h3>Capacity estimation</h3>
+<p>One quick pass tells us the GPU fleet is the dominant cost and design constraint:</p>
+<pre><code>1B messages/day                      ≈ 11.6K/s avg, ~35K/s peak (3×)
+Output: ~500 tokens/message          ≈ 5.8M output tokens/s avg
+Input per call: ~3K tokens (history + system prompt), mostly prefix-cacheable
+<span class="c"># Assume ~10K output tokens/s per 8-GPU node at interactive speeds (stated assumption)</span>
+5.8M / 10K ≈ 580 nodes avg  → ~1,700 nodes at peak ≈ <span class="k">~14K GPUs</span> for one model tier
+Storage: 1B messages × ~2 KB ≈ 2 TB/day of conversation text</code></pre>
+<p>The storage is ordinary; the GPU number is not. Every deep dive that saves GPU time (prefix caching, smart context trimming, admission control) pays for itself.</p>
+
+<h2>The Set Up</h2>
+<h3>Core Entities</h3>
+<ul>
+<li><strong>User</strong>: plan (free, plus, team), quotas.</li>
+<li><strong>Conversation</strong>: owner, title, model tier, created/updated time, optional rolling summary.</li>
+<li><strong>Message</strong>: conversation ID, sequence number, role (user/assistant), content, status (streaming, complete, incomplete, blocked), token counts, model version.</li>
+<li><strong>Quota</strong>: per-user token and message budgets per window.</li>
+</ul>
+
+<h3>API</h3>
+<pre><code>POST /conversations                                → 201 { conversationId }
+GET  /conversations?cursor=                        → [{ conversationId, title, updatedAt }]
+GET  /conversations/{id}/messages?cursor=          → [Message]
+POST /conversations/{id}/messages                  <span class="c">// returns text/event-stream</span>
+     { content, modelTier, clientMessageId }
+     event: message_start  { messageId, seq }
+     event: delta          { text }          <span class="c">// id: &lt;n&gt; on every event for resume</span>
+     event: message_stop   { status, usage }
+GET  /messages/{messageId}/stream                  <span class="c">// resume with Last-Event-ID</span></code></pre>
+<p>The user comes from the auth token. <code>clientMessageId</code> makes the send idempotent: a retried POST after a network blip returns the existing stream instead of creating a second turn.</p>
+
+<h2>High-Level Design</h2>
+<h3>1) Users can send a message and receive a streamed response</h3>
+<p>Start simple. The client opens an SSE request to a stateless <strong>Chat Service</strong>, which loads recent messages, builds the prompt (system prompt + history + new message), and calls the model through an <strong>LLM Gateway</strong>. The gateway picks a healthy <strong>inference pool</strong> for the requested tier. Tokens stream back through the gateway and the Chat Service to the client.</p>
+<figure class="dg" data-diagram="chatgpt-1"></figure>
+<p>When generation finishes, the Chat Service writes both the user message and the assistant message. Input moderation runs in parallel with prompt assembly; output moderation runs on streamed chunks.</p>
+
+<h3>2) Users can view and continue past conversations</h3>
+<p>Conversations and messages go in a <strong>Conversation Store</strong>. The access patterns are simple: "messages of conversation X in order" and "conversations of user Y, most recent first." A wide-column store such as Cassandra or DynamoDB fits: partition messages by <code>conversationId</code>, sort by <code>seq</code>; keep a second table partitioned by <code>userId</code>, sorted by <code>updatedAt</code>. Postgres sharded by user also works at smaller scale. Conversation titles are generated asynchronously by a small model after the first exchange.</p>
+
+<h3>3) Users can choose a model tier</h3>
+<p>The client sends a tier, not a model name. The gateway maps tier → model version → inference pool, and enforces the user's plan: token quotas per window, concurrency caps, and which tiers they can use. Each tier has its own GPU pool because models have different hardware footprints. Pinning the model version on each message lets us debug and evaluate later.</p>
+<figure class="dg" data-diagram="chatgpt-final"></figure>
+
+<h2>Potential Deep Dives</h2>
+<h3>1) How do we make streaming reliable when connections drop?</h3>
+<p>Mobile users switch networks; laptops sleep; load balancers recycle connections. A 30-second generation will regularly outlive the connection that started it.</p>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Generate, then return the whole response</h5>
+<p><span class="lbl">Approach:</span> the Chat Service waits for the full completion and returns it in one HTTP response.</p>
+<p><span class="lbl">Challenges:</span> users stare at a spinner for the full generation time, and any disconnect throws the whole response away after we've paid for it.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Proxy the token stream over SSE</h5>
+<p><span class="lbl">Approach:</span> the Chat Service relays tokens from the gateway to the client as SSE events and persists the final message.</p>
+<p><span class="lbl">Challenges:</span> generation is tied to one connection on one server. If the client drops, either generation is cancelled (wasted work, lost answer) or it finishes with nobody to receive it. Reconnecting to a different server has no way to pick up the stream.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Decouple generation from delivery with a resumable stream buffer</h5>
+<p><span class="lbl">Approach:</span> a generation worker owns the model call and appends sequence-numbered deltas to a short-lived buffer keyed by message ID (for example a Redis stream with a TTL of a few minutes), periodically checkpointing the partial text to the Conversation Store. Any Chat Service instance can serve the SSE connection by reading from the buffer. On reconnect, the client sends <code>Last-Event-ID</code> and the server replays from there. If no client is attached for a while, the worker can finish and store the answer (so it appears when the user returns) or cancel to save GPU time, depending on product choice. The message's status field (streaming, complete, incomplete) tells every device what to render.</p>
+<p><span class="lbl">Challenges:</span> one extra hop adds a few milliseconds per token; buffer memory must be bounded; cancellation must propagate to the inference server to actually free the GPU slot.</p></div>
+<figure class="dg" data-diagram="streaming"></figure>
+
+<h3>2) How do we handle conversations longer than the context window?</h3>
+<p>Every turn re-sends the conversation. Long chats get slow and expensive long before they hit the hard context limit, and quality drops as the context fills with stale detail.</p>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Send the full history every time</h5>
+<p><span class="lbl">Approach:</span> concatenate all messages into the prompt.</p>
+<p><span class="lbl">Challenges:</span> cost and TTFT grow linearly with conversation length, KV-cache memory per sequence grows with it (fewer concurrent users per GPU), and the request eventually fails at the context limit.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Sliding window with a token budget</h5>
+<p><span class="lbl">Approach:</span> keep the system prompt and as many recent turns as fit in a budget (say 8K tokens), counted with the model's tokenizer.</p>
+<p><span class="lbl">Challenges:</span> the model forgets early facts ("my name is…", the original task). Users notice.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Rolling summary + recent window + prefix-cache-friendly layout</h5>
+<p><span class="lbl">Approach:</span> when history exceeds a threshold, a small model compacts older turns into a running summary stored on the conversation (decisions, facts, open questions). The prompt is: stable system prompt → summary → last N turns verbatim → new message. Optionally embed old turns and retrieve the few relevant ones. Because the prefix (system prompt + summary + earlier turns) is identical on the next turn, prompt caching and cache-aware routing (send a conversation's turns to the replica holding its KV cache) cut TTFT and cost substantially.</p>
+<p><span class="lbl">Challenges:</span> summaries lose detail and can drift; regenerate them from source occasionally. Summarization is extra LLM spend, so trigger it on thresholds rather than every turn.</p></div>
+
+<h3>3) How do we admit traffic to a scarce GPU fleet fairly?</h3>
+<p>GPU capacity can't scale up in seconds the way stateless web servers can; new nodes take minutes to provision and load weights. A viral moment or an outage in one region can push demand far above capacity.</p>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Unbounded queue plus autoscaling</h5>
+<p><span class="lbl">Approach:</span> queue every request and let the autoscaler add GPUs.</p>
+<p><span class="lbl">Challenges:</span> queues grow faster than capacity arrives; everyone's TTFT climbs to tens of seconds, clients time out and retry, adding more load. Heavy users dominate.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Per-user token rate limits and fast rejection</h5>
+<p><span class="lbl">Approach:</span> token-bucket limits per user and plan at the gateway (on estimated input + max output tokens); return 429 with Retry-After when exceeded; cap queue wait time.</p>
+<p><span class="lbl">Challenges:</span> protects against individuals but not against aggregate overload; doesn't distinguish paying from free traffic when the whole fleet is saturated.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Capacity-aware admission control with priorities and graceful degradation</h5>
+<p><span class="lbl">Approach:</span> the gateway tracks real-time capacity signals from each pool (queue depth, KV-cache utilization, observed TTFT). Requests carry a priority class (paid interactive, free interactive, background). When utilization crosses thresholds: shed background work first, then route free-tier traffic to a smaller model or show a "high demand" notice, while paid traffic keeps its SLO. Token quotas reserve estimated tokens on admission and reconcile on completion. Routing is load- and cache-aware rather than round-robin, and autoscaling keys on queue depth and KV utilization with warm spare capacity, since cold starts are slow.</p>
+<p><span class="lbl">Challenges:</span> priority policies are product decisions; communicate degradation clearly in the UI. Smaller-model fallbacks need their own eval coverage.</p></div>
+
+<p>It's worth showing where the time goes on a single request. Prefill sets the first-token time, but decoding the answer dominates the total:</p>
+<div class="chart" data-chart="latency-budget"><div class="legend"><span><i style="background:var(--series-2)"></i>Time to first token</span><span><i style="background:var(--series-1)"></i>Other steps</span></div><h5>Illustrative latency budget for one chat turn</h5><p class="sub">An illustrative budget, not measured data: ~3K input tokens, 400 output tokens at ~70 tokens/s. Guardrails and persistence overlap with generation rather than adding to it.</p></div>
+<details class="data"><summary>Show the numbers</summary><div class="tbl"><table><thead><tr><th>Step</th><th class="num">Start (ms)</th><th class="num">End (ms)</th></tr></thead><tbody>
+<tr><td>Auth + rate limit</td><td class="num">0</td><td class="num">8</td></tr><tr><td>Input guardrail (parallel)</td><td class="num">8</td><td class="num">40</td></tr><tr><td>Load history + memory</td><td class="num">8</td><td class="num">30</td></tr><tr><td>Retrieval (if needed)</td><td class="num">40</td><td class="num">160</td></tr><tr><td>Queue + prefill</td><td class="num">160</td><td class="num">550</td></tr><tr><td>Decode 400 tokens</td><td class="num">550</td><td class="num">6,250</td></tr><tr><td>Output guard (chunked)</td><td class="num">600</td><td class="num">6,300</td></tr><tr><td>Persist + trace</td><td class="num">6,250</td><td class="num">6,290</td></tr></tbody></table></div></details>
+
+<h3>4) How do we keep conversation history fast at this scale?</h3>
+<p>Writes are ~2 per message (user + assistant) at tens of thousands per second; reads happen on every turn (load context) and when opening the app (list conversations).</p>
+<ul>
+<li>Partition messages by <code>conversationId</code> with <code>seq</code> as the sort key; a conversation is small and hot only while active, so partitions stay balanced.</li>
+<li>Cache the active conversation's recent turns and summary in Redis for the duration of the session; the Chat Service reads the cache first.</li>
+<li>Assign <code>seq</code> in the Chat Service with a conditional write (only if <code>seq</code> doesn't exist) to prevent two devices from interleaving turns.</li>
+<li>Archive old conversations to cheaper storage; search over history is a separate index built asynchronously.</li>
+</ul>
+
+<h3>5) How do we handle safety without adding latency?</h3>
+<ul>
+<li>Input moderation runs in parallel with history loading and prompt assembly; if it flags, cancel the model call before tokens stream.</li>
+<li>Output moderation runs on sentence- or paragraph-sized chunks as they stream; a violation stops generation and replaces the message with a notice (status = blocked).</li>
+<li>Abuse signals (rate of flagged inputs, automation patterns) feed per-account limits.</li>
+</ul>
+
+<h2>What is Expected at Each Level?</h2>
+<div class="levels">
+<div><h4>Mid-level</h4>A clear working design: SSE streaming, a conversation store with a sensible key, a gateway or service that calls the model. With prompting, discusses context trimming and basic per-user rate limits.</div>
+<div><h4>Senior</h4>Drives two or three deep dives without prompting. Explains why generation must be decoupled from the connection, proposes summary + window + prefix caching with reasons, and quantifies GPU needs to motivate admission control.</div>
+<div><h4>Staff+</h4>Frames the system around GPU economics: capacity-aware admission with priority classes, cache-aware routing, multi-region capacity and failover, model version rollouts with eval gates, and the product trade-offs of degradation.</div>
+</div>
+</section>
