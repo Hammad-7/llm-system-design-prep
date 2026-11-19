@@ -1,0 +1,161 @@
+<section class="page" id="p-design-doc-extraction" data-title="Document Extraction Pipeline" data-kw="document ai extraction ocr vision llm payslip id passport invoice bank statement kyc underwriting structured output json schema validation consistency human review queue confidence idempotency retries dead letter batch api fallback pii gdpr retention audit field accuracy">
+<div class="banner" style="--banner:#d7b45a" data-bt="Doc Extraction" data-bs="worked example · document AI"></div>
+<p class="eyebrow">Question Breakdown · Medium</p>
+<h1>Design a Document Extraction Pipeline</h1>
+<p class="lead">A pipeline that ingests uploaded documents (payslips, IDs, bank statements, invoices), extracts structured fields with vision LLMs, flags inconsistencies across documents, and routes uncertain cases to human reviewers. Based on the reported prompt "process 10K monthly uploads and flag inconsistencies."</p>
+<hr class="sep">
+
+<h2>Understanding the Problem</h2>
+<p>A lender, a rental platform or an HR onboarding product asks applicants to upload proof: an ID, three recent payslips, a bank statement. Today staff read each one and type numbers into a form. The product wants this automated: extract the fields, check that the documents agree with each other and with what the applicant declared, and only send a person the cases that actually need judgment.</p>
+<p>This is the most common "LLMs in the enterprise" shape, and a favorite with founding-engineer and solutions-engineer interviews because it tests whether you know <strong>where the model ends and deterministic code begins</strong>. The LLM reads messy documents; code validates, reconciles and decides. The interesting problems are trust (when can we skip the human?), reliability (no document lost, no double processing, provider outages), compliance (these are some of the most sensitive documents people own) and cost per document.</p>
+
+<h3>Functional Requirements</h3>
+<ol>
+<li>Users should be able to upload documents (PDFs and photos) attached to a case, such as a loan application.</li>
+<li>The system should classify each document and extract a typed set of fields per document type (for a payslip: employer, employee name, pay period, gross pay, deductions, net pay).</li>
+<li>The system should flag inconsistencies within a document (net ≠ gross − deductions), across documents (name on payslip ≠ name on ID), and against declared data (declared income vs payslips).</li>
+<li>Reviewers should be able to see flagged cases with the source image and highlighted fields, correct values, and approve or reject.</li>
+<li>Client systems should be able to get results through an API and webhooks.</li>
+</ol>
+<p><strong>Below the line:</strong> forgery and image-tampering detection as a full product (we'll mention signals), credit decisioning, training custom OCR models.</p>
+
+<h3>Non-Functional Requirements</h3>
+<ol>
+<li><strong>Scale:</strong> 10K documents/month today, designed for 1M/month (≈ 0.4 docs/s average, ~2 docs/s at peak).</li>
+<li><strong>Latency:</strong> results within a few minutes (p95 &lt; 5 min) for applicants waiting in a flow; overnight is fine for backfills.</li>
+<li><strong>Accuracy:</strong> auto-accepted fields must be right ≥ 99% of the time (precision matters more than coverage); inconsistency flags should have high recall, since a missed mismatch costs more than a false alarm.</li>
+<li><strong>Durability:</strong> no uploaded document is lost, and each is processed exactly once in effect (no duplicate results or double-billed reviews).</li>
+<li><strong>Security and compliance:</strong> encryption, least-privilege access, audit trails, retention limits, data residency, deletion on request.</li>
+</ol>
+<div class="callout"><span class="ci"></span><p>10K documents a month is about 14 per hour. Say so: "At this volume a single worker could do it; I'll design for 100× because the hard parts here are correctness, trust and compliance, not throughput." Interviewers reward candidates who don't over-scale small numbers and who spend their time where the risk is.</p></div>
+
+<h2>The Set Up</h2>
+<h3>Core Entities</h3>
+<ul>
+<li><strong>Case</strong>: the unit of decision (an application), with declared data (name, income, address) and status.</li>
+<li><strong>Document</strong>: blob key, content hash, MIME type, page count, detected type, processing state.</li>
+<li><strong>Extraction</strong>: per document, versioned: field values, per-field confidence, source location (page, bounding box or quoted text), model and prompt version.</li>
+<li><strong>Finding</strong>: a rule result: rule ID, severity, documents and fields involved, explanation.</li>
+<li><strong>Review task</strong>: assigned reviewer, decisions, corrections (which become labels), timestamps.</li>
+</ul>
+
+<h3>API</h3>
+<pre><code>POST /cases                         { declared: {...} }                 → { caseId }
+POST /cases/{id}/documents          { filename, contentType, sha256 }   → { documentId, uploadUrl }  <span class="c">// presigned PUT, ~5 min TTL</span>
+POST /documents/{id}/complete                                           → 202  <span class="c">// client confirms upload; enqueues processing</span>
+GET  /cases/{id}                    → { status, documents[], extractions[], findings[] }
+POST /webhooks                      { url, events: ["case.completed", "case.needs_review"] }
+
+<span class="c">// Reviewer tool</span>
+GET  /review/tasks?queue=…          → next task (leased for 15 min)
+POST /review/tasks/{id}/decision    { corrections: {...}, outcome: "approve" | "reject" | "request_reupload" }</code></pre>
+
+<h3>Extraction schema, per document type</h3>
+<pre><code>Payslip {
+  employer_name: string, employee_name: string,
+  pay_period_start: date, pay_period_end: date, pay_date: date,
+  gross_pay: Money, total_deductions: Money, net_pay: Money,
+  currency: ISO4217,
+  _evidence: { field → { page, quote } }      <span class="c">// where each value came from</span>
+}</code></pre>
+<p>Schema-constrained output (structured outputs / JSON mode with a schema) guarantees the result parses (barring refusals or truncation at the token limit). It doesn't guarantee the values are right, which is what the rest of the design is about.</p>
+
+<h2>High-Level Design</h2>
+<h3>1) Users can upload documents</h3>
+<p>The client asks the <strong>Upload API</strong> for a presigned URL and uploads the file directly to an encrypted <strong>blob store</strong>, so large files never pass through our servers. The API records the document in the <strong>Jobs DB</strong> with its SHA-256 hash; a duplicate hash on the same case returns the existing document instead of creating a new one (idempotent uploads). When the client confirms, the API enqueues a processing message. Before anything else, a scanner checks file type and malware, and normalizes inputs: PDFs split into pages, photos de-skewed and resized to a sensible resolution.</p>
+
+<h3>2) The system classifies and extracts fields</h3>
+<p>Extraction workers pull from the <strong>queue</strong> and run each document through a small state machine, recording progress in the Jobs DB so a crash resumes at the last completed step:</p>
+<ol>
+<li><strong>Classify and split.</strong> A cheap, fast model (or a small vision classifier) labels each page: payslip, passport, driver's license, bank statement, invoice, other. Multi-document PDFs (three payslips scanned together) are split by page ranges. Unknown types go straight to review.</li>
+<li><strong>Extract.</strong> A vision-capable LLM gets the page images, the OCR text if available, and the schema for that type, and returns structured JSON with an evidence quote per field. Calls go through a <strong>Model Gateway</strong> that handles retries, fallbacks and budgets.</li>
+<li><strong>Normalize.</strong> Deterministic code parses dates and money into canonical forms, normalizes names (case, diacritics, ordering), and maps currencies.</li>
+</ol>
+
+<h3>3) The system flags inconsistencies</h3>
+<p>Validation is code, not a prompt. Three layers of rules run over the normalized extractions:</p>
+<div class="tbl"><table>
+<thead><tr><th>Layer</th><th>Examples</th><th>How</th></tr></thead>
+<tbody>
+<tr><td>Field</td><td>Date is valid; amount positive; ID number format; passport MRZ check digits</td><td>Schema types, regexes, checksum algorithms (MRZ check digits are defined in <a href="https://www.icao.int/publications/doc-series/doc-9303">ICAO Doc 9303</a>)</td></tr>
+<tr><td>Document</td><td>gross − deductions = net (± rounding); pay period ends before pay date; ID not expired</td><td>Arithmetic and date logic with tolerances</td></tr>
+<tr><td>Case (cross-document)</td><td>Same person on ID and payslips; consistent employer across payslips; payslip net pay appears as a deposit on the bank statement; declared income within X% of payslip-derived income; payslips are the 3 most recent months</td><td>Entity matching plus a rules engine over the case's facts</td></tr>
+</tbody></table></div>
+<p>Each failed rule creates a <strong>Finding</strong> with an explanation that cites the documents and fields. An LLM can turn findings into a readable summary for reviewers, but the decision that a mismatch exists comes from code you can test.</p>
+
+<h3>4) Reviewers resolve flagged cases</h3>
+<p>Cases with findings or low-confidence fields go to a <strong>review queue</strong>. The review tool shows each field next to the highlighted region of the source image, pre-filled with the extracted value. Reviewers correct and approve. Tasks are leased (so two reviewers don't work the same case) and every action is written to an audit log. Corrections are stored as labels, which feed evaluation and threshold tuning.</p>
+
+<h3>5) Clients get results</h3>
+<p>When a case reaches a terminal state, results and findings are written to the <strong>results store</strong> and a webhook fires (signed, retried with backoff, idempotent by event ID). Clients can also poll <code>GET /cases/{id}</code>.</p>
+<figure class="dg" data-diagram="design-doc-extraction-final"></figure>
+
+<h2>Potential Deep Dives</h2>
+<h3>1) OCR, vision LLM, or both?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>OCR plus regexes and templates per layout</h5><p><span class="lbl">Challenges:</span> payslips come in thousands of layouts from different payroll providers; templates break on every new one, and photos taken at an angle wreck positional rules. Maintenance never ends.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>OCR text into a text LLM with a schema</h5><p><span class="lbl">Approach:</span> run OCR, give the text to an LLM with the target schema, get JSON back.</p><p><span class="lbl">Challenges:</span> OCR flattens tables and loses layout, so the model confuses year-to-date totals with this period's amounts, or columns with rows. Handwriting and stamps are lost.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Vision LLM with layout-aware OCR as a second signal, specialized parsers where they exist</h5><p><span class="lbl">Approach:</span> send page images to a vision LLM with the schema, plus OCR text (with coordinates) as an extra input. Require an evidence quote per field and check that it appears in the OCR text; a value with no supporting text is suspect. For highly structured parts, use deterministic parsers: the MRZ on passports and many IDs encodes name, number, birth date and expiry with check digits, so parse it and compare to what the model read from the visual zone. For the few highest-volume layouts, a cached prompt with examples of that layout improves accuracy cheaply.</p><p><span class="lbl">Challenges:</span> images are token-heavy (on Claude, one token per 28×28-pixel patch, so a 1000×1400 page is ~1,800 tokens on current models; see <a href="https://platform.claude.com/docs/en/build-with-claude/vision">vision docs</a>); downscale to the smallest resolution that preserves accuracy on your eval set, and keep OCR costs in the budget.</p></div>
+
+<h3>2) How do we know when to trust an extraction without a human?</h3>
+<p>This is the core of the design: the auto-accept rate drives cost, and auto-accept precision drives risk.</p>
+<figure class="dg" data-diagram="design-doc-extraction-routing"></figure>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Ask the model to rate its own confidence</h5><p><span class="lbl">Challenges:</span> self-reported confidence from an LLM is poorly calibrated; it says 0.95 for wrong answers often enough that you can't set a threshold on it.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Deterministic validators as the gate</h5><p><span class="lbl">Approach:</span> auto-accept when every field passes type, checksum and arithmetic rules and no cross-document rule fires.</p><p><span class="lbl">Challenges:</span> many fields have no checksum (employer name, pay period). A plausible but wrong value sails through.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Combine independent signals into per-field confidence, calibrated on labeled data</h5><p><span class="lbl">Approach:</span> for each field, collect signals: validator pass/fail, evidence quote found in OCR text, agreement between two independent extractions for critical fields (two models, or vision vs OCR+text), token log-probabilities where the provider exposes them, and document quality (blur, crop). Fit a simple calibrated model on reviewer-labeled data that maps signals to the probability the field is correct. Pick a threshold <em>per field and document type</em> that meets the precision target (≥ 99%) on a held-out set, and route everything below it to review. Track auto-accept rate and post-hoc error rate (via audited samples of auto-accepted cases) weekly.</p><p><span class="lbl">Challenges:</span> dual extraction doubles model cost; apply it only to fields that drive decisions (income, name, ID number). Thresholds must be re-tuned after any model or prompt change, which the eval gate enforces.</p></div>
+
+<h3>3) How do we check consistency across documents?</h3>
+<ul>
+<li><strong>Entity matching:</strong> names differ legitimately (middle names, initials, transliteration, maiden names). Normalize, then use token-based fuzzy matching with thresholds; treat "J. Smith" vs "John Smith" as a soft match, "John Smith" vs "Jane Doe" as a hard mismatch. Escalate soft matches only when other evidence is weak.</li>
+<li><strong>Income reconciliation:</strong> annualize per pay frequency (weekly, biweekly, monthly) before comparing; match payslip net pay to bank deposits within a date window and an amount tolerance.</li>
+<li><strong>Completeness and recency:</strong> "three consecutive recent payslips" is a rule over pay periods, not something to ask a model.</li>
+<li><strong>Fraud signals:</strong> PDF metadata (editing software, creation after the pay date), font inconsistencies, arithmetic that's off by suspiciously round amounts, duplicates of documents seen in other cases (perceptual image hashes). These are separate detectors that raise findings; an LLM is not a reliable forgery detector.</li>
+</ul>
+<div class="callout warn"><span class="ci w"></span><p>Don't let the LLM decide "consistent: yes/no" across a whole case in one prompt. It's untestable, it can't explain itself reproducibly, and regulators and auditors will ask why a case was flagged. Extract facts with the model; decide with versioned rules.</p></div>
+
+<h3>4) How do we make processing reliable?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Process synchronously inside the upload request</h5><p><span class="lbl">Challenges:</span> model calls take seconds to tens of seconds and sometimes fail; a timeout loses work, and retries from the client duplicate it.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Queue with retries and a dead-letter queue</h5><p><span class="lbl">Approach:</span> at-least-once delivery, exponential backoff on transient errors, a dead-letter queue after N attempts with alerting.</p><p><span class="lbl">Challenges:</span> at-least-once means duplicates: two workers may extract the same document and write two results or create two review tasks.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Idempotent state machine plus a gateway that absorbs provider outages</h5><p><span class="lbl">Approach:</span> each document has a state (<code>uploaded → classified → extracted → validated → done | needs_review</code>) with conditional updates (compare-and-set on the version), so a duplicate message finds the step done and exits. Writes are keyed by <code>(documentId, step, pipelineVersion)</code>. The Model Gateway retries with jitter, opens a circuit breaker on a failing provider, and falls back to a second model that has passed the same extraction evals. Because the latency SLO is minutes, the queue itself is the outage buffer: during a long outage, work waits and drains later instead of failing. Backfills and re-extraction after a prompt change go through providers' batch APIs, which are typically discounted around 50% (<a href="https://platform.claude.com/docs/en/build-with-claude/batch-processing">Claude batch processing</a>).</p><p><span class="lbl">Challenges:</span> fallback models extract slightly differently; record the model version on every extraction and use per-model thresholds.</p></div>
+
+<h3>5) How do we protect the data?</h3>
+<ul>
+<li><strong>Storage:</strong> encrypt blobs and extracted fields at rest with KMS-managed keys (per-tenant keys for enterprise customers); presigned URLs with short TTLs; buckets never public.</li>
+<li><strong>Least privilege:</strong> workers can read only documents they're processing; reviewers see only cases assigned to them, with the review UI showing only the fields they need. Every view and export is audit-logged.</li>
+<li><strong>Logs and traces:</strong> never log raw field values or images; log document IDs and hashes. Redact PII in traces used for debugging.</li>
+<li><strong>Model providers:</strong> use enterprise terms with no training on your data and zero or limited retention where available (check feature eligibility: Claude's Batch API, for example, keeps results for 29 days and isn't covered by zero data retention, so keep ZDR-only documents out of batch backfills); pin the processing region for data residency (EU documents processed in the EU).</li>
+<li><strong>Retention and deletion:</strong> keep source documents only as long as the business and regulators require, then delete blobs, extractions and derived labels; support deletion requests (for example under GDPR) across all stores, including eval sets built from production data.</li>
+</ul>
+
+<h3>6) How do we evaluate and improve accuracy?</h3>
+<ul>
+<li><strong>Golden set:</strong> a few hundred labeled documents per type, stratified by layout, image quality (scans, phone photos, glare) and language, including deliberately inconsistent cases.</li>
+<li><strong>Metrics:</strong> field-level accuracy after normalization (exact match for IDs, tolerance for money, normalized match for names), document-level "all critical fields correct", finding recall and precision, auto-accept rate and auto-accept precision, review rate, cost and latency per document.</li>
+<li><strong>Gates:</strong> any prompt, model or pipeline change runs the golden set and can't regress auto-accept precision or finding recall (see <a href="#evaluation">Evaluation</a>).</li>
+<li><strong>Flywheel:</strong> every reviewer correction is a new label. Sample auto-accepted cases for audit too, or you'll never learn about confident mistakes.</li>
+</ul>
+
+<h3>7) What does it cost, and how does it scale to 1M documents a month?</h3>
+<pre><code><span class="c">// Model cost per document (Sonnet 5.5 list prices: $2 / M input, $10 / M output; check current pricing)</span>
+classify:   1 page thumbnail on a small model                     ≈ $0.001
+extract:    2 pages × ~1,800 image tokens + ~1,000 prompt/OCR tokens ≈ 4,600 in × $2/M  = $0.0092
+            ~400 output tokens × $10/M                                              = $0.0040
+dual extraction on critical fields (~30% of docs)                              ≈ $0.004
+retries and fallbacks (~10%)                                                   ≈ $0.002
+                                                                     total ≈ <span class="k">$0.02 / doc</span>
+
+<span class="c">// Human review cost</span>
+review rate 15% × 2 min per review × $30/hour                                  ≈ <span class="k">$0.15 / doc</span></code></pre>
+<p>Review dominates model cost by about 7×. The most valuable optimization is raising the trustworthy auto-accept rate, not shaving tokens. That's the insight to say out loud.</p>
+<pre><code>1M docs / month ÷ 2.6M s ≈ 0.39 docs/s average; peak ~5× ≈ 2 docs/s
+in-flight model calls (Little's law): 2 docs/s × ~2 calls × ~8 s ≈ <span class="k">32 concurrent</span>
+token rate: 2 docs/s × ~5K tokens ≈ 10K tokens/s ≈ <span class="k">600K tokens/min</span>   <span class="c">// check provider rate-limit tier; split across providers</span>
+storage: 1M docs × ~1 MB ≈ 1 TB / month → lifecycle to cold storage, delete at retention</code></pre>
+<p>Workers autoscale on queue depth; interactive cases go on a higher-priority queue than backfills, so a bulk re-extraction never delays an applicant. Review staffing is the real scaling constraint: at a 15% review rate, 1M documents is 150K reviews a month, about 5,000 reviewer-hours, which is why every point of auto-accept rate is worth engineering effort.</p>
+
+<h2>What is Expected at Each Level?</h2>
+<div class="levels">
+<div><h4>Mid-level</h4>Presigned uploads, a queue and workers, an LLM extracting to a JSON schema, basic validation, a review queue, and webhooks. Notices that LLM output must be validated.</div>
+<div><h4>Senior</h4>Clear split between model extraction and rule-based decisions; vision plus OCR with evidence; calibrated per-field confidence and thresholds tied to a precision target; idempotent state machine, DLQ, provider fallback; PII handling; field-level evals and a correction flywheel; cost math showing review dominates.</div>
+<div><h4>Staff+</h4>Frames auto-accept rate at a fixed precision as the business metric and designs the system around moving it safely; audit sampling of auto-accepted cases, per-model thresholds and gated rollouts, data residency and deletion across eval sets, review workforce capacity planning, and fraud detection as a separate signal pipeline.</div>
+</div>
+</section>

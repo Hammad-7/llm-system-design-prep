@@ -1,0 +1,67 @@
+D["design-claude-code-basic"]={w:780,h:300,label:"First version of a coding harness: the developer types into a terminal UI; a single agent loop sends context to a streaming model API, dispatches the model's tool calls to a tool layer that reads and edits the repo and runs shell commands, and appends every message to a local transcript.",
+ nodes:[
+  {id:"u",x:10,y:110,w:70,h:72,t:"Developer",s:"person"},
+  {id:"ui",x:110,y:114,w:130,h:64,t:"Terminal UI",sub:"REPL · IDE · SDK",c:"gray",fs:16},
+  {id:"lp",x:290,y:104,w:170,h:84,t:"Agent loop",sub:"one master loop\nstream + dispatch",c:"orange",fs:18},
+  {id:"m",x:540,y:14,w:220,h:62,t:"Model API",sub:"streaming · prompt cache",c:"blue",fs:17},
+  {id:"tl",x:540,y:114,w:220,h:64,t:"Tool layer",sub:"Read · Edit · Grep · Bash",c:"red",fs:17},
+  {id:"fs",x:540,y:216,w:220,h:72,t:"Repo + shell",s:"db",c:"gray",fs:16},
+  {id:"tr",x:290,y:222,w:170,h:70,t:"Transcript",s:"db",c:"gray",fs:15}
+ ],
+ edges:[{a:"u",b:"ui"},{a:"ui",b:"lp",bi:1},
+  {a:"lp",b:"m",t:"context + tools",bi:1,lp:[470,62]},
+  {a:"lp",b:"tl",t:"tool_use / result",bi:1},{a:"tl",b:"fs"},
+  {a:"lp",b:"tr",d:1,t:"append"}]};
+D["design-claude-code-context"]={w:780,h:215,label:"What one model call contains: a stable prefix of system prompt, tool definitions including MCP tools, CLAUDE.md memory and the skill list, which is cached across calls; then the conversation (a compacted summary plus recent turns) and the latest tool results, which grow every step; plus space reserved for output.",
+ nodes:[
+  {id:"s",x:10,y:60,w:120,h:70,t:"System\nprompt",c:"blue",fs:14},
+  {id:"t",x:134,y:60,w:110,h:70,t:"Tool defs\n+ MCP tools",c:"blue",fs:14},
+  {id:"c",x:248,y:60,w:110,h:70,t:"CLAUDE.md\nmemory",c:"teal",fs:14},
+  {id:"k",x:362,y:60,w:90,h:70,t:"Skill\nlist",c:"teal",fs:13},
+  {id:"h",x:456,y:60,w:170,h:70,t:"Conversation\n(summary + turns)",c:"purple",fs:14},
+  {id:"r",x:630,y:60,w:70,h:70,t:"Tool\nresults",c:"orange",fs:13},
+  {id:"o",x:704,y:60,w:66,h:70,t:"Output",c:"gray",fs:13,dash:1}
+ ],
+ notes:[{x:231,y:36,t:"stable prefix: cached across every call",a:"middle",fs:14,c:"blue"},
+  {x:613,y:36,t:"grows every step; compacted",a:"middle",fs:14,c:"purple"},
+  {x:390,y:160,t:"cache breakpoints: end of the stable prefix, and end of the latest turn",a:"middle",fs:13},
+  {x:390,y:188,t:"changing anything on the left invalidates the cache for everything to its right",a:"middle",fs:13}]};
+D["design-claude-code-permission"]={w:840,h:280,label:"Permission pipeline for one tool call, in Claude Code's documented order: PreToolUse hooks can block it; deny rules block matches; ask rules send matches straight to a prompt; the permission mode can approve it (for example accept-edits or bypass); allow rules approve matches; anything still undecided goes to the user, the auto-mode classifier, or the SDK's canUseTool callback. Approved calls execute inside the OS sandbox, then PostToolUse hooks run and the result returns to the model. Blocked calls return an error to the model.",
+ nodes:[
+  {id:"tc",x:10,y:50,w:90,h:62,t:"tool_use\nfrom model",c:"gray",fs:13},
+  {id:"hk",x:122,y:50,w:100,h:62,t:"PreToolUse\nhooks",c:"purple",fs:14},
+  {id:"dn",x:245,y:50,w:80,h:62,t:"Deny\nrules",c:"red",fs:14},
+  {id:"ar",x:348,y:50,w:80,h:62,t:"Ask\nrules",c:"orange",fs:14},
+  {id:"md",x:451,y:50,w:100,h:62,t:"Permission\nmode",c:"blue",fs:14},
+  {id:"al",x:574,y:50,w:82,h:62,t:"Allow\nrules",c:"green",fs:14},
+  {id:"ak",x:680,y:50,w:150,h:62,t:"Ask user\nor classifier",c:"purple",fs:14},
+  {id:"ex",x:680,y:190,w:150,h:62,t:"Run in sandbox",sub:"fs + network rules",c:"teal",fs:15},
+  {id:"po",x:480,y:190,w:130,h:62,t:"PostToolUse\nhooks",c:"purple",fs:14},
+  {id:"rs",x:280,y:190,w:140,h:62,t:"tool_result\n→ model",c:"gray",fs:14},
+  {id:"bk",x:60,y:190,w:150,h:62,t:"Blocked:\nerror → model",c:"red",fs:14}
+ ],
+ edges:[{a:"tc",b:"hk"},{a:"hk",b:"dn"},{a:"dn",b:"ar"},{a:"ar",b:"md"},{a:"md",b:"al"},{a:"al",b:"ak"},
+  {a:"ar",b:"ak",t:"match",as:"t",bs:"t0.3",via:[[388,22],[725,22]]},
+  {a:"ak",b:"ex",t:"approved"},{a:"md",b:"ex",t:"mode allows",as:"b",lp:[560,141]},{a:"al",b:"ex",t:"match",as:"b"},
+  {a:"ex",b:"po"},{a:"po",b:"rs"},
+  {a:"dn",b:"bk",d:1,c:"red",t:"match"},{a:"hk",b:"bk",d:1,c:"red",t:"exit 2",lp:[160,150]}]};
+D["design-claude-code-final"]={w:860,h:450,label:"Final coding-harness design: front ends (terminal UI, IDE, SDK) drive the agent loop; a context manager assembles the prompt from CLAUDE.md memory and settings and handles compaction; the loop streams from the model API, spawns subagents with fresh context, and dispatches tool calls to a tool layer; each call passes a permission engine of rules, modes and hooks before running in an OS sandbox over the repo and shell, or going to MCP servers; transcripts and file checkpoints are stored locally.",
+ nodes:[
+  {id:"mem",x:40,y:34,w:150,h:84,t:"CLAUDE.md\n+ settings",s:"db",c:"gray",fs:15},
+  {id:"u",x:10,y:200,w:70,h:72,t:"Developer",s:"person"},
+  {id:"ui",x:100,y:204,w:120,h:64,t:"Front ends",sub:"TUI · IDE · SDK",c:"gray",fs:15},
+  {id:"tr",x:40,y:346,w:160,h:84,t:"Transcripts +\ncheckpoints",s:"db",c:"gray",fs:14},
+  {id:"cx",x:260,y:34,w:170,h:84,t:"Context manager",sub:"assemble · compact\ncache breakpoints",c:"blue",fs:16},
+  {id:"lp",x:260,y:190,w:170,h:92,t:"Agent loop",sub:"stream · dispatch\ninterrupt · budgets",c:"orange",fs:18},
+  {id:"sa",x:260,y:356,w:170,h:66,t:"Subagents",sub:"fresh context each",c:"orange",fs:16},
+  {id:"m",x:480,y:34,w:160,h:76,t:"Model API",sub:"streaming ·\nprompt cache",c:"blue",fs:16},
+  {id:"tl",x:480,y:190,w:160,h:92,t:"Tool layer",sub:"Read · Edit · Grep\nBash · Web · Agent",c:"red",fs:17},
+  {id:"mcp",x:480,y:356,w:160,h:66,t:"MCP servers",sub:"stdio · HTTP",c:"purple",fs:16},
+  {id:"pe",x:690,y:34,w:155,h:84,t:"Permission\nengine",sub:"rules · mode · hooks",c:"red",fs:16},
+  {id:"sb",x:690,y:190,w:155,h:92,t:"OS sandbox",sub:"Seatbelt / bubblewrap\nnetwork allowlist",c:"teal",fs:16},
+  {id:"fs",x:690,y:346,w:155,h:84,t:"Repo, shell,\ntoolchain",s:"db",c:"gray",fs:15}
+ ],
+ edges:[{a:"u",b:"ui"},{a:"ui",b:"lp",bi:1},{a:"mem",b:"cx",t:"load"},{a:"lp",b:"cx",bi:1},
+  {a:"lp",b:"m",t:"stream",bi:1},{a:"lp",b:"tl",bi:1},{a:"lp",b:"sa",t:"Agent"},
+  {a:"tl",b:"pe",t:"allowed?"},{a:"tl",b:"sb",t:"exec"},{a:"sb",b:"fs"},{a:"tl",b:"mcp"},
+  {a:"lp",b:"tr",d:1,t:"append"}]};

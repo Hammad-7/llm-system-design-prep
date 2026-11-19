@@ -1,0 +1,261 @@
+<section class="page" id="p-api-streaming" data-title="API Design &amp; Streaming" data-kw="api design streaming sse server-sent events last-event-id resumable streams websockets webrtc realtime voice idempotency keys request id pagination cursor conversations responses api previous_response_id stateful stateless cancellation backpressure partial json tool call streaming errors mid-stream retry-after rate limit headers webhooks async jobs batch api versioning markdown rendering optimistic ui http2 proxy buffering heartbeat">
+<div class="banner" style="--banner:#9aa7e0" data-bt="API &amp; Streaming" data-bs="contracts for slow, metered, token-by-token work"></div>
+<p class="eyebrow">LLM System Design · Core Concepts</p>
+<h1>API Design &amp; Streaming</h1>
+<p class="lead">How to shape the API for LLM-backed features: choosing between synchronous, streaming and asynchronous interactions, designing resources and idempotency, making streams resumable and cancellable, handling errors after the first token, and the client-side details that make it feel fast.</p>
+<hr class="sep">
+
+<p>LLM calls break the assumptions that most API design advice is built on. A response can take 30 seconds or 30 minutes. It arrives a few characters at a time. It costs real money per request, so a duplicate retry is a billing bug, not just wasted CPU. It can fail halfway through, after the user has already read the first paragraph. And it often isn't a single call at all, but an agent run with tool calls in the middle.</p>
+<p>In interviews, the API section of the <a href="#delivery-framework">delivery framework</a> is where you show you understand this. "POST /chat returns the answer" is a mid-level answer. A senior answer picks the right interaction shape, makes retries safe, streams typed events, survives disconnects, and says what happens when generation fails at token 400. This page covers each of those, with sketches you can reuse.</p>
+
+<h2>Choosing the interaction shape</h2>
+<figure class="dg" data-diagram="api-streaming-modes"></figure>
+<div class="tbl"><table>
+<thead><tr><th>Shape</th><th>Use when</th><th>Transport</th><th>Examples</th></tr></thead>
+<tbody>
+<tr><td>Synchronous</td><td>Output is short (&lt; a few seconds), consumed by code, not a person</td><td>Plain HTTP request/response</td><td>Classification, extraction, embeddings, moderation, query rewriting</td></tr>
+<tr><td>Streaming</td><td>A person is waiting and reading; output is long relative to TTFT</td><td>SSE (or fetch streaming) over HTTP</td><td>Chat, writing assistants, code explanations</td></tr>
+<tr><td>Async job</td><td>Minutes or longer; must survive disconnects and deploys</td><td>POST → 202 + ID; poll, SSE progress, or webhook</td><td>Agent runs, deep research, document processing, video</td></tr>
+<tr><td>Batch</td><td>Thousands of independent requests; latency of hours is fine</td><td>Upload a file of requests; download results</td><td>Backfills, nightly enrichment, eval sweeps (commonly ~50% cheaper)</td></tr>
+<tr><td>Real-time bidirectional</td><td>The client streams too, or must interrupt (barge-in)</td><td>WebSocket or WebRTC</td><td>Voice agents, live collaboration</td></tr>
+</tbody></table></div>
+<div class="callout"><span class="ci"></span><p>The question to ask out loud: "Who consumes this output, and how long does it take?" A person reading for 10 seconds wants streaming. Code waiting on a JSON object wants synchronous. Anything that can outlive an HTTP connection (a deploy, a laptop lid closing) wants an async job with a durable run ID.</p></div>
+
+<h2>Designing the API surface</h2>
+<h3>Stateless vs stateful model APIs</h3>
+<p>Provider APIs come in two styles, and the same choice appears in your own product's API:</p>
+<ul>
+<li><strong>Stateless</strong> (e.g. Chat Completions, Anthropic Messages): the client sends the full conversation every time. Simple, horizontally scalable, easy to cache and to switch providers. The client (or your backend) owns history storage.</li>
+<li><strong>Stateful</strong> (e.g. OpenAI's Responses API with <code>previous_response_id</code> and stored conversations): the server keeps the conversation and the client references it by ID. Less payload, and the server can run built-in tools, keep reasoning state and resume background work. The costs are server-side storage, retention and privacy obligations (zero-data-retention customers may not be able to store), and tighter coupling to one provider.</li>
+</ul>
+<p>For your own product, the usual answer is a stateful public API (clients deal in conversation IDs) backed by stateless calls to model providers (your backend assembles the context each turn). That keeps providers swappable and puts context engineering under your control (see <a href="#context-engineering">Context Engineering</a>).</p>
+
+<h3>A resource model for an LLM product</h3>
+<pre><code>POST   /v1/conversations                              → { id }
+GET    /v1/conversations?cursor=…&amp;limit=20            → { items, next_cursor }
+GET    /v1/conversations/{cid}/messages?before=…      → { items, next_cursor }
+
+POST   /v1/conversations/{cid}/messages               <span class="c">// send a user message, start a response</span>
+       Idempotency-Key: 7b0c…                          <span class="c">// client-generated, reused on retry</span>
+       { content, parent_message_id?, model?, stream: true }
+       → 200 text/event-stream                         <span class="c">// or 202 { response_id } if async</span>
+
+GET    /v1/responses/{rid}/events                      <span class="c">// (re)attach to a running stream</span>
+       Last-Event-ID: 42
+POST   /v1/responses/{rid}/cancel                      → 202
+POST   /v1/messages/{mid}/feedback   { rating, reason? }</code></pre>
+<ul>
+<li><strong>Response as a resource.</strong> Giving each generation a <code>response_id</code> lets clients reattach, cancel, and fetch the final result independently of the connection that started it.</li>
+<li><strong>Branching.</strong> Editing a message or regenerating creates a sibling, not an overwrite. Store messages as a tree (<code>parent_message_id</code>) and track the active leaf per conversation.</li>
+<li><strong>Cursor pagination.</strong> Paginate messages by an opaque cursor over <code>(created_at, id)</code>, newest first. Offsets break when messages are added while scrolling.</li>
+<li><strong>Model choice as a parameter.</strong> Accept a model alias the product controls ("fast", "best") rather than raw provider model IDs, so you can change the backing model without breaking clients.</li>
+</ul>
+
+<h3>Idempotency keys</h3>
+<p>Mobile networks drop requests constantly. If the client retries <code>POST /messages</code> after a timeout, you must not generate (and bill) twice, or show two answers. The standard fix:</p>
+<ol>
+<li>The client generates a UUID per logical send and reuses it on every retry, in an <code>Idempotency-Key</code> header.</li>
+<li>The server atomically inserts <code>(tenant, key) → {request_hash, response_id, status}</code> with a TTL of about 24 hours.</li>
+<li>If the key exists with the same request hash: return the existing response (or reattach to its stream if it's still generating). If the hash differs: return <code>409 Conflict</code>, because the client reused a key for a different request.</li>
+</ol>
+<p>The same key can double as the optimistic-UI message ID on the client, which makes de-duplication on reconnect trivial.</p>
+
+<h3>Request IDs and traceability</h3>
+<p>Return a request ID on every response (<code>X-Request-Id</code>) and in every stream's first event, and propagate it to model calls, tool calls and logs. When a user reports "the answer was wrong," the request ID is how support finds the trace with the exact prompt, retrieved context and model version (see <a href="#observability">Observability &amp; LLMOps</a>).</p>
+
+<h2>Server-Sent Events in depth</h2>
+<p>SSE is the default transport for token streaming: a long-lived HTTP response with <code>Content-Type: text/event-stream</code>, made of text events separated by blank lines. It works through most proxies, needs no special server infrastructure, and has reconnection semantics built in.</p>
+<pre><code>HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+X-Accel-Buffering: no                <span class="c">// tell nginx not to buffer</span>
+
+retry: 3000                          <span class="c">// client reconnect delay (ms)</span>
+
+id: 1
+event: response.created
+data: {"response_id":"r_9f2","request_id":"req_41a","model":"fast-2026-10"}
+
+id: 2
+event: text.delta
+data: {"delta":"The refund window"}
+
+id: 3
+event: text.delta
+data: {"delta":" is 30 days."}
+
+: keep-alive                         <span class="c">// comment line = heartbeat, ignored by clients</span>
+
+id: 4
+event: citation
+data: {"source_id":"kb_118","title":"Refund policy","span":[0,32]}
+
+id: 5
+event: response.completed
+data: {"stop_reason":"end_turn","usage":{"input":5210,"cached_input":4096,"output":41}}</code></pre>
+
+<h3>Typed events</h3>
+<p>Don't stream bare text. Typed events let the client render text, tool status, citations and errors differently, and let you add new event types without breaking old clients (clients must ignore types they don't know). Real provider streams are modeled this way: Anthropic's Messages API emits <code>message_start</code>, <code>content_block_start</code>, <code>content_block_delta</code> (with text or partial-JSON deltas), <code>content_block_stop</code>, <code>message_delta</code> (stop reason and usage) and <code>message_stop</code>, plus <code>ping</code> and <code>error</code>; OpenAI's Responses API uses events like <code>response.output_text.delta</code> and <code>response.completed</code>.</p>
+<div class="tbl"><table>
+<thead><tr><th>Event</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>response.created</code></td><td>IDs (response, request, message), model used; lets the client attach cancel and feedback controls immediately</td></tr>
+<tr><td><code>text.delta</code></td><td>Append text</td></tr>
+<tr><td><code>reasoning.summary.delta</code></td><td>Optional summarized "thinking" for UIs that show it</td></tr>
+<tr><td><code>tool_call.*</code> / <code>tool.status</code></td><td>"Searching the knowledge base…", arguments, results</td></tr>
+<tr><td><code>citation</code></td><td>Source attached to a text span</td></tr>
+<tr><td><code>error</code></td><td>Typed error after the stream started (see below)</td></tr>
+<tr><td><code>response.completed</code></td><td>Stop reason and token usage, for display and billing</td></tr>
+</tbody></table></div>
+
+<h3>Operational pitfalls</h3>
+<ul>
+<li><strong>Proxy buffering.</strong> nginx, some CDNs and compression middleware buffer responses, so the user sees nothing for 20 seconds and then the whole answer. Disable buffering for the route (<code>proxy_buffering off</code> or <code>X-Accel-Buffering: no</code>), don't gzip event streams, and flush after each event.</li>
+<li><strong>Idle timeouts.</strong> Load balancers drop idle connections (AWS ALB's default idle timeout is 60 seconds). A model thinking for 90 seconds before its first token looks idle. Send a comment heartbeat every 10–15 seconds.</li>
+<li><strong>Browser connection limits.</strong> Over HTTP/1.1, browsers allow only about six concurrent connections per origin, and each open SSE stream holds one. Serve streams over HTTP/2, which multiplexes them on one connection.</li>
+<li><strong><code>EventSource</code> limitations.</strong> The browser's built-in <code>EventSource</code> only does GET and can't set custom headers like <code>Authorization</code>. Most chat clients use <code>fetch()</code> with a streaming body reader for the POST and parse SSE themselves, keeping <code>EventSource</code>-style IDs and reconnection logic.</li>
+<li><strong>Graceful deploys.</strong> Rolling deploys kill connections. If generation is decoupled from the connection (next section), the client just reconnects and resumes.</li>
+</ul>
+
+<h2>WebSockets and WebRTC</h2>
+<div class="tbl"><table>
+<thead><tr><th></th><th>SSE</th><th>WebSocket</th><th>WebRTC</th></tr></thead>
+<tbody>
+<tr><td>Direction</td><td>Server → client</td><td>Both</td><td>Both, media-first</td></tr>
+<tr><td>Transport</td><td>HTTP (1.1 or 2)</td><td>TCP, upgraded from HTTP</td><td>UDP (SRTP), with NAT traversal</td></tr>
+<tr><td>Best for</td><td>Token streaming, progress events</td><td>Interactive sessions, client-side tool results, interruptions</td><td>Real-time audio/video with low, stable latency</td></tr>
+<tr><td>Operational cost</td><td>Low; stateless servers</td><td>Sticky connections, connection draining on deploy, custom heartbeats</td><td>Media servers or provider endpoints, TURN relays, jitter buffers</td></tr>
+</tbody></table></div>
+<p>For voice agents, the model provider's real-time endpoint is often reached over WebRTC directly from the browser or phone, using a short-lived, narrowly scoped token minted by your backend, so your API key never reaches the client. Server-side orchestration (tool calls, logging) then happens over a parallel WebSocket or webhook channel. The <a href="#design-voice-agent">Real-time Voice Agent</a> breakdown goes deeper.</p>
+
+<h2>Resumable streams</h2>
+<p>The single most important streaming design decision: <strong>decouple generation from the client connection</strong>. If the model call lives inside the HTTP handler, a dropped connection loses the answer you're paying for, and a reconnect has to start over.</p>
+<figure class="dg" data-diagram="api-streaming-resumable"></figure>
+<ol>
+<li>The send request creates a <code>response_id</code> and enqueues generation on a worker (or starts it in a detached task).</li>
+<li>The worker streams from the model and appends each event to a per-response <strong>event log</strong> with a monotonically increasing sequence number. A Redis Stream works well (<code>XADD</code> with a TTL of minutes to hours); Kafka or a database table also work at different cost points.</li>
+<li>The stream endpoint reads from the log and relays events to the client as SSE with <code>id:</code> set to the sequence number.</li>
+<li>On reconnect, the browser (or your client code) sends <code>Last-Event-ID: 42</code>; the endpoint replays from event 43 and then tails new events. Any server instance can serve the reconnect because state is in the log, not in memory.</li>
+<li>When generation finishes, the worker writes the final message to the message store. Clients that come back later just fetch it.</li>
+</ol>
+<p>OpenAI's background mode exposes the same idea publicly: you track the <code>sequence_number</code> of each event and resume a stream from a cursor (<a href="https://developers.openai.com/api/docs/guides/background">OpenAI background mode</a>).</p>
+<p>Policy decision: if the client disconnects, does generation continue? For chat, a reasonable default is to keep generating (the user probably switched networks or tabs) and persist the result, but cancel if nobody reattaches within, say, 60 seconds of a long response. For agent runs, keep going; the run is a job, not a stream.</p>
+
+<h2>Cancellation and backpressure</h2>
+<h3>Cancellation</h3>
+<p>Users hit "Stop" constantly, and every token generated after that is wasted money and GPU time. Cancellation has to propagate all the way down:</p>
+<ul>
+<li>The client calls <code>POST /responses/{id}/cancel</code> (and aborts its fetch).</li>
+<li>The API sets a short-lived cancel flag (or publishes a cancel message).</li>
+<li>The worker checks the flag between chunks and aborts the upstream model stream. Closing the HTTP connection to a provider usually stops generation; on self-hosted engines like vLLM, aborting the request frees its KV cache blocks immediately.</li>
+<li>The worker persists the partial message, marked <code>stopped_by_user</code>, and bills only the tokens actually generated.</li>
+</ul>
+<h3>Backpressure</h3>
+<p>Generation rarely outruns the client for text (models emit tens to hundreds of tokens per second), but slow mobile clients, long tool outputs and fan-out to many viewers can. With an event log in between, the worker never blocks on a slow socket: it appends at model speed, and each connection reads at its own pace. Set a cap: if a client falls too far behind (or the log exceeds its size limit), drop the connection and let it resume from its last ID. Some UIs also smooth bursty token arrival into a steady typing rhythm client-side, which looks better than chunks arriving in clumps.</p>
+
+<h2>Streaming tool calls and structured output</h2>
+<figure class="dg" data-diagram="api-streaming-events"></figure>
+<p>When the model calls a tool or produces JSON, its arguments arrive as <strong>partial JSON</strong>: <code>{"query": "refund pol</code>. Two rules:</p>
+<ul>
+<li><strong>Don't act on partial arguments.</strong> Buffer deltas and parse only when the tool call is marked complete. Schema-constrained decoding (structured outputs) guarantees the final JSON parses, not that the values are right, so validate before executing.</li>
+<li><strong>Do render partial structure if it helps the UI.</strong> A tolerant partial-JSON parser can show fields as they fill in (a form being completed, a table growing). Libraries for this exist in most languages.</li>
+</ul>
+<p>For server-side tools, emit status events ("Searching 3 sources…") so the stream doesn't go silent during a 4-second tool call. For client-side tools (the browser or IDE executes them), the stream ends with a tool request, the client runs it, and posts the result back to continue the response, which is one reason agent IDEs often prefer WebSockets.</p>
+
+<h2>Errors after the first token</h2>
+<p>Once a stream starts, the HTTP status is already <code>200</code>. Errors after that point must travel as events, and the client must handle a partially rendered answer.</p>
+<div class="tbl"><table>
+<thead><tr><th>When</th><th>Signal</th><th>Client behavior</th></tr></thead>
+<tbody>
+<tr><td>Before streaming: invalid request, auth, not found</td><td><code>400</code>, <code>401</code>/<code>403</code>, <code>404</code></td><td>Show error; don't retry</td></tr>
+<tr><td>Before streaming: input too long for the context window</td><td><code>400</code>/<code>413</code> with a specific code</td><td>Trigger compaction or ask the user to shorten</td></tr>
+<tr><td>Before streaming: idempotency key reused with a different body</td><td><code>409</code></td><td>Bug in the client; don't retry</td></tr>
+<tr><td>Before streaming: rate limited or overloaded</td><td><code>429</code> or <code>503</code> (some providers use <code>529</code>) with <code>Retry-After</code></td><td>Retry with backoff and jitter; show "busy" after a few seconds</td></tr>
+<tr><td>Mid-stream: provider failure, timeout</td><td><code>event: error</code> with <code>retryable: true</code></td><td>Keep partial text, mark the message incomplete, offer "Continue" or "Retry"</td></tr>
+<tr><td>Mid-stream: output limit reached</td><td>Completed with <code>stop_reason: max_tokens</code></td><td>Offer "Continue"</td></tr>
+<tr><td>Mid-stream: output blocked by safety filter</td><td>Completed with a refusal / <code>content_filter</code> reason</td><td>Replace or redact the partial text as the policy requires</td></tr>
+</tbody></table></div>
+<div class="callout warn"><span class="ci w"></span><p>Never silently retry a stream after text has been shown. The retry generates a different answer, and splicing it onto the first half produces nonsense. Either continue from the partial output (send it back as the start of the assistant turn, where the model supports prefill; many newer models, including recent Claude models, reject a prefilled assistant turn) or regenerate visibly.</p></div>
+
+<h2>Rate-limit headers and usage reporting</h2>
+<p>Because limits are on tokens, not just requests (see <a href="#gateway-reliability">Gateways, Routing &amp; Reliability</a>), tell clients where they stand. Providers return headers such as <code>x-ratelimit-remaining-tokens</code> and <code>x-ratelimit-reset-tokens</code> (OpenAI) or <code>anthropic-ratelimit-input-tokens-remaining</code> (Anthropic), plus <code>Retry-After</code> on 429. Your own API should do the same per API key, and report usage (input, cached input, output and reasoning tokens) in the final event so clients can show cost and you can reconcile billing against provider invoices.</p>
+
+<h2>Long-running work: jobs and webhooks</h2>
+<p>Agent runs, deep research and document pipelines take minutes to hours. Model them as jobs (see <a href="#common-patterns">Common Patterns</a> for durable execution):</p>
+<pre><code>POST /v1/runs   { task, inputs, webhook_url? }      → 202 { run_id, status: "queued" }
+GET  /v1/runs/{id}                                  → { status, progress, result? }
+GET  /v1/runs/{id}/events                           <span class="c">// SSE progress, resumable</span>
+POST /v1/runs/{id}/cancel
+
+<span class="c">// webhook delivery</span>
+POST {webhook_url}
+  webhook-id: evt_8812                 <span class="c">// consumers de-duplicate on this</span>
+  webhook-timestamp: 1763542861        <span class="c">// reject if older than ~5 minutes (replay protection)</span>
+  webhook-signature: v1,base64(HMAC_SHA256(secret, id.timestamp.body))
+  { "type": "run.completed", "run_id": "...", "result_url": "..." }</code></pre>
+<ul>
+<li><strong>Sign webhooks</strong> with an HMAC over ID, timestamp and body; reject stale timestamps. The open <a href="https://www.standardwebhooks.com/">Standard Webhooks</a> spec codifies this.</li>
+<li><strong>Retry with backoff</strong> for hours, then dead-letter; expose delivery logs to customers.</li>
+<li><strong>Consumers must be idempotent</strong>: at-least-once delivery means duplicates.</li>
+<li><strong>Return results by reference</strong> (a signed URL) when they're large.</li>
+</ul>
+
+<h2>Versioning and compatibility</h2>
+<ul>
+<li><strong>Version the API explicitly</strong>, by URL (<code>/v1</code>) or by a dated header (Anthropic's <code>anthropic-version</code> header is an example), so behavior changes are opt-in.</li>
+<li><strong>Pin model versions behind aliases.</strong> Clients ask for "support-default"; you map it to a dated model snapshot and move the alias only after evals pass. Never let a provider's floating alias change your product's behavior silently.</li>
+<li><strong>Additive events only.</strong> New event types and fields are fine because clients ignore unknowns; renaming or removing them is a breaking change.</li>
+</ul>
+
+<h2>Client-side concerns</h2>
+<ul>
+<li><strong>Streaming Markdown.</strong> Partial Markdown is often invalid: an unclosed code fence turns the rest of the message into code; half a table renders as pipes. Use a renderer that tolerates incomplete input (or temporarily closes open blocks), and re-render at most once per animation frame rather than per token.</li>
+<li><strong>Optimistic UI.</strong> Show the user's message instantly with a client-generated ID (the same value as the idempotency key), then reconcile with the server's copy.</li>
+<li><strong>Scroll behavior.</strong> Auto-scroll only if the user is already at the bottom; never yank them away from what they're reading.</li>
+<li><strong>Reconnect logic.</strong> On network change or tab wake, reattach with <code>Last-Event-ID</code>; back off exponentially on repeated failures.</li>
+<li><strong>Accessibility.</strong> Announce streamed content politely (<code>aria-live="polite"</code>) and in sentence-sized chunks, not per token.</li>
+</ul>
+
+<h2>API Design &amp; Streaming in System Design Interviews</h2>
+<h3>When to bring it up</h3>
+<ul>
+<li><strong>In the API step of every LLM design.</strong> "Sending a message returns an SSE stream of typed events; the response has its own ID so the client can reattach or cancel."</li>
+<li><strong>When the interviewer asks about reliability.</strong> "Generation is decoupled from the connection via an event log, so refreshes and deploys don't lose answers."</li>
+<li><strong>When work is long.</strong> "Agent runs are jobs: 202 with a run ID, SSE for progress, webhooks on completion."</li>
+<li><strong>When cost comes up.</strong> "Idempotency keys stop double generation on retries; cancellation stops billing when users hit Stop."</li>
+</ul>
+<h3>How to introduce it</h3>
+<ol>
+<li>Name the interaction shape and why (who consumes the output, how long it takes).</li>
+<li>Sketch the resources: conversation, message, response or run.</li>
+<li>Show the streaming contract: typed events, IDs, the completion event with usage.</li>
+<li>Cover failure: idempotent sends, resumable streams, mid-stream errors, cancellation.</li>
+<li>Mention the operational details briefly: heartbeats, buffering, HTTP/2.</li>
+</ol>
+
+<h3>Common deep-dive questions</h3>
+<h4>"The user refreshes the page halfway through a long answer. What happens?"</h4>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>The stream dies with the connection; the user asks again</h5><p><span class="lbl">Challenges:</span> you paid for half an answer, the user waits again, and the conversation now has a missing or duplicated turn.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Persist the message when generation completes</h5><p><span class="lbl">Approach:</span> generation continues server-side; when the page reloads, the client polls until the message appears.</p><p><span class="lbl">Challenges:</span> the user sees nothing until the end; generation still lives in one process, so a crash or deploy loses it.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Generation workers write to a sequence-numbered event log; any server can replay</h5><p><span class="lbl">Approach:</span> on reload, the client fetches the conversation, sees an in-progress response ID, and opens <code>GET /responses/{id}/events</code> with the last event ID it rendered (or 0). The endpoint replays from the log and tails new events. The final message is persisted on completion; the log expires after a TTL.</p><p><span class="lbl">Challenges:</span> one extra write per event (batch deltas into ~50 ms chunks to keep Redis load reasonable); log retention sizing; a policy for abandoned responses.</p></div>
+
+<h4>"How do you bill a stream the user cancelled?"</h4>
+<p>Bill the tokens actually consumed: the input tokens (all of them; prefill already ran) plus output tokens generated before the cancel reached the model. That requires cancellation to propagate quickly and the worker to record usage from the provider's final usage event or its own token count when aborting. Reconcile against provider invoices daily.</p>
+
+<h4>"Enterprise customers say streaming doesn't work behind their proxy."</h4>
+<p>Their proxy buffers or times out long responses. Options: heartbeats every ~10 seconds, disable compression on the stream, offer a fallback mode that long-polls the response resource (<code>GET /responses/{id}?wait=25s</code> returning the latest chunks), and document a WebSocket option where allowed. Detect buffering client-side (no events for N seconds while the server reports progress) and switch modes automatically.</p>
+
+<h4>"Design the API for an AI agent product."</h4>
+<p>Runs as first-class resources with status, budget and cost; SSE events for steps (model output, tool call, tool result summary, approval request); <code>POST /runs/{id}/messages</code> to steer; <code>POST /runs/{id}/approvals/{aid}</code> to approve or deny a risky action; cancellation; webhooks on completion; and artifacts (diffs, files, reports) as separate resources with signed download URLs. See <a href="#design-coding-agent">AI Coding Agent</a> and <a href="#design-claude-code">Design Claude Code</a>.</p>
+
+<h2>Summary</h2>
+<ul>
+<li>Pick the shape by consumer and duration: synchronous for code-consumed short outputs, streaming for people, jobs for anything that can outlive a connection.</li>
+<li>Make responses and runs resources with IDs; make sends idempotent with client-generated keys.</li>
+<li>Stream typed events over SSE with sequence IDs, heartbeats and no proxy buffering; prefer HTTP/2.</li>
+<li>Decouple generation from the connection with an event log so streams survive refreshes, deploys and network changes.</li>
+<li>Propagate cancellation to the model; bill only what was generated.</li>
+<li>Errors after the first token are events; never silently splice a retry onto a partial answer.</li>
+</ul>
+<p>Related: <a href="#gateway-reliability">Gateways, Routing &amp; Reliability</a> for rate limits and retries, <a href="#design-chatgpt">Design ChatGPT</a> for these ideas in a full design, and <a href="#design-voice-agent">Real-time Voice Agent</a> for the WebRTC side.</p>
+</section>

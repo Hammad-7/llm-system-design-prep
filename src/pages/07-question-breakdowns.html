@@ -1,5 +1,5 @@
 <section class="page" id="p-question-breakdowns" data-title="Question Breakdowns" data-kw="worked examples breakdowns how to read solutions">
-<div class="banner" style="--banner:#c79ad6" data-bt="Question Breakdowns" data-bs="four interviews, worked end to end"></div>
+<div class="banner" style="--banner:#c79ad6" data-bt="Question Breakdowns" data-bs="eleven interviews, worked end to end"></div>
 <p class="eyebrow">LLM System Design · Fast Track</p>
 <h1>Question Breakdowns</h1>
 <p class="lead">Complete walkthroughs of the most common LLM system design prompts, following the delivery framework from requirements to deep dives, with what's expected at each level.</p>
@@ -18,6 +18,13 @@
 <a class="card2" href="#design-support-assistant"><span class="tag">Retrieval · Medium</span><h4>Customer-Support RAG Assistant</h4><p>Grounded answers with citations, permission-aware retrieval, safe actions, freshness and evaluation.</p></a>
 <a class="card2" href="#design-inference-batching"><span class="tag">Infrastructure · Hard</span><h4>Inference Batching Service</h4><p>The most-reported frontier-lab prompt: batch formation, routing responses back, GPU failover, overload, continuous batching.</p></a>
 <a class="card2" href="#design-coding-agent"><span class="tag">Agentic · Hard</span><h4>AI Coding Agent</h4><p>Issue in, pull request out: sandboxes, codebase context, durable long runs, injection and secret safety, agent evals.</p></a>
+<a class="card2" href="#design-claude-code"><span class="tag">Agent harness · Hard</span><h4>Design Claude Code</h4><p>A coding agent in the terminal: the agent loop, tools, permissions and OS sandboxing, context compaction, hooks, MCP and sub-agents.</p></a>
+<a class="card2" href="#design-code-completion"><span class="tag">Latency-critical · Hard</span><h4>Copilot-style Autocomplete</h4><p>Ghost-text completions in a few hundred milliseconds: fill-in-the-middle prompts, context selection, cancellation, small models.</p></a>
+<a class="card2" href="#design-answer-engine"><span class="tag">Retrieval · Hard</span><h4>Perplexity-style Answer Engine</h4><p>Web search, fetch and synthesis with citations under a tight latency budget, freshness and source quality.</p></a>
+<a class="card2" href="#design-deep-research"><span class="tag">Multi-agent · Hard</span><h4>Deep Research Agent</h4><p>A lead agent and parallel sub-agents that research for minutes and write a cited report; cost, durability and evals.</p></a>
+<a class="card2" href="#design-llm-gateway"><span class="tag">Platform · Medium</span><h4>LLM Gateway</h4><p>One front door for every team's model traffic: quotas, routing, fallbacks, streaming proxy, cost attribution.</p></a>
+<a class="card2" href="#design-voice-agent"><span class="tag">Real-time · Hard</span><h4>Real-time Voice Agent</h4><p>Sub-second voice-to-voice: STT, LLM and TTS streaming, turn detection, barge-in, telephony and evals.</p></a>
+<a class="card2" href="#design-doc-extraction"><span class="tag">Pipeline · Medium</span><h4>Document Extraction Pipeline</h4><p>Payslips, IDs and invoices in, validated structured data out: OCR vs vision models, review queues, cost per document.</p></a>
 </div>
 
 <h2>Other prompts you can solve with the same building blocks</h2>
@@ -26,10 +33,11 @@
 <tbody>
 <tr><td>Design the OpenAI Playground / a prompt playground</td><td>ChatGPT</td><td>Parameter controls, saved and shared presets, versioned prompts, side-by-side model comparison.</td></tr>
 <tr><td>Design LLM-powered enterprise search</td><td>Support Assistant</td><td>Many connectors (Drive, Slack, Jira), per-document ACL sync, ranking across sources.</td></tr>
-<tr><td>Design a Perplexity-style answer engine</td><td>Support Assistant</td><td>Web search and crawling instead of a private corpus, freshness in minutes, source quality ranking.</td></tr>
 <tr><td>Design a high-concurrency LLM inference API</td><td>Inference Batching</td><td>Multi-model routing, per-key token rate limits, streaming, KV-aware load balancing.</td></tr>
-<tr><td>Design GitHub Copilot (inline completions)</td><td>Coding Agent</td><td>Latency budget of a few hundred ms, fill-in-the-middle prompts from cursor context, small fast models, debouncing and cancellation.</td></tr>
-<tr><td>Design ChatGPT's memory feature</td><td>ChatGPT</td><td>Extraction pipeline, user-visible memory store, relevance retrieval, deletion and privacy.</td></tr>
-<tr><td>Design a document-processing pipeline (IDs, payslips, invoices)</td><td>Coding Agent (durable runs)</td><td>Batch-oriented, vision models, schema extraction with validation, human review queue, provider-outage tolerance.</td></tr>
+<tr><td>Design ChatGPT's memory feature</td><td>ChatGPT + <a href="#context-engineering">Context Engineering</a></td><td>Extraction pipeline, user-visible memory store, relevance retrieval, deletion and privacy.</td></tr>
+<tr><td>Design Cursor / Windsurf (an AI IDE)</td><td>Claude Code + Autocomplete</td><td>Both latency regimes in one product: tab completions plus an agent mode; codebase indexing on the server, privacy modes.</td></tr>
+<tr><td>Design an AI code reviewer</td><td>Claude Code (headless mode)</td><td>Triggered by PR webhooks, diff-scoped context, comment precision over recall, cost per PR.</td></tr>
+<tr><td>Design an LLM evaluation platform</td><td>LLM Gateway + <a href="#evaluation">Evaluation</a></td><td>Dataset store, runner fleet, judge pool, results warehouse, regression gates in CI.</td></tr>
+<tr><td>Design a semantic cache / token rate limiter</td><td>LLM Gateway</td><td>Narrow component designs; see <a href="#llm-caching">Caching for LLMs</a> and <a href="#gateway-reliability">Gateways &amp; Reliability</a>.</td></tr>
 </tbody></table></div>
 </section>

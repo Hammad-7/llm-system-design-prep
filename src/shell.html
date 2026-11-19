@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LLM System Design Prep</title>
-<meta name="description" content="A free study guide for system design interviews about LLM-powered applications: concepts, patterns, worked examples and a 55-question bank.">
+<meta name="description" content="A free study guide for system design interviews about LLM-powered applications: concepts, patterns, in-depth concept pages, eleven worked examples and a 58-question bank.">
 <meta property="og:type" content="website">
 <meta property="og:title" content="LLM System Design Prep">
-<meta property="og:description" content="A free study guide for system design interviews about LLM-powered applications: concepts, patterns, worked examples and a 55-question bank.">
+<meta property="og:description" content="A free study guide for system design interviews about LLM-powered applications: concepts, patterns, in-depth concept pages, eleven worked examples and a 58-question bank.">
 <meta name="twitter:card" content="summary">
 <meta name="google-site-verification" content="QjppQVr9rlSMkX013JvLey2Cv8x0jQ9dMCxetO4wtEo">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -319,6 +319,24 @@ a.card2:hover{border-color:var(--accent);background:var(--accent-soft)}
         <li><a href="#question-breakdowns"><span class="dot"></span>Question Breakdowns</a></li>
       </ul>
     </div>
+    <div class="grp" data-grp="concepts">
+      <button aria-expanded="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5h6a4 4 0 0 1 4 4v11a3 3 0 0 0-3-3H2z"/><path d="M22 5h-6a4 4 0 0 0-4 4v11a3 3 0 0 1 3-3h7z"/></svg>Core Concepts<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg></button>
+      <ul>
+        <li><a href="#inference-serving"><span class="dot"></span>Inference &amp; Serving</a></li>
+        <li><a href="#context-engineering"><span class="dot"></span>Context Engineering &amp; Memory</a></li>
+        <li><a href="#vector-search"><span class="dot"></span>Embeddings &amp; Vector Search</a></li>
+        <li><a href="#rag-deep-dive"><span class="dot"></span>RAG in Depth</a></li>
+        <li><a href="#llm-caching"><span class="dot"></span>Caching for LLMs</a></li>
+        <li><a href="#agents-tool-use"><span class="dot"></span>Agents, Tools &amp; MCP</a></li>
+        <li><a href="#evaluation"><span class="dot"></span>Evaluation</a></li>
+        <li><a href="#guardrails-security"><span class="dot"></span>Guardrails &amp; Security</a></li>
+        <li><a href="#api-streaming"><span class="dot"></span>API Design &amp; Streaming</a></li>
+        <li><a href="#gateway-reliability"><span class="dot"></span>Gateways, Routing &amp; Reliability</a></li>
+        <li><a href="#observability"><span class="dot"></span>Observability &amp; LLMOps</a></li>
+        <li><a href="#fine-tuning"><span class="dot"></span>Fine-tuning &amp; Adaptation</a></li>
+        <li><a href="#numbers-to-know"><span class="dot"></span>Numbers to Know</a></li>
+      </ul>
+    </div>
     <div class="grp" data-grp="qb">
       <button aria-expanded="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16v14H4z"/><path d="M8 9h8M8 13h5"/></svg>Worked Examples<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg></button>
       <ul>
@@ -326,6 +344,13 @@ a.card2:hover{border-color:var(--accent);background:var(--accent-soft)}
         <li><a href="#design-support-assistant"><span class="dot"></span>Support RAG Assistant</a></li>
         <li><a href="#design-inference-batching"><span class="dot"></span>Inference Batching Service</a></li>
         <li><a href="#design-coding-agent"><span class="dot"></span>AI Coding Agent</a></li>
+        <li><a href="#design-claude-code"><span class="dot"></span>Design Claude Code</a></li>
+        <li><a href="#design-code-completion"><span class="dot"></span>Copilot-style Autocomplete</a></li>
+        <li><a href="#design-answer-engine"><span class="dot"></span>Perplexity-style Answer Engine</a></li>
+        <li><a href="#design-deep-research"><span class="dot"></span>Deep Research Agent</a></li>
+        <li><a href="#design-llm-gateway"><span class="dot"></span>LLM Gateway</a></li>
+        <li><a href="#design-voice-agent"><span class="dot"></span>Real-time Voice Agent</a></li>
+        <li><a href="#design-doc-extraction"><span class="dot"></span>Document Extraction Pipeline</a></li>
       </ul>
     </div>
     <div class="grp" data-grp="practice">

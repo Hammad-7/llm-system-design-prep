@@ -20,7 +20,8 @@ pages = ''.join(open(f, encoding='utf-8').read() for f in files)
 pages = (pages.replace('<span class="ci w"></span>', '<span class="ci">' + WARN + '</span>')
               .replace('<span class="ci"></span>', '<span class="ci">' + BULB + '</span>'))
 
-diagrams = read('diagrams.js')
+diagrams = read('diagrams.js') + ''.join('\n' + open(f, encoding='utf-8').read()
+    for f in sorted(glob.glob(os.path.join(SRC, 'diagrams', '*.js'))))
 out = (read('shell.html').replace('{{CONTENT}}', pages)
        .replace('{{DIAGRAMS}}', diagrams).replace('{{APP}}', read('app.js')))
 

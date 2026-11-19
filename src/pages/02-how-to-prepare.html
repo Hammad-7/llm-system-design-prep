@@ -14,7 +14,7 @@
 <div class="tbl"><table>
 <thead><tr><th>Where you're interviewing</th><th>What candidates report</th><th>Where to spend time</th></tr></thead>
 <tbody>
-<tr><td><strong>Frontier labs, SWE roles</strong></td><td>Inference batching, high-concurrency inference APIs, model/file distribution, plus classic prompts (KV store, web crawler, webhooks, CI/CD). Questions wear AI vocabulary but test infrastructure fundamentals (<a href="https://www.aced.io/blog/anthropic-system-design-interview">Exponent: Anthropic</a>, <a href="https://www.designgurus.io/answers/detail/what-to-expect-in-the-openai-system-design-interview">DesignGurus: OpenAI</a>).</td><td>Classic distributed systems first, then inference concepts (batching, KV cache, routing). Practice the <a href="#design-inference-batching">batching breakdown</a>.</td></tr>
+<tr><td><strong>Frontier labs, SWE roles</strong></td><td>Inference batching, high-concurrency inference APIs, model/file distribution, plus classic prompts (KV store, web crawler, webhooks, CI/CD). Questions wear AI vocabulary but test infrastructure fundamentals (<a href="https://www.aced.io/blog/anthropic-system-design-interview">Aced (formerly Exponent): Anthropic</a>, <a href="https://www.designgurus.io/answers/detail/what-to-expect-in-the-openai-system-design-interview">DesignGurus: OpenAI</a>).</td><td>Classic distributed systems first, then inference concepts (batching, KV cache, routing). Practice the <a href="#design-inference-batching">batching breakdown</a>.</td></tr>
 <tr><td><strong>Frontier labs, product / full-stack roles</strong></td><td>Design ChatGPT, a ChatGPT-style homepage with streaming, the Playground with presets, enterprise search with permission-aware indexing.</td><td>Streaming, conversation state, API design, rate limits. Practice <a href="#design-chatgpt">Design ChatGPT</a>.</td></tr>
 <tr><td><strong>Big tech, AI/ML engineer roles</strong></td><td>"Design an LLM-based system for X": support assistant, document Q&amp;A, code review, enterprise search, on-device small model.</td><td>RAG end to end, evaluation, guardrails, cost. Practice the <a href="#design-support-assistant">Support Assistant</a>.</td></tr>
 <tr><td><strong>AI-native startups &amp; forward-deployed roles</strong></td><td>Domain-specific: document-processing pipelines, agent workflows, voice assistants, "our provider goes down, what happens?"</td><td>Agents, durable workflows, provider fallback, cost per task. Practice the <a href="#design-coding-agent">Coding Agent</a>.</td></tr>
@@ -42,7 +42,7 @@
 <li>Compare against the breakdown. Note every component you missed and every deep dive you couldn't have answered.</li>
 <li>Write the missing concepts on a "gaps" list and revisit them in Core Concepts.</li>
 </ol>
-<p>The Bad / Good / Great solution format in each deep dive is there to show you the ladder interviewers climb. Mid-level candidates who reach "Good" pass. Senior candidates are expected to reach "Great" on at least two deep dives without being led there.</p>
+<p>The Bad / Good / Great solution format in each deep dive is there to show you the ladder interviewers climb. Mid-level candidates who reach "Good" typically pass. Senior candidates are usually expected to reach "Great" on at least two deep dives without being led there.</p>
 
 <h2>Step 4: Build one small thing</h2>
 <p>A single weekend project will make your answers more concrete than any amount of reading, because you'll quote numbers you measured. A good scope:</p>
@@ -52,7 +52,7 @@
 <li><strong>Streaming and tracing.</strong> Stream responses over SSE and log every step (retrieval latency, TTFT, tokens in and out, cost) to an open-source tracer such as Langfuse.</li>
 <li><strong>One tool.</strong> Let the model call a single function, and validate its arguments in code before executing.</li>
 </ul>
-<p>In the interview, A sentence like "when I tried it, the reranker lifted recall@5 noticeably and cost about this much latency", with your own measured numbers, lands far better than a recited benchmark.</p>
+<p>In the interview, a sentence like "when I tried it, the reranker lifted recall@5 noticeably and cost about this much latency", with your own measured numbers, lands far better than a recited benchmark.</p>
 
 <h2>Step 5: Practice under real conditions</h2>
 <p>Pick prompts from the <a href="#question-bank">Question Bank</a> you haven't seen worked through. Set a 45-minute timer, talk out loud, and draw in the tool your company uses (Excalidraw is common). Record yourself if you can. Afterwards, grade yourself against this checklist:</p>
@@ -86,7 +86,7 @@
 <h3>Four weeks</h3>
 <ul>
 <li><strong>Week 1:</strong> classic system design refresh plus the whole Fast Track.</li>
-<li><strong>Week 2:</strong> all four breakdowns, done actively (cold attempt first). Start the weekend RAG project.</li>
+<li><strong>Week 2:</strong> the four breakdowns closest to your interview family, done actively (cold attempt first). Start the weekend RAG project.</li>
 <li><strong>Week 3:</strong> finish the project with evals and tracing. Read three engineering write-ups from <a href="#resources">Resources</a>. Four timed practice questions.</li>
 <li><strong>Week 4:</strong> four to six mocks, focused on your interview family. Polish your opening five minutes.</li>
 </ul>
@@ -97,7 +97,7 @@
 <ol>
 <li>Memorize the <a href="#delivery-framework">Delivery Framework</a> timings and the LLM-specific non-functional requirements.</li>
 <li>Learn the reference request path: gateway → guard → context assembly (history + retrieval) → model router → LLM → output guard → stream → trace.</li>
-<li>Know four numbers: tokens per word, TTFT vs decode speed, KV cache per token for a 70B model, and that a cache read is about a tenth of the input price on major APIs.</li>
+<li>Know four numbers: tokens per word, TTFT vs decode speed, KV cache per token for a 70B model, and that a cache read is about a tenth of the input price or less on major APIs.</li>
 <li>Have one sentence each on evaluation, prompt injection, and provider fallback.</li>
 </ol>
 </section>

@@ -1,0 +1,215 @@
+<section class="page" id="p-llm-caching" data-title="Caching for LLMs" data-kw="caching prompt caching prefix caching kv cache automatic prefix caching vllm sglang radix attention lmcache kv offload cache-aware routing semantic cache exact response cache embedding cache retrieval cache tool cache ttl eviction lru hit rate cost savings stampede poisoning timing side channel gptcache">
+<div class="banner" style="--banner:#86c5a8" data-bt="Caching for LLMs" data-bs="the cheapest token is the one you don't recompute"></div>
+<p class="eyebrow">LLM System Design · Core Concepts</p>
+<h1>Caching for LLMs</h1>
+<p class="lead">Where to cache in an LLM system, how provider prompt caching and engine prefix caching actually work, when semantic caching is safe, and how to estimate the savings in an interview.</p>
+<hr class="sep">
+
+<p>In classic system design, caching protects a database from read load and shaves milliseconds. In LLM systems the stakes are much higher. A single uncached model call can cost cents and take seconds; with a cached prefix, those input tokens cost a tenth as much or less and the call starts streaming sooner. For a product serving a million requests a day, caching decisions routinely move the bill by tens of thousands of dollars per day and move time to first token (TTFT) by hundreds of milliseconds.</p>
+<p>There are also more kinds of cache. Some store final answers (like a classic response cache), some store intermediate computation (the model's attention state for a prompt prefix), and some store expensive side products (embeddings, retrieval results, tool outputs). Each has a different key, hit rate, failure mode and privacy risk. This page walks through them in the same order you'd discuss them in an interview: where to cache, how each layer works, eviction, common problems, and how to bring it up.</p>
+
+<h2>Where to cache</h2>
+<figure class="dg" data-diagram="llm-caching-where"></figure>
+<div class="tbl"><table>
+<thead><tr><th>Layer</th><th>What's cached</th><th>Key</th><th>Saves</th><th>Typical hit rate</th></tr></thead>
+<tbody>
+<tr><td>Provider prompt cache</td><td>KV state of a prompt prefix, on the provider's GPUs</td><td>Exact token prefix (per organization or workspace)</td><td>~90% of prefix input cost, part of TTFT</td><td>High for agents and long system prompts</td></tr>
+<tr><td>Engine prefix cache (self-hosted)</td><td>KV blocks in GPU memory, optionally CPU/SSD</td><td>Hash of token blocks</td><td>Prefill compute, TTFT, GPU time</td><td>High with cache-aware routing</td></tr>
+<tr><td>Exact response cache</td><td>Final model output</td><td>Hash of model + params + normalized input + tenant</td><td>The whole call</td><td>Low for chat; high for batch, classification, evals</td></tr>
+<tr><td>Semantic cache</td><td>Final output for similar inputs</td><td>Embedding similarity within a scope</td><td>The whole call</td><td>Medium for FAQ-like traffic; risky elsewhere</td></tr>
+<tr><td>Embedding cache</td><td>Vectors for text</td><td>Hash of embedding-model version + text</td><td>Embedding calls during re-ingestion and repeated queries</td><td>High during re-indexing</td></tr>
+<tr><td>Retrieval cache</td><td>Top-k results for a query</td><td>Normalized query + filters + index version</td><td>Search and rerank latency</td><td>Medium</td></tr>
+<tr><td>Tool-result cache</td><td>Outputs of read-only tools (web fetch, lookups)</td><td>Tool + args + freshness bucket</td><td>External API latency and quota</td><td>Varies</td></tr>
+<tr><td>CDN / edge</td><td>Pre-generated AI content (product descriptions, page summaries)</td><td>URL</td><td>Everything; content is generated offline</td><td>Very high</td></tr>
+</tbody></table></div>
+<p>The two layers that matter most in nearly every design are the ones that cache <em>computation</em>, not answers: provider prompt caching and engine prefix caching. They're safe (the model still generates a fresh answer), they apply to every request with a shared prefix, and they're invisible to the user. Answer caches are the riskier, more situational layer.</p>
+
+<h2>Provider prompt caching</h2>
+<h3>How it works</h3>
+<p>When a model processes a prompt, prefill computes keys and values for every token at every layer: the KV cache (see <a href="#inference-serving">Inference &amp; Serving</a>). Prompt caching keeps that state after the request finishes. If a later request begins with the exact same tokens, the provider loads the stored state instead of recomputing it, then only prefills the new suffix. You pay a reduced rate for the cached tokens, and TTFT drops because less prefill work is done.</p>
+<ul>
+<li><strong>Exact prefix match.</strong> Matching is on tokens from the very start of the prompt. A single different token early on means everything after it is a miss.</li>
+<li><strong>Minimum size.</strong> Providers only cache prefixes above a minimum length (roughly 512 to 4,096 tokens, varying by model and provider).</li>
+<li><strong>Lifetime.</strong> Cached prefixes expire after minutes of inactivity unless refreshed by use; some providers offer longer, paid retention.</li>
+<li><strong>Scope.</strong> Caches are scoped to your organization (or tighter), so one customer can't hit another's cache. This matters for privacy; see common problems below.</li>
+<li><strong>Explicit vs automatic.</strong> Some APIs cache automatically; others let you mark cache breakpoints in the request so you control what's stored, and Anthropic and OpenAI (on newer models) offer both.</li>
+</ul>
+
+<h3>Provider comparison</h3>
+<p>Prices and rules change frequently, so treat this as the shape of the landscape and check the linked docs before quoting a number in an interview or a budget.</p>
+<div class="tbl"><table>
+<thead><tr><th>Provider</th><th>How you enable it</th><th>Write cost</th><th>Read cost</th><th>Lifetime</th></tr></thead>
+<tbody>
+<tr><td>Anthropic (Claude)</td><td>Explicit <code>cache_control</code> breakpoints (up to 4), or one top-level <code>cache_control</code> for automatic placement</td><td>1.25× base input (5-minute) or 2× (1-hour)</td><td>0.1× base input on most models; 0.05× on Sonnet 5.5 and Opus 5.5, 0.025× on Fable and Mythos 5.1–5.2</td><td>5 minutes, refreshed on each hit; or 1 hour</td></tr>
+<tr><td>OpenAI</td><td>Automatic for prompts ≥ 1,024 tokens; GPT-5.6+ also supports explicit breakpoints; <code>prompt_cache_key</code> improves routing on earlier models</td><td>GPT-5.6+: 1.25× (30-minute) or 2.5× (12-hour). Earlier models: no surcharge</td><td>GPT-5.6+: 0.1× (0.05× on some models). Earlier models: model-dependent discount</td><td>GPT-5.6+: 30 minutes or 12 hours. Earlier models: in-memory (minutes) or extended 24-hour retention</td></tr>
+<tr><td>Google (Gemini)</td><td>Implicit caching on by default (2.5+); explicit context caches you create with a TTL (2.5 and 3.x, not Gemini 4)</td><td>Implicit: none. Explicit: per-token-per-hour storage fee</td><td>~90% off on 2.5 and 3.x models (95% on Gemini 4)</td><td>Implicit: short, not guaranteed. Explicit: your TTL</td></tr>
+</tbody></table></div>
+<p class="src">Sources: <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching">Claude prompt caching</a>, <a href="https://platform.claude.com/docs/en/about-claude/pricing">Claude pricing</a>, <a href="https://developers.openai.com/api/docs/guides/prompt-caching">OpenAI prompt caching</a>, <a href="https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/context-cache/context-cache-overview">Google context caching</a>, <a href="https://aistudio.google.com/docs/pricing">Gemini pricing</a>. Checked November 2026.</p>
+
+<h3>Break-even math</h3>
+<p>If a cache write costs <code>w</code>× base input and a read costs <code>r</code>×, caching a prefix that's reused <code>k</code> times is cheaper than not caching when:</p>
+<pre><code>w + k·r  &lt;  1 + k      →      k  &gt;  (w − 1) / (1 − r)
+
+5-minute cache  (w = 1.25, r = 0.05–0.1):  k &gt; 0.26–0.28  → <span class="k">pays off after 1 reuse</span>
+1-hour cache    (w = 2.0,  r = 0.05–0.1):  k &gt; 1.05–1.11  → <span class="k">pays off after 2 reuses</span></code></pre>
+<p>So the question is never "should we cache?" but "what's stable enough to reuse within the lifetime?" For a chat product, the system prompt and tools are reused by every request. For an agent, the entire growing trajectory is reused by the next step a few seconds later, which is why agents see the largest savings (the <a href="#context-engineering">Context Engineering</a> page works through an 89% saving on a 40-step run).</p>
+
+<h3>Designing prompts for cache hits</h3>
+<ul>
+<li>Order content from most to least stable: tools → system prompt → examples → per-session context → history → new input.</li>
+<li>Keep timestamps, request IDs and per-user data out of the prefix.</li>
+<li>Place breakpoints (where explicit) after each stable block, and one at the end of the conversation so the next turn reuses this turn.</li>
+<li>Route a user or conversation consistently (e.g. OpenAI's <code>prompt_cache_key</code>) so requests land where their cache lives.</li>
+<li>Monitor <strong>cache-read tokens ÷ input tokens</strong> per route. Providers return cached-token counts in the usage object; a sudden drop means someone broke the prefix.</li>
+</ul>
+
+<h2>Engine prefix caching (self-hosted)</h2>
+<p>When you run your own models, the serving engine does the same thing inside your GPUs, and you control the policy.</p>
+<h3>vLLM: hashed blocks</h3>
+<p>vLLM stores the KV cache in fixed-size blocks (PagedAttention). With <strong>automatic prefix caching</strong>, each full block is identified by a hash of its own tokens plus the hash of everything before it, and a global table maps hashes to physical blocks. A new request walks its prompt block by block; every block whose hash is already in the table is reused. Blocks no longer referenced by any running request become evictable, and the least recently used is evicted first, ending blocks of long prefixes before shared early ones (<a href="https://docs.vllm.ai/en/latest/design/prefix_caching/">vLLM prefix caching design</a>). For multi-tenant deployments, use a cryptographic hash (SHA-256, the default in recent vLLM versions) to make collisions impractical, and a per-request <code>cache_salt</code> so tenants never share cached blocks.</p>
+<h3>SGLang: a radix tree</h3>
+<p>SGLang's <strong>RadixAttention</strong> keeps cached prefixes in a radix tree keyed by token sequences, so shared prefixes are stored once and branches diverge where prompts differ. Eviction removes least-recently-used <em>leaves</em> first, so the widely shared root (system prompt, tools) is the last to go (<a href="https://arxiv.org/abs/2312.07104">SGLang paper</a>). vLLM's block policy behaves similarly for standard attention models.</p>
+<figure class="dg" data-diagram="llm-caching-prefix-tree"></figure>
+
+<h3>Cache-aware routing</h3>
+<p>A prefix cache only helps if the request reaches the replica that holds the prefix. With 50 replicas and round-robin load balancing, a multi-turn conversation lands on a cold replica most of the time. Options:</p>
+<ul>
+<li><strong>Session affinity:</strong> hash the conversation ID to a replica. Simple; uneven when some sessions are much heavier.</li>
+<li><strong>Prefix-aware routing:</strong> hash the first few blocks of the prompt (e.g. system prompt + tenant documents) so requests sharing a long prefix go together.</li>
+<li><strong>KV-aware scoring:</strong> the router tracks which replicas hold which prefix blocks and scores each replica by expected cache hit minus current load. Projects such as llm-d, NVIDIA Dynamo and the SGLang router implement variants of this.</li>
+<li><strong>Bounded load:</strong> any affinity scheme needs a cap so a viral prefix doesn't melt one replica. Consistent hashing with bounded loads (spill to the next replica once one exceeds, say, 1.25× average load) is the classic fix.</li>
+</ul>
+
+<h3>KV offload tiers: GPU → CPU → SSD</h3>
+<p>GPU memory (HBM) is the smallest and most expensive tier, and it's also where running sequences need space, so cached prefixes get evicted quickly under load. Offloading evicted KV blocks to CPU DRAM and then local SSD or a shared store keeps them reusable. <a href="https://github.com/LMCache/LMCache">LMCache</a> is a widely used layer for this with vLLM; its authors report multi-fold TTFT reductions on multi-round chat and document-analysis workloads (<a href="https://arxiv.org/abs/2510.09665">LMCache paper</a>, vendor-run benchmarks). Whether loading beats recomputing is simple arithmetic:</p>
+<pre><code>Llama-3-70B-class model, FP16 KV ≈ 320 KB per token. A 32K-token shared prefix:
+  KV size      = 32,000 × 320 KB          ≈ <span class="k">10.5 GB</span>
+
+Recompute (prefill) ≈ 2 × params × tokens  = 2 × 70e9 × 32e3 ≈ 4.5e15 FLOPs
+  8 × H100 at ~40% of ~990 dense BF16 TFLOPS ≈ 3.2e15 FLOP/s  → <span class="k">~1.4 s</span> (more with attention)
+
+Load from CPU DRAM over PCIe Gen5 (~50 GB/s usable per GPU, 8 GPUs in parallel,
+  each loading its 1/8 tensor-parallel shard)  ≈ 1.3 GB per GPU ÷ 50 GB/s → <span class="k">~0.03 s</span></code></pre>
+<p>Even with generous overheads, reloading a long prefix from host memory is an order of magnitude faster than recomputing it. SSD and network tiers are slower but still competitive for long prefixes. The cost is engineering complexity and host memory.</p>
+
+<h2>Response caches</h2>
+<h3>Exact response cache</h3>
+<p>Hash the full request (model, version, sampling parameters, normalized messages, tool definitions, tenant) and store the output. It's a plain key-value cache (Redis, the gateway's built-in cache) with a TTL.</p>
+<ul>
+<li><strong>Good fit:</strong> deterministic tasks at temperature 0 (classification, extraction, moderation), batch pipelines that re-run over the same data, eval suites, popular pre-computable prompts ("summarize this public page").</li>
+<li><strong>Poor fit:</strong> open-ended chat, where almost no two requests are identical, and any request where the user expects a fresh sample ("regenerate" must bypass the cache).</li>
+<li><strong>Normalization</strong> (trim whitespace, lowercase where safe, canonical JSON) raises hit rate. Be conservative: normalizing away meaning produces wrong hits.</li>
+</ul>
+
+<h3>Semantic cache</h3>
+<figure class="dg" data-diagram="llm-caching-semantic"></figure>
+<p>A semantic cache embeds the incoming query, searches past queries in the same scope, and returns the stored answer if the nearest neighbor's similarity exceeds a threshold τ. It turns "How do I reset my password?" and "password reset steps?" into one model call. Open-source options include GPTCache, Redis vector search and gateway plugins (Kong, Portkey and others offer one).</p>
+<p>The danger is <strong>false hits</strong>: embeddings place "How do I reset my password?" and "How do I reset my 2FA device?" close together, but the answers differ. Treat the threshold as a precision/recall trade-off you measure, not a constant you guess:</p>
+<ol>
+<li>Collect a few thousand real query pairs with labels "same answer is correct" or not.</li>
+<li>Sweep τ and plot hit rate against false-hit rate.</li>
+<li>Pick the τ where false hits are below what the product tolerates (often well under 1% for support content), and accept the lower hit rate that implies.</li>
+</ol>
+<p>Ways to make semantic caching safer:</p>
+<ul>
+<li><strong>Scope tightly:</strong> per tenant always; per user if answers include anything personal; per locale and model version.</li>
+<li><strong>Restrict to cacheable intents:</strong> a classifier allows only FAQ-type, non-personal questions into the cache. Never cache answers that depend on account state, the current time, or tool calls with side effects.</li>
+<li><strong>Verify hits:</strong> add an entity/keyword overlap check or a cheap model that confirms "does this cached answer answer this question?" A small-model check is still far cheaper than a frontier-model answer.</li>
+<li><strong>Cache earlier in the pipeline:</strong> caching the <em>retrieval results</em> for similar queries, then still generating the answer, captures much of the latency win with far less correctness risk.</li>
+<li><strong>Invalidate on content change:</strong> tag each cached answer with the document IDs it was grounded on and purge by tag when those documents change.</li>
+</ul>
+
+<h2>Embedding, retrieval and tool caches</h2>
+<ul>
+<li><strong>Embedding cache:</strong> key on <code>hash(embedding_model_version, text)</code>. Identical text with an identical model always yields the same vector, so this cache never goes stale; it's what makes re-ingesting a mostly unchanged corpus cheap. Changing the embedding model invalidates it by construction.</li>
+<li><strong>Retrieval cache:</strong> key on the normalized query, filters (tenant, ACL groups) and the <strong>index version</strong>. Bumping the index version on each re-index invalidates stale results without explicit purges.</li>
+<li><strong>Tool-result cache:</strong> cache only read-only tools, with a TTL that matches data volatility (a stock price: seconds; a documentation page: hours). Never cache tools with side effects; use idempotency keys for those instead (see <a href="#agents-tool-use">Agents, Tools &amp; MCP</a>).</li>
+<li><strong>Edge-cached AI content:</strong> if output doesn't depend on the user (a generated product description, a page summary), generate it offline in a batch job (batch APIs are commonly 50% cheaper) and serve it from a CDN. The model is then out of the request path entirely.</li>
+</ul>
+
+<h2>Eviction and lifetimes</h2>
+<div class="tbl"><table>
+<thead><tr><th>Cache</th><th>Who controls eviction</th><th>Policy</th><th>Design lever</th></tr></thead>
+<tbody>
+<tr><td>Provider prompt cache</td><td>Provider</td><td>TTL since last use (minutes), optional longer paid retention</td><td>Request rate per prefix; choose 1-hour retention when reuse gaps exceed 5 minutes</td></tr>
+<tr><td>Engine prefix cache</td><td>You (engine config)</td><td>LRU over unreferenced blocks or tree leaves; some engines support priorities</td><td>GPU memory reserved for KV; offload tiers; routing</td></tr>
+<tr><td>Exact / semantic response cache</td><td>You (Redis or similar)</td><td>TTL + LRU/LFU; tag-based purge</td><td>TTL per intent; invalidate on document change</td></tr>
+<tr><td>Embedding cache</td><td>You</td><td>Rarely evicted; keyed by model version</td><td>Storage cost only</td></tr>
+</tbody></table></div>
+<p>A useful trick for the provider cache: if a prefix is reused every 6–10 minutes (just over the 5-minute lifetime), either switch to 1-hour retention or send a tiny keep-warm request before expiry. Compare the costs: a keep-warm read of a 20K-token prefix every 4.5 minutes costs 20K × the read rate (0.05–0.1×) per ping, about 13 pings per hour, versus one 2× write per hour plus normal reads. Do the multiplication for your prices; for long prefixes and steady traffic either option beats repeated cold writes.</p>
+
+<h2>Hit-rate math: a worked example</h2>
+<p>A support assistant handles 1M requests per day. Each sends 10K input tokens, of which 6K are a stable prefix (system prompt, tools, policies), and returns 300 output tokens. Prices (Sonnet 5.5): $2/M input, $10/M output, cache write 1.25×, read 0.05×.</p>
+<pre><code><span class="c">Before caching</span>
+  input  10,000 × $2/M   = $0.0200
+  output    300 × $10/M  = $0.0030
+  per request            = $0.0230   × 1M/day = <span class="k">$23,000/day</span>
+
+<span class="c">After caching</span>
+  exact cache hits:        5% of requests
+  semantic cache hits:    15% of the remaining 95%  = 14.25%
+  served from response caches: 19.25%   → 807,500 requests still reach the model
+
+  prefix (6K): 90% read at 0.05×, 10% written at 1.25×
+     0.9 × 6,000 × $0.10/M + 0.1 × 6,000 × $2.50/M = $0.00054 + $0.0015 = $0.0020
+  rest of input (4K) × $2/M                                              = $0.0080
+  output                                                                 = $0.0030
+  per model request                                                      = $0.0130
+  × 807,500                                                              = <span class="k">$10,530/day (−54%)</span></code></pre>
+<p>Notice where the savings come from: about two-thirds (~$8.0K/day) from prompt caching (risk-free) and one-third (~$4.4K/day) from response caches (which carry the false-hit risk). In an interview, say both numbers and that you'd ship prompt caching first. Also note that the remaining cost is dominated by the uncached 4K tokens and output; the next lever is trimming retrieval and history (see <a href="#context-engineering">Context Engineering</a>) or routing easy requests to a cheaper model (see <a href="#gateway-reliability">Gateways, Routing &amp; Reliability</a>).</p>
+
+<h2>Common caching problems</h2>
+<h3>Cold-cache stampedes</h3>
+<p>You deploy a new system prompt. Every in-flight conversation now misses, and thousands of requests in the same second each write the new prefix (paying the write premium) and, on self-hosted fleets, each run full prefill, spiking TTFT across the fleet. <strong>Handle it:</strong> pre-warm caches with one request per region or replica before shifting traffic, roll prompt changes gradually (canary 1% → 10% → 100%), and use request coalescing (single-flight) for response caches so concurrent identical misses compute once.</p>
+<h3>Staleness</h3>
+<p>A policy document changes and the semantic cache keeps serving the old refund window. <strong>Handle it:</strong> tag cached answers with source document IDs and purge on change events; include index or prompt version in keys; set TTLs by intent; never cache answers to time-sensitive questions.</p>
+<h3>Privacy and cross-tenant leakage</h3>
+<p>A response cache keyed without the tenant ID serves one customer's answer to another. More subtly, shared prompt caches leak information through timing: a cache hit has measurably lower TTFT, so an attacker who shares a cache can test whether someone else recently sent a given prefix. An audit of 17 API providers in 2024 detected cache sharing across organizations at 7 of them; several changed their behavior after disclosure (<a href="https://arxiv.org/abs/2502.07776">Gu et al., ICML 2025</a>). <strong>Handle it:</strong> tenant (and user, where personal) in every cache key and partition; per-organization scoping for any shared KV cache you operate; never cache prompts containing secrets.</p>
+<h3>Cache poisoning</h3>
+<p>A bad answer, or one shaped by a prompt injection, gets written to a semantic cache and is then served to everyone who asks something similar. <strong>Handle it:</strong> only write answers that passed output guardrails, consider writing only after positive feedback or for vetted intents, keep a fast purge path, and log which cache entry served each response so you can find affected users.</p>
+<h3>Hot prefixes and uneven load</h3>
+<p>Affinity routing sends all requests for a popular tenant's 100K-token knowledge base to one replica, which saturates while others idle. <strong>Handle it:</strong> bounded-load consistent hashing, replicating hot prefixes to several replicas, and autoscaling decisions based on per-replica queue depth rather than fleet averages.</p>
+<h3>Measuring the wrong thing</h3>
+<p>A semantic cache reports a 30% hit rate, but user satisfaction drops. <strong>Handle it:</strong> measure false-hit rate by sampling hits for LLM-judge or human review, and A/B test the cache like any other model change.</p>
+
+<h2>Caching in System Design Interviews</h2>
+<h3>When to bring it up</h3>
+<ul>
+<li><strong>Any design with a long, shared system prompt or documents.</strong> "Our 8K-token system prompt and tools are identical across requests, so prompt caching makes them 90–95% cheaper and cuts TTFT."</li>
+<li><strong>Agents.</strong> "Each step re-sends the trajectory, so I'll put cache breakpoints at the end of each turn; most input becomes cache reads."</li>
+<li><strong>Self-hosted inference.</strong> "Prefix caching only helps if requests land on the replica with the cache, so the router does prefix-aware routing with bounded load."</li>
+<li><strong>Cost reduction questions.</strong> "Here's the stack of caches I'd add, in order of risk."</li>
+<li><strong>High-volume repetitive queries.</strong> "FAQ-style questions are a good semantic cache candidate, scoped per tenant, with a threshold we tune on labeled pairs."</li>
+</ul>
+<h3>How to introduce it</h3>
+<ol>
+<li><strong>Find the reuse.</strong> What's identical across requests (prefix), across steps (trajectory), or across users (answers)?</li>
+<li><strong>Start with computation caches.</strong> Prompt or prefix caching first: no correctness risk.</li>
+<li><strong>Add answer caches only where safe.</strong> Exact caching for deterministic tasks; semantic caching for scoped, non-personal intents with a measured threshold.</li>
+<li><strong>Define keys, scope and invalidation.</strong> Tenant in every key; versions in keys; purge on content change.</li>
+<li><strong>Quantify.</strong> Estimate hit rates and show the cost and latency math; name the metric you'd monitor (cache-read share, false-hit rate).</li>
+</ol>
+
+<h3>Common deep-dive questions</h3>
+<h4>"Your LLM bill is too high. Cut it by half."</h4>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Add a semantic cache in front of everything</h5><p><span class="lbl">Challenges:</span> chat traffic rarely repeats exactly; an aggressive threshold creates wrong answers; personal and stateful requests can't be cached; you've added risk for an uncertain saving.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Prompt caching plus a model router</h5><p><span class="lbl">Approach:</span> reorder prompts so the system prompt, tools and documents form a stable prefix; enable provider caching; route simple requests to a cheaper model.</p><p><span class="lbl">Challenges:</span> needs measurement to prove quality holds on the cheaper model; cache hit rate depends on traffic patterns.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Measure, then stack levers by risk</h5><p><span class="lbl">Approach:</span> break the bill down by route into prefix input, variable input and output tokens. Apply prompt caching and cache-friendly ordering (often 20–40% alone for long prompts); trim history and retrieval; route easy traffic to small models behind an eval gate; move offline work to batch APIs; add exact caching for deterministic pipelines and a narrowly scoped semantic cache for FAQ intents with a measured false-hit rate. Show the per-request math and track cost per successful task, not just cost per call.</p><p><span class="lbl">Challenges:</span> each lever needs its own monitoring; savings interact (caching reduces the benefit of trimming), so re-measure after each step.</p></div>
+
+<h4>"Would you add a semantic cache to this support bot?"</h4>
+<p>Strong answer: "Only for a subset. I'd classify intents and cache only non-personal FAQ answers, scoped per tenant and locale, with a threshold tuned on labeled query pairs to keep false hits under, say, 0.5%. Each entry is tagged with the articles it cites and purged when they change. I'd A/B it and watch resolution rate and thumbs-down, and I'd also consider caching retrieval results instead, which captures much of the latency win with less risk."</p>
+
+<h4>"How do you maximize prefix cache hits across a fleet of 100 GPU replicas?"</h4>
+<p>Strong answer: cache-aware routing (hash on conversation or on the leading prefix blocks), bounded load to avoid hotspots, KV offload to CPU memory so evicted prefixes are cheap to restore, a shared system prompt kept identical across products where possible, and metrics per replica: prefix hit rate, KV memory utilization and TTFT. At larger scale, a KV-aware router that knows which replica holds which blocks (llm-d, Dynamo) and disaggregated prefill so prefill replicas specialize (see <a href="#inference-serving">Inference &amp; Serving</a> and <a href="#design-inference-batching">Inference Batching</a>).</p>
+
+<h2>Summary</h2>
+<ul>
+<li>Cache computation before answers. Prompt and prefix caching are safe, broad and usually the biggest win.</li>
+<li>Prefix caches need exact token prefixes: order prompts from stable to volatile and keep volatile values out of the front.</li>
+<li>Break-even is one reuse for a 1.25× write and a 0.05–0.1× read; agents benefit most because each step reuses the last.</li>
+<li>Self-hosted: prefix caching plus cache-aware routing with bounded load, plus CPU/SSD offload for long prefixes.</li>
+<li>Answer caches (exact, semantic) need tight scoping, measured thresholds, tag-based invalidation and poisoning defenses.</li>
+<li>Always put tenant (and user, where personal) in the key, and remember that shared caches can leak through timing.</li>
+</ul>
+<p>Related: <a href="#context-engineering">Context Engineering &amp; Memory</a>, <a href="#inference-serving">Inference &amp; Serving</a>, <a href="#gateway-reliability">Gateways, Routing &amp; Reliability</a>, and the <a href="#design-llm-gateway">LLM Gateway</a> worked example.</p>
+</section>

@@ -1,0 +1,220 @@
+<section class="page" id="p-design-claude-code" data-title="Design Claude Code" data-kw="claude code codex cli gemini cli agent harness terminal coding agent agent loop tools permissions sandbox seatbelt bubblewrap hooks skills subagents mcp claude.md compaction prompt caching checkpoints rewind headless sdk worktrees">
+<div class="banner" style="--banner:#c79ad6" data-bt="Design Claude Code" data-bs="worked example · agent harness"></div>
+<p class="eyebrow">Question Breakdown · Hard</p>
+<h1>Design Claude Code (an AI Coding Harness)</h1>
+<p class="lead">An agentic coding tool that runs in the developer's terminal or IDE, reads and edits the local repository, runs commands, and asks before doing anything risky. Representative of "design Claude Code / Codex CLI / Gemini CLI" and the broader "design an agent harness" prompt.</p>
+<hr class="sep">
+
+<h2>Understanding the Problem</h2>
+<p>A developer opens a terminal in their repository and types "the date parser test is flaky, find out why and fix it." The tool explores the code, reads the test, runs it a few times, edits two files, re-runs the tests, and reports back, streaming every step so the developer can interrupt or redirect it. The model does the thinking; everything around the model is the <strong>harness</strong>: the loop that calls the model, the tools it can use, the context it sees, the rules about what it may do, and the extension points teams use to customize it.</p>
+<p>The interesting part of this problem is that the hard engineering is <em>not</em> scale in the usual sense. The harness runs on one laptop for one user. The hard parts are: giving a model good-enough context about a huge codebase through a finite window, letting it run real shell commands on a machine that holds the user's SSH keys and cloud credentials, keeping long sessions affordable, and making edits that never silently corrupt code.</p>
+
+<div class="callout info"><span class="ci"></span><span class="ct">How this differs from the cloud coding agent</span><p>The <a href="#design-coding-agent">AI Coding Agent</a> breakdown is "issue in, pull request out" in a cloud sandbox. Clarify early which one the interviewer wants. The differences drive the whole design:</p></div>
+<div class="tbl"><table>
+<thead><tr><th></th><th>Local harness (this page)</th><th>Cloud coding agent</th></tr></thead>
+<tbody>
+<tr><td>Where code runs</td><td>The developer's own machine, with their files, credentials and network</td><td>A disposable microVM per run</td></tr>
+<tr><td>Interaction</td><td>Synchronous, human watching and steering turn by turn</td><td>Asynchronous, human reviews a PR at the end</td></tr>
+<tr><td>Main risk</td><td>Damaging or leaking the user's machine and secrets</td><td>Tenant isolation, runaway cost across thousands of runs</td></tr>
+<tr><td>Safety model</td><td>Permission prompts, rules, modes, OS-level sandbox</td><td>VM isolation, egress proxy, credentials outside the sandbox</td></tr>
+<tr><td>State</td><td>Local transcript and file checkpoints</td><td>Durable workflow history in a server</td></tr>
+<tr><td>Scale problem</td><td>Context and cost per session; the backend is the model API</td><td>Scheduling sandboxes and warm pools for 10K concurrent runs</td></tr>
+</tbody></table></div>
+
+<h3>Functional Requirements</h3>
+<ol>
+<li>Developers should be able to give a natural-language task in an interactive terminal session, watch the agent's text, tool calls and diffs stream live, and interrupt or steer at any time.</li>
+<li>The agent should be able to explore the codebase, edit files, and run commands (build, tests, git, package managers) on the developer's machine.</li>
+<li>Developers and organizations should control what the agent may do without asking: per-tool rules, permission modes, and managed policy.</li>
+<li>Sessions should persist: resume a past conversation, and rewind file changes the agent made.</li>
+<li>Teams should be able to extend it: project instructions, custom commands, deterministic hooks, external tools over MCP, skills and specialized subagents.</li>
+<li>The same engine should run headless (a CLI flag or an SDK) for CI and scripted automation.</li>
+</ol>
+<p><strong>Below the line:</strong> training the model, running the inference fleet (see <a href="#design-inference-batching">Inference Batching</a>), cloud sandboxes (see <a href="#design-coding-agent">AI Coding Agent</a>), keystroke-level autocomplete (see <a href="#design-code-completion">Copilot-style Autocomplete</a>), billing.</p>
+
+<h3>Non-Functional Requirements</h3>
+<ol>
+<li><strong>Responsiveness:</strong> the UI reacts to keystrokes and Esc within ~100 ms; the first streamed token of a turn arrives in ~1–2 s; local tools such as search and read return in tens of milliseconds.</li>
+<li><strong>Safety:</strong> nothing destructive or outward-facing happens without consent or an explicit rule; a hijacked agent's blast radius is bounded by OS enforcement, not by the model behaving well.</li>
+<li><strong>Local-first privacy:</strong> code leaves the machine only as context sent to the model API (optionally through the customer's own cloud provider); no repository index is uploaded.</li>
+<li><strong>Works on huge repos:</strong> millions of lines, no pre-built index required, startup in about a second.</li>
+<li><strong>Affordable long sessions:</strong> 50–200 model calls per session must not cost dollars per step; target a prompt-cache hit rate above 90% of input tokens.</li>
+<li><strong>Reliability:</strong> a crash, network drop or Ctrl-C never leaves a half-written file; sessions are resumable; transient API errors are retried with backoff.</li>
+<li><strong>Cross-platform:</strong> macOS, Linux and Windows, many shells and terminals.</li>
+</ol>
+
+<h2>The Set Up</h2>
+<h3>Core Entities</h3>
+<ul>
+<li><strong>Session</strong>: id, working directory, model, permission mode, token and cost counters.</li>
+<li><strong>Message</strong>: user text, assistant text, <code>tool_use</code> and <code>tool_result</code> blocks; the ordered list of messages <em>is</em> the agent's state.</li>
+<li><strong>Tool</strong>: name, description, JSON schema, read-only or mutating, concurrency-safe or not.</li>
+<li><strong>ToolCall</strong>: tool, arguments, permission decision, result (possibly truncated), duration.</li>
+<li><strong>PermissionRule</strong>: allow, ask or deny, a tool pattern such as <code>Bash(npm run test:*)</code> or <code>Read(./.env)</code>, and the scope it came from (managed, command line, local, project, user).</li>
+<li><strong>Hook</strong>: lifecycle event, matcher, command to run, timeout.</li>
+<li><strong>Subagent</strong>: name, description, system prompt, allowed tools, model.</li>
+<li><strong>Skill</strong>: folder with a <code>SKILL.md</code> (name, description, instructions) plus optional scripts and reference files.</li>
+<li><strong>MCP server</strong>: transport (stdio or HTTP), command or URL, credentials, the tools and resources it exposes.</li>
+<li><strong>Checkpoint</strong>: snapshot of files before an edit, tied to a message, so code and conversation can be rewound together.</li>
+</ul>
+
+<h3>Interface</h3>
+<p>The "API" here is two surfaces: the CLI the developer uses, and the model API the harness calls. Claude Code's public CLI looks like this:</p>
+<pre><code>claude                                   <span class="c"># interactive session in the current repo</span>
+claude "fix the flaky date parser test"  <span class="c"># start with a first prompt</span>
+claude --continue | --resume &lt;session&gt;   <span class="c"># reload a past transcript</span>
+claude -p "summarize this diff" --output-format stream-json --verbose  <span class="c"># headless, scriptable</span>
+/compact  /rewind  /permissions  /agents  /mcp                         <span class="c"># in-session slash commands</span></code></pre>
+<p>Underneath, every step of the agent is one streaming call to a tool-use API:</p>
+<pre><code>POST /v1/messages   stream: true
+{ system:   [ ...harness prompt..., cache_control ],      <span class="c">// stable, cached</span>
+  tools:    [ Read, Edit, Write, Glob, Grep, Bash, ... ],  <span class="c">// stable, cached</span>
+  messages: [ user, assistant(tool_use), user(tool_result), ... ] }
+→ SSE: text deltas, tool_use input deltas,
+       stop_reason: "tool_use" | "end_turn",
+       usage: { input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_tokens }
+
+Edit { file_path, old_string, new_string, replace_all? }
+  <span class="c">// in this design: fails if the file wasn't read this session, changed since it was read,</span>
+  <span class="c">// or old_string is not unique</span></code></pre>
+
+<h3>Back-of-envelope: tokens and cost per session</h3>
+<p>Assume one session of 40 model calls. The stable prefix (system prompt, tool definitions, memory) is ~20K tokens; the conversation grows to ~100K, so the average call carries ~60K input tokens and writes ~300 output tokens. Prices are Sonnet 5.5 list prices: $2 per million input and $10 per million output tokens, with cache writes at 1.25× and cache reads at 0.05× of input (<a href="https://platform.claude.com/docs/en/about-claude/pricing">Claude pricing</a>; check current numbers before quoting).</p>
+<pre><code>input processed  = 40 calls × 60K           = 2.4M tokens
+output           = 40 × 300                 = 12K tokens  → $0.12
+
+no caching:      2.4M × $2/M                = $4.80  (+ $0.12) ≈ <span class="k">$4.90 / session</span>
+with caching:    new tokens written ≈ 100K × $2.50/M  = $0.25
+                 reads ≈ 2.3M × $0.10/M               = $0.23
+                 total (+ output)                     ≈ <span class="k">$0.60 / session</span>
+cache hit rate   ≈ 2.3M / 2.4M                         ≈ <span class="k">96%</span>
+
+fleet: 1M developers × 3 sessions/day × 2.4M = 7.2T input tokens/day
+       uncached share ~4% → ~0.3T tokens/day of real prefill (~3.5M tokens/s)
+       output: 1M × 3 × 12K = 36B tokens/day (~420K tokens/s)</code></pre>
+<p>Two conclusions shape the design. First, agent loops are <strong>input-heavy</strong>: each step re-sends the whole conversation, so prompt caching cuts session cost roughly 8× and the harness must be built to keep the cache warm. Second, anything that rewrites early context (editing old messages, reordering tools, a timestamp in the system prompt) silently multiplies cost. See <a href="#llm-caching">Caching for LLMs</a> and <a href="#inference-serving">Inference &amp; Serving</a> for the provider-side mechanics.</p>
+
+<h2>High-Level Design</h2>
+<h3>1) Interactive tasks: the agent loop</h3>
+<p>The core is deliberately simple: one loop, one message list. Anthropic describes the loop behind Claude Code and its Agent SDK as <em>gather context → take action → verify work → repeat</em> (<a href="https://claude.com/resources/articles/building-agents-with-the-claude-agent-sdk">Building agents with the Claude Agent SDK</a>). One reasonable implementation:</p>
+<ol>
+<li>The user submits a prompt; it is appended to the message list.</li>
+<li>The context manager builds the request (system prompt, tools, memory, messages) and checks the token count; if it is near the limit, it compacts first.</li>
+<li>The loop streams the model response, rendering text deltas immediately and buffering <code>tool_use</code> blocks.</li>
+<li>If the response ends with <code>end_turn</code>, the turn is over and control returns to the user.</li>
+<li>Otherwise, each tool call goes through the permission pipeline and runs. Read-only, concurrency-safe calls (several greps or reads) can run in parallel; mutating calls run one at a time in order.</li>
+<li>Results, truncated to a budget, are appended as <code>tool_result</code> blocks, and the loop goes back to step 2.</li>
+</ol>
+<figure class="dg" data-diagram="design-claude-code-basic"></figure>
+<p>Why a single-threaded master loop rather than a graph of agents? Debuggability and predictability: the transcript is a complete, linear record of what happened, every decision is visible to the user, and there is exactly one place where budgets, interrupts and permissions are enforced. Parallelism is added in controlled places (parallel read-only tools, subagents) instead of everywhere.</p>
+<p><strong>Interrupts and steering.</strong> Esc aborts the HTTP stream and sends SIGINT/SIGTERM to any running child process, then appends a marker ("the user interrupted") so the model knows its last action may be incomplete. A message typed while the agent is working is queued and injected at the next step boundary, never mid-tool, so <code>tool_use</code>/<code>tool_result</code> pairs stay well-formed.</p>
+
+<h3>2) Exploring, editing and running</h3>
+<p>The model can only act through tools, so tool design is product design. Anthropic's guidance: a small set of clearly distinct tools, outputs that are token-efficient (truncation, pagination, sensible defaults), and error messages that tell the model how to recover (<a href="https://www.anthropic.com/research/writing-tools-for-agents">Writing effective tools for agents</a>). A typical set:</p>
+<div class="tbl"><table>
+<thead><tr><th>Tool</th><th>Purpose</th><th>Design notes</th></tr></thead>
+<tbody>
+<tr><td><code>Glob</code>, <code>Grep</code></td><td>Find files and text</td><td>Grep is ripgrep and skips gitignored files; return paths first, matches with context only on request, capped. Claude Code now includes both by default only on Windows; on macOS, Linux and WSL it searches with embedded <code>find</code> and <code>grep</code> through <code>Bash</code></td></tr>
+<tr><td><code>Read</code></td><td>Read a file or a line range</td><td>Line numbers in output so edits can be precise; large files paginated; images and PDFs supported</td></tr>
+<tr><td><code>Edit</code>, <code>Write</code></td><td>Change files</td><td>Exact-string replacement; read-before-edit and staleness checks (deep dive 4)</td></tr>
+<tr><td><code>Bash</code></td><td>Build, test, git, anything</td><td>Timeout, output truncated head and tail, long-running processes as background tasks; sandboxed (deep dive 2)</td></tr>
+<tr><td><code>WebFetch</code>, <code>WebSearch</code></td><td>Docs and error lookups</td><td>Content is untrusted; summarized before entering context</td></tr>
+<tr><td><code>Agent</code> (subagent)</td><td>Delegate exploration or a side job</td><td>Runs a fresh loop with its own context; returns a short report</td></tr>
+<tr><td><code>TaskCreate</code>, <code>TaskUpdate</code> (replaced <code>TodoWrite</code>)</td><td>Plan and track steps</td><td>Keeps multi-step work on track and visible to the user; Claude Code enables them by default only on older models, since newer ones track multi-step work without a written checklist</td></tr>
+</tbody></table></div>
+<p>What the model sees on every call is assembled by the context manager. The order matters as much as the content, because the provider caches by exact prefix:</p>
+<figure class="dg" data-diagram="design-claude-code-context"></figure>
+<p><strong>Memory files.</strong> Claude Code loads <code>CLAUDE.md</code> files at launch from the directory hierarchy above the working directory (plus a user-level file and organization-managed policy), and loads <code>CLAUDE.md</code> files in subdirectories on demand when the agent reads files there (<a href="https://code.claude.com/docs/en/claude-md">Claude Code memory docs</a>). Codex CLI does the same with <code>AGENTS.md</code>. These files are the team's curated map: build and test commands, conventions, "never touch the generated folder." They are paid for on every call, so they should be short.</p>
+
+<h3>3) Controlling what the agent may do</h3>
+<p>Every tool call passes through a permission engine before it runs. Claude Code checks each call in a fixed order: <code>PreToolUse</code> hooks, deny rules, ask rules, the permission mode, allow rules, and finally a prompt (the <code>canUseTool</code> callback in the Agent SDK) for anything still undecided (<a href="https://code.claude.com/docs/en/agent-sdk/permissions">Agent SDK permissions</a>):</p>
+<figure class="dg" data-diagram="design-claude-code-permission"></figure>
+<ul>
+<li><strong>Rules</strong> are patterns per tool: allow <code>Bash(npm run test:*)</code>, ask for <code>Bash(git push:*)</code>, deny <code>Read(./.env)</code>. Deny always wins.</li>
+<li><strong>Scopes</strong> layer, highest precedence first: organization-managed settings (which nothing can override), command-line arguments, personal local project overrides, shared project settings checked into the repo, then user settings. Rule lists merge across scopes, so a deny from any scope still wins.</li>
+<li><strong>Modes</strong> set the default for everything the rules don't cover: ask for anything that changes state; auto-accept file edits; <strong>plan mode</strong> (read-only research and a proposed plan, no edits); a classifier-reviewed <strong>auto</strong> mode; and a bypass mode meant only for throwaway containers.</li>
+<li><strong>Hooks</strong> are the deterministic escape hatch: a <code>PreToolUse</code> hook can block a call (exit code 2, with stderr fed back to the model) regardless of mode (<a href="https://code.claude.com/docs/en/hooks">hooks reference</a>).</li>
+</ul>
+<p>Rules alone are not a security boundary, which is the subject of deep dive 2.</p>
+
+<h3>4) Sessions, resume and rewind</h3>
+<p>Each session is an append-only transcript on local disk (Claude Code keeps them per project under <code>~/.claude/projects</code>). Append-only matters twice: a crash loses at most the in-flight step, and resume is just "reload the messages and continue," which also keeps the prompt-cache prefix identical. Before an edit the harness snapshots the affected file into a <strong>checkpoint</strong> tied to the user prompt that started the turn; <code>/rewind</code> restores code, conversation, or both to that point.</p>
+<div class="callout warn"><span class="ci w"></span><p>Checkpoints only track files the agent edited through its file tools. A <code>Bash</code> command that deletes other files, runs a migration or pushes to a remote is outside them. Say this in the interview: git (and the permission system) is the real safety net for shell side effects, and the harness should encourage committing before risky steps.</p></div>
+
+<h3>5) Extensibility and 6) headless mode</h3>
+<p>Extension points (hooks, MCP, skills, subagents, slash commands, plugins) plug into the same loop and are covered in deep dive 5. Headless mode is the same engine without the TUI: <code>claude -p</code> reads a prompt, runs the loop, and emits text or a JSON event stream; the Agent SDK exposes the loop as a library. Because nobody is there to answer a permission prompt, everything the run may do must be declared up front (deep dive 6). Putting it together:</p>
+<figure class="dg" data-diagram="design-claude-code-final"></figure>
+<p>Everything except the model API runs on the developer's machine. That is the defining property: the harness has the user's full local power, and the design's job is to channel that power safely.</p>
+
+<h2>Potential Deep Dives</h2>
+<h3>1) How does the agent find the right code in a huge repo?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Put the repository (or as much as fits) in the prompt</h5><p><span class="lbl">Challenges:</span> real repos are millions of tokens; even a 1M-token window would cost dollars per step and bury the relevant lines. Model accuracy degrades as context fills with irrelevant text ("context rot," <a href="https://www.anthropic.com/research/effective-context-engineering-for-ai-agents">Anthropic</a>).</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Embedding index of code chunks, retrieved per task</h5><p><span class="lbl">Approach:</span> chunk by function or class, embed, store in a local or hosted vector index, retrieve the top-k chunks for each query.</p><p><span class="lbl">Challenges:</span> indexing a monorepo takes minutes and must be kept fresh as the agent itself edits files; uploading embeddings or code to a service conflicts with local-first privacy; semantic similarity misses exact identifiers, call sites and config keys; retrieved chunks lack the surrounding context an engineer would read.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Agentic search: fast tools, a curated map, and subagents</h5><p><span class="lbl">Approach:</span> give the model the same tools an engineer uses (glob, ripgrep, read with line ranges, git log/blame through Bash) and let it search iteratively: grep for the error string, read the test, follow the import. The <code>CLAUDE.md</code> file acts as a hand-written map of the repo. For broad questions ("how does auth work across these services?") the agent spawns a <strong>subagent</strong> that explores in its own context and returns a 1–2K-token summary, so the main context stays clean. Anthropic recommends starting with agentic search and adding semantic search only if you need faster results, because it is more accurate, easier to maintain and more transparent (<a href="https://claude.com/resources/articles/building-agents-with-the-claude-agent-sdk">Agent SDK post</a>). A semantic or LSP-backed tool can still be added over MCP.</p><p><span class="lbl">Challenges:</span> more model calls per task (mitigated by prompt caching and cheap, fast tools), and quality depends heavily on tool output design: a grep that returns 5,000 lines is worse than none.</p></div>
+
+<h3>2) How do we let it run shell commands safely on a developer's laptop?</h3>
+<p>The threat model has two parts: the model making a mistake (<code>rm -rf</code> in the wrong directory, force-pushing), and <strong>prompt injection</strong>, where text in a README, issue, dependency or web page instructs the agent to exfiltrate <code>~/.ssh</code> or <code>.env</code>. Simon Willison's "lethal trifecta" frames it: private data + untrusted content + a way to communicate externally. A coding agent has all three by default, so the design must cut at least one leg.</p>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Ask for approval on every command, or approve everything</h5><p><span class="lbl">Challenges:</span> constant prompts train users to click yes; Anthropic's telemetry showed users approved roughly 93% of permission prompts, and attention drops as approvals pile up (<a href="https://www.anthropic.com/research/how-we-contain-claude">Anthropic, How we contain Claude</a>). Approving everything removes the only check.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Allow/deny rules, permission modes and plan mode</h5><p><span class="lbl">Approach:</span> safe, frequent commands (tests, linters, read-only git) are allow-listed; pushes and deploys always ask; secrets files are denied; plan mode lets the agent research without changing anything.</p><p><span class="lbl">Challenges:</span> rules match strings, but shells are programmable. <code>npm test</code> runs whatever <code>package.json</code> says, a build script can curl anywhere, and a prefix rule like <code>git:*</code> also allows options that execute commands. Rules reduce mistakes; they don't contain an adversary.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>OS-level sandbox for filesystem and network, with prompts only at the boundary</h5><p><span class="lbl">Approach:</span> run <code>Bash</code> and every child process inside an OS sandbox: Seatbelt on macOS, bubblewrap on Linux and WSL2 (<a href="https://code.claude.com/docs/en/sandboxing">Claude Code sandboxing docs</a>). Writes are allowed only inside the project directory and a temp directory; sensitive paths can be blocked for reads; network traffic goes through a proxy outside the sandbox that only allows approved domains (package registries, the git host). Inside the boundary, commands run without prompts; anything that needs to cross it asks. Anthropic reports that sandboxing cut permission prompts by 84% in internal use (<a href="https://www.anthropic.com/research/claude-code-sandboxing">Anthropic, sandboxing post</a>) and open-sourced the runtime. OpenAI's Codex CLI takes the same approach with Seatbelt on macOS and bubblewrap on Linux and WSL2 (<a href="https://learn.chatgpt.com/docs/sandboxing">Codex docs</a>). Both legs matter: without network isolation a compromised agent can exfiltrate keys; without filesystem isolation it can modify shell config or other system files to get network access later.</p><p>Layer the rest on top: enterprise-managed deny rules users can't override; hooks for org policy (block edits to <code>.github/workflows</code>, scan commands for secrets); the model API key and other credentials never placed in context; and, for fewer interruptions outside the sandbox, a separate classifier model that reviews each proposed action before it runs, as Claude Code's auto mode does (<a href="https://simonwillison.net/2026/Mar/24/auto-mode-for-claude-code/">Simon Willison's write-up</a>).</p><p><span class="lbl">Challenges:</span> platform gaps (WSL1 and some container setups lack the needed kernel features, so the harness must detect that and fall back to stricter prompting); allowlisted domains can still be abused (a package registry is a place to upload data), so keep the list tight; tools that legitimately need broad access (Docker, cloud CLIs) need explicit, visible exceptions.</p></div>
+
+<h3>3) How do we manage the context window over a two-hour session?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Drop the oldest messages when the window fills</h5><p><span class="lbl">Challenges:</span> the oldest messages contain the task itself and the key decisions; dropping them can orphan <code>tool_use</code>/<code>tool_result</code> pairs (an API error), and every drop changes the prefix, so the cache misses on every subsequent call.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Summarize the history near the limit and cap tool outputs</h5><p><span class="lbl">Approach:</span> when usage crosses a threshold, ask the model to summarize the conversation, replace the history with the summary, and continue. Truncate long tool outputs to a fixed budget.</p><p><span class="lbl">Challenges:</span> naive summaries lose file paths, exact error messages and the user's constraints; the agent then repeats work or violates an instruction it no longer sees.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Prevent, offload, externalize, then compact with structure, all cache-aware</h5><p><span class="lbl">Approach:</span></p>
+<ul>
+<li><strong>Prevent bloat:</strong> tools return compact output by default (paths before contents, head and tail of logs, pagination), so a test run costs 2K tokens, not 40K.</li>
+<li><strong>Offload:</strong> subagents explore in their own context window and return short findings; the parent never sees the 30 files they read.</li>
+<li><strong>Externalize state:</strong> a todo list, notes files and <code>CLAUDE.md</code> hold plans and decisions outside the window, and are re-read after compaction.</li>
+<li><strong>Compact with a schema:</strong> the summary keeps the user's goal and constraints, decisions made, files modified, open tasks and the last errors verbatim; recently read files are re-attached. Users can trigger it manually (<code>/compact</code> with instructions) at a natural breakpoint.</li>
+<li><strong>Stay cache-friendly:</strong> the history is append-only; the system prompt and tool list are byte-stable (no timestamps or random ordering at the top); cache breakpoints sit at the end of the stable prefix and at the latest turn. Compaction is one deliberate cache break, not a stream of small ones.</li>
+</ul>
+<p><span class="lbl">Challenges:</span> the default 5-minute cache lifetime means a developer who reads a diff for ten minutes pays a cache write on the next step (a 1-hour cache tier exists at a higher write price); compaction quality needs its own evals.</p></div>
+<div class="tbl"><table>
+<thead><tr><th>Session (40 calls, avg 60K context)</th><th class="num">Input cost</th><th class="num">Relative</th></tr></thead>
+<tbody>
+<tr><td>No caching</td><td class="num">$7.20</td><td class="num">1×</td></tr>
+<tr><td>Caching, append-only history</td><td class="num">≈ $1.07</td><td class="num">≈ 0.15×</td></tr>
+<tr><td>Caching, but a timestamp at the top of the system prompt</td><td class="num">≈ $9.00</td><td class="num">1.25× (every call is a cache write)</td></tr>
+</tbody></table></div>
+<p class="src">Derived from the session estimate above. The last row is the trap: a cache that never hits is more expensive than no cache.</p>
+
+<h3>4) How do we make edits reliable?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>The model rewrites the whole file</h5><p><span class="lbl">Challenges:</span> an 800-line file is ~10K output tokens: at ~60 tokens/s that is close to three minutes and ~$0.15 per edit, versus a few seconds for a 20-line change. Models also "helpfully" elide unchanged code (<code>// ... rest unchanged</code>) and silently drop functions.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Diffs or patches</h5><p><span class="lbl">Approach:</span> the model emits a unified diff or a patch format with context anchors (Codex CLI uses an <code>apply_patch</code> tool with its own format). Output is small and multi-hunk changes are one call.</p><p><span class="lbl">Challenges:</span> models miscount line numbers and context lines; patches fail to apply after the file drifts, and fuzzy application can apply a hunk in the wrong place.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Exact-string replace with guardrails, feedback and checkpoints</h5><p><span class="lbl">Approach:</span> <code>Edit(old_string, new_string)</code> must match exactly once, so ambiguity becomes an error the model can fix by including more surrounding lines. The harness enforces <strong>read-before-edit</strong> (the model must have seen the current content) and <strong>staleness detection</strong> (if the file's hash or mtime changed since the last read, because the user or a formatter touched it, the edit fails with "re-read the file"). Writes are atomic (temp file + rename) so a crash never leaves half a file. After each edit, a <code>PostToolUse</code> hook or language server can run the formatter, linter or type checker and return diagnostics, so the model fixes its own errors in the next step. Every edit is checkpointed for <code>/rewind</code>. Whole-file <code>Write</code> remains for new files.</p><p><span class="lbl">Challenges:</span> many small edits mean more round trips; a common alternative is a "fast apply" step where the large model sketches the change and a small, fast model merges it into the file.</p></div>
+
+<h3>5) How do teams extend it without bloating every prompt?</h3>
+<p>The key question for every extension point is <em>who decides when it runs, and when its text enters the context</em>.</p>
+<div class="tbl"><table>
+<thead><tr><th>Mechanism</th><th>Who triggers it</th><th>Context cost</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>CLAUDE.md</code> / <code>AGENTS.md</code></td><td>Always loaded</td><td>Every call</td><td>Short, always-relevant facts: commands, conventions</td></tr>
+<tr><td>Slash commands</td><td>The user</td><td>Only when invoked</td><td>Reusable prompts: <code>/review</code>, <code>/release-notes</code></td></tr>
+<tr><td>Skills</td><td>The model, by matching the description</td><td>Name + description always; body and files on demand</td><td>Procedures and domain know-how loaded only when relevant</td></tr>
+<tr><td>Subagents</td><td>The model (or user) via <code>Agent</code></td><td>Only the returned summary</td><td>Isolated work with its own prompt, tools and model</td></tr>
+<tr><td>Hooks</td><td>Lifecycle events (pre/post tool use, prompt submit, stop, session start, pre-compact)</td><td>None unless they return output</td><td>Deterministic policy: format on save, block paths, notify</td></tr>
+<tr><td>MCP servers</td><td>The model calls their tools</td><td>Tool definitions (can be large)</td><td>External systems: issue trackers, databases, browsers</td></tr>
+<tr><td>Plugins</td><td>Installed by the user or org</td><td>Whatever they bundle</td><td>Distributing all of the above as one package</td></tr>
+</tbody></table></div>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Put every instruction and tool into the system prompt</h5><p><span class="lbl">Challenges:</span> context cost on every call, conflicting instructions, and "should" rules the model may ignore when the rule must hold every time.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Expose everything as MCP tools</h5><p><span class="lbl">Challenges:</span> a few servers can add tens of thousands of tokens of tool definitions to every call, and tool choice degrades as the list grows. MCP servers are also third-party code with access to your context (supply-chain risk, <a href="#guardrails-security">Guardrails &amp; Security</a>).</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Match the mechanism to the guarantee, and load lazily</h5><p><span class="lbl">Approach:</span> anything that <em>must</em> happen goes in a hook (code, not a prompt). Always-relevant facts go in a short memory file. Procedures go in <strong>skills</strong> with progressive disclosure: only metadata sits in context until the task matches, then the body loads, then referenced files or scripts as needed (<a href="https://www.anthropic.com/research/equipping-agents-for-the-real-world-with-agent-skills">Anthropic, Agent Skills</a>). Large tool catalogs are deferred behind a tool-search step so definitions load on demand. Isolated or parallel work goes to subagents with restricted tool lists. Organizations allowlist MCP servers and plugins through managed settings and pin versions.</p><p><span class="lbl">Challenges:</span> skill and subagent descriptions are the routing signal, so vague descriptions mean they never trigger; extension behavior needs the same evals as the core prompt.</p></div>
+
+<h3>6) How does it run in CI and in parallel?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Run several agents in the same checkout, or the interactive tool in CI with permissions bypassed</h5><p><span class="lbl">Challenges:</span> agents overwrite each other's files and fight over build outputs and ports; a bypassed agent in CI with repository secrets in the environment is a prompt-injection target with real credentials.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Headless mode with pre-declared permissions and separate clones</h5><p><span class="lbl">Approach:</span> <code>claude -p</code> with an explicit allowed-tools list, a max-turns budget and JSON output, run per job; parallel work in separate clones.</p><p><span class="lbl">Challenges:</span> full clones are slow and disk-hungry for large repos.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>One engine, three front ends, isolated workspaces</h5><p><span class="lbl">Approach:</span> the loop is a library (Claude's Agent SDK), and the TUI, IDE extension and CLI <code>-p</code> are thin clients over its event stream. In CI it runs with least privilege: read-only token by default, scoped write token only for posting a comment or pushing a branch, network allowlist, turn and cost caps. Parallel sessions each get a <strong>git worktree</strong> (a separate working directory sharing one object store), their own ports and env, and background tasks for long-running dev servers whose output the agent polls. Work that should outlive the laptop is handed to a cloud runner (the <a href="#design-coding-agent">cloud coding agent</a> design).</p><p><span class="lbl">Challenges:</span> merging the results of parallel agents is still a human review problem; cost multiplies with parallelism.</p></div>
+
+<h3>7) How do we know a harness change made it better?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Try a few prompts by hand</h5><p><span class="lbl">Challenges:</span> agent runs are long and stochastic; a change to one tool description can help one task family and hurt another.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Public benchmarks</h5><p><span class="lbl">Approach:</span> SWE-bench Verified (500 human-validated GitHub issues scored by hidden tests, <a href="https://openai.com/index/introducing-swe-bench-verified/">OpenAI</a>) and Terminal-Bench (<a href="https://www.tbench.ai/">tbench.ai</a>) for terminal tasks.</p><p><span class="lbl">Challenges:</span> they measure model + harness on someone else's tasks, are at risk of contamination, and don't measure interactive qualities like asking good questions or respecting permissions.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>A harness eval suite, A/B gates and privacy-respecting telemetry</h5><p><span class="lbl">Approach:</span> build an internal suite of hundreds of tasks with verifiable outcomes (tests pass, the right file changed, no forbidden command ran), each in a container snapshot. Run every harness change (system prompt, tool descriptions, compaction prompt, defaults) and every new model across it several times and track pass rate, cost and tokens per solved task, turns, wall-clock, and permission prompts per task. Anthropic reports that refining tool descriptions measurably improved SWE-bench results, which is why tools get the same rigor as prompts (<a href="https://www.anthropic.com/research/writing-tools-for-agents">Writing effective tools</a>). Online, track opt-in signals: interrupts, rewinds, "that's wrong" follow-ups, accepted versus reverted edits, session abandonment. See <a href="#evaluation">Evaluation</a>.</p><p><span class="lbl">Challenges:</span> environment setup dominates the cost of the suite; flaky tasks must be quarantined or they drown real signal.</p></div>
+
+<h2>What is Expected at Each Level?</h2>
+<div class="levels">
+<div><h4>Mid-level</h4>A clear agent loop with read, search, edit and shell tools; streaming output; a permission prompt before running commands; session transcripts. Mentions the context limit and truncating tool output when asked.</div>
+<div><h4>Senior</h4>Distinguishes local harness from cloud agent; agentic search over embeddings with reasons; permission rules and modes plus an OS-level sandbox with network control; structured compaction and cache-friendly context ordering with cost math; reliable edit semantics with read-before-edit and checkpoints.</div>
+<div><h4>Staff+</h4>Treats the harness as a platform: one engine behind TUI, IDE, CI and SDK; an extension model chosen by guarantee and context cost; enterprise policy and supply-chain controls for MCP and plugins; threat model built on the lethal trifecta; a harness eval suite and release gates for every prompt, tool and model change.</div>
+</div>
+</section>

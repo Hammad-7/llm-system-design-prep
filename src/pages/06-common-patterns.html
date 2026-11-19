@@ -17,6 +17,7 @@
 </ul>
 <p><strong>Trade-offs:</strong> each stage adds latency (rewriting adds an LLM call; reranking adds roughly 50–200 ms) in exchange for precision. Bigger top-k improves recall but costs tokens and can distract the model. <strong>Shows up in:</strong> support bots, enterprise search, document Q&amp;A, code assistants, Perplexity-style answer engines.</p>
 
+<p class="src">Deep dive: <a href="#rag-deep-dive">RAG in Depth</a></p>
 <h2>Streaming Responses</h2>
 <p><strong>Problem:</strong> generating a full answer takes seconds; users won't stare at a spinner, and connections drop mid-answer.</p>
 <p><strong>Solution:</strong> stream token deltas to the client over SSE as they're generated, while a writer persists the growing message. Number each event so a reconnecting client can resume from the last event ID.</p>
@@ -28,6 +29,7 @@
 </ul>
 <p><strong>Shows up in:</strong> every chat product, the Playground, agent progress feeds.</p>
 
+<p class="src">Deep dive: <a href="#api-streaming">API Design &amp; Streaming</a></p>
 <h2>Agent Loop with Guarded Tool Execution</h2>
 <p><strong>Problem:</strong> the task needs multiple steps and real actions (search, query a database, call an API, edit a file) whose sequence can't be known in advance.</p>
 <p><strong>Solution:</strong> loop: the model proposes the next step as a structured tool call; your executor validates and authorizes it; the result is appended to context; repeat until the model returns a final answer or a budget runs out.</p>
@@ -39,9 +41,10 @@
 <li>Keep the loop's control flow in code: the orchestrator decides when to stop, retry, summarize the context or escalate.</li>
 </ul>
 
+<p class="src">Deep dive: <a href="#agents-tool-use">Agents, Tools &amp; MCP</a></p>
 <h2>Agentic Workflows</h2>
 <p><strong>Problem:</strong> a fully autonomous agent is unpredictable and expensive, but a single prompt can't do the task.</p>
-<p><strong>Solution:</strong> compose LLM calls through predefined code paths. Anthropic's <a href="https://www.anthropic.com/engineering/building-effective-agents">Building effective agents</a> names five patterns, and they cover most "multi-step" prompts:</p>
+<p><strong>Solution:</strong> compose LLM calls through predefined code paths. Anthropic's <a href="https://www.anthropic.com/research/building-effective-agents">Building effective agents</a> names five patterns, and they cover most "multi-step" prompts:</p>
 <figure class="dg" data-diagram="workflows"></figure>
 <div class="tbl"><table>
 <thead><tr><th>Pattern</th><th>How it works</th><th>Use for</th></tr></thead>
@@ -52,8 +55,9 @@
 <tr><td>Orchestrator-workers</td><td>A lead LLM decides subtasks at runtime and delegates them to workers, then synthesizes</td><td>Research across many sources; multi-file code changes</td></tr>
 <tr><td>Evaluator-optimizer</td><td>One call generates, another critiques against criteria, loop until it passes</td><td>Translation, writing with clear quality criteria, code against tests</td></tr>
 </tbody></table></div>
-<p>Orchestrator-workers is how Anthropic's Research feature works: a lead agent plans and spawns parallel subagents that each search one thread, then a citation pass. The multi-agent setup beat a single agent by 90.2% on their internal research eval, at roughly 15× the tokens of a chat (<a href="https://www.anthropic.com/engineering/built-multi-agent-research-system">Anthropic Engineering</a>). That trade-off, breadth and quality for cost, is exactly what interviewers want you to weigh.</p>
+<p>Orchestrator-workers is how Anthropic's Research feature works: a lead agent plans and spawns parallel subagents that each search one thread, then a citation pass. The multi-agent setup beat a single agent by 90.2% on their internal research eval, at roughly 15× the tokens of a chat (<a href="https://www.anthropic.com/research/multi-agent-research-system">Anthropic Engineering</a>). That trade-off, breadth and quality for cost, is exactly what interviewers want you to weigh.</p>
 
+<p class="src">Deep dive: <a href="#agents-tool-use">Agents, Tools &amp; MCP</a></p>
 <h2>Managing Long-Running Agent Tasks</h2>
 <p><strong>Problem:</strong> a task runs for minutes or hours across dozens of LLM and tool calls. Servers restart, providers rate-limit, and some steps wait for a human.</p>
 <p><strong>Solution:</strong> make the HTTP request asynchronous and the run durable. Return a run ID immediately, execute the run as a durable workflow that checkpoints after every step, stream progress events, and notify on completion.</p>
@@ -65,11 +69,13 @@
 <li>Enforce per-run and per-tenant concurrency limits so one customer's batch can't starve everyone.</li>
 </ul>
 
+<p class="src">Deep dive: <a href="#agents-tool-use">Agents, Tools &amp; MCP</a> · <a href="#design-deep-research">Deep Research Agent</a></p>
 <h2>Request Batching for Inference</h2>
 <p><strong>Problem:</strong> a GPU is most efficient when processing many inputs at once, but requests arrive one by one and each caller waits for its own answer.</p>
 <p><strong>Solution:</strong> requests enter a queue; a batcher forms a batch when it reaches the maximum size <em>or</em> the oldest request has waited a maximum time; a worker runs the batch; a response router completes each caller's pending future by request ID. For autoregressive LLMs, upgrade to continuous batching inside the serving engine.</p>
-<p>This is the most-reported frontier-lab infrastructure question. See the full <a href="#design-inference-batching">Inference Batching breakdown</a>.</p>
+<p>This is one of the most-reported frontier-lab infrastructure questions. See the full <a href="#design-inference-batching">Inference Batching breakdown</a>.</p>
 
+<p class="src">Deep dive: <a href="#inference-serving">Inference &amp; Serving</a></p>
 <h2>Layered Caching</h2>
 <p><strong>Problem:</strong> LLM calls are slow and costly, and much of what you send is repeated.</p>
 <p><strong>Solution:</strong> stack caches from cheapest to most specific, checking each before paying for the next.</p>
@@ -80,6 +86,7 @@
 <li>Semantic caching is risky for anything personalized or time-sensitive; reserve it for FAQ-like traffic with a high similarity threshold.</li>
 </ul>
 
+<p class="src">Deep dive: <a href="#llm-caching">Caching for LLMs</a></p>
 <h2>Model Routing, Cascades and Fallbacks</h2>
 <p><strong>Problem:</strong> the best model is too slow and expensive for every request, and any single provider will eventually have an outage or rate-limit you.</p>
 <p><strong>Solution:</strong> put a gateway in front of all models. Route by task type and difficulty; cascade from small to large models when a check fails; fail over across providers or regions when a backend is unhealthy.</p>
@@ -90,6 +97,7 @@
 <li>Circuit breakers and per-backend concurrency limits keep a slow provider from tying up all your workers.</li>
 </ul>
 
+<p class="src">Deep dive: <a href="#gateway-reliability">Gateways, Routing &amp; Reliability</a></p>
 <h2>Guardrail Sandwich</h2>
 <p><strong>Problem:</strong> inputs may be malicious or contain sensitive data; outputs may be unsafe, malformed or ungrounded; tool calls may be harmful.</p>
 <p><strong>Solution:</strong> independent checks before the model, around tool execution, and after the model, with the strongest controls enforced in code rather than in the prompt.</p>
@@ -100,12 +108,14 @@
 <li>Log every guardrail decision. Over-blocking is a quality bug you can only find by measuring it.</li>
 </ul>
 
+<p class="src">Deep dive: <a href="#guardrails-security">Guardrails &amp; Security</a></p>
 <h2>The Eval Flywheel</h2>
 <p><strong>Problem:</strong> you can't tell whether a prompt tweak, model upgrade or retrieval change made things better or worse, and quality drifts silently in production.</p>
 <p><strong>Solution:</strong> a closed loop between production and development. Production traces and feedback surface failures; failures become labeled eval cases; every change is gated on the eval suite; shipped changes are monitored online.</p>
 <figure class="dg" data-diagram="eval-flywheel"></figure>
 <p>In interviews, end your design with this loop. It answers "how do you know it works?" and "how does it get better over time?" in one picture.</p>
 
+<p class="src">Deep dive: <a href="#evaluation">Evaluation</a></p>
 <h2>Multi-Tenant Isolation</h2>
 <p><strong>Problem:</strong> many customers share models, indexes, caches and GPUs. A mistake leaks data; a noisy neighbor ruins latency.</p>
 <div class="tbl"><table>
@@ -119,4 +129,5 @@
 <tr><td>Fine-tunes</td><td>Per-tenant LoRA adapters on a shared base model</td></tr>
 <tr><td>Logs &amp; traces</td><td>Tenant-tagged, access-controlled, retention per contract; redact PII before storage</td></tr>
 </tbody></table></div>
+<p class="src">Deep dive: <a href="#guardrails-security">Guardrails &amp; Security</a> · <a href="#gateway-reliability">Gateways, Routing &amp; Reliability</a></p>
 </section>

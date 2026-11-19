@@ -1,0 +1,166 @@
+<section class="page" id="p-observability" data-title="Observability &amp; LLMOps" data-kw="observability llmops tracing spans opentelemetry gen_ai semantic conventions logging metrics ttft tpot tokens cost cache hit rate refusal rate guardrail triggers quality scores cost attribution tenant feature prompt registry prompt versioning model versioning shadow canary feature flags rollback drift monitoring incident playbook provider outage quality regression runaway agent cost pii redaction retention feedback loop langfuse langsmith phoenix helicone datadog">
+<div class="banner" style="--banner:#d7b45a" data-bt="Observability" data-bs="traces, metrics, rollouts"></div>
+<p class="eyebrow">LLM System Design · Core Concepts</p>
+<h1>Observability &amp; LLMOps</h1>
+<p class="lead">What to trace, measure and alert on for LLM systems, how to attribute cost, how to version and roll out prompts and models safely, and how to run incidents when the failure is "the answers got worse."</p>
+<hr class="sep">
+
+<p>Classic observability answers "is it up and is it fast?" LLM systems add three questions those tools weren't built for: <strong>is it right</strong> (quality can degrade with zero errors in the logs), <strong>what did it cost</strong> (one request can cost 1,000× another), and <strong>why did it do that</strong> (a bad answer is the product of a prompt version, retrieved chunks, tool results and a model version, all of which you need to reconstruct). An interview answer that ends with "and we'd add monitoring" misses all three.</p>
+<p>LLMOps is the operational discipline around this: tracing every step, versioning prompts and models like code, rolling changes out gradually behind quality gates, and feeding production failures back into <a href="#evaluation">evaluation</a>. This page covers each piece and how to talk about it.</p>
+
+<h2>Tracing LLM requests</h2>
+<p>A single user request in an LLM app fans out into guardrail checks, retrieval (embed, search, rerank), one or more model calls, tool calls, and post-processing. Represent it as a distributed trace: one root span per request, child spans per step, all sharing a trace id that is also attached to the response and to any user feedback.</p>
+<figure class="dg" data-diagram="observability-trace"></figure>
+
+<h3>What each span should record</h3>
+<div class="tbl"><table>
+<thead><tr><th>Span</th><th>Record</th></tr></thead>
+<tbody>
+<tr><td>Request (root)</td><td>Tenant, user (pseudonymous id), feature/endpoint, app version, conversation id, final status, total latency, total cost</td></tr>
+<tr><td>Model call</td><td>Provider, requested and actual model version, prompt template id and version, parameters (temperature, max tokens, reasoning effort), input/output/cached token counts, TTFT, total duration, finish reason (stop, length, tool_use, content filter), retries and fallbacks, cost</td></tr>
+<tr><td>Retrieval</td><td>Query (rewritten), index and embedding model versions, filters applied, candidate ids and scores before and after reranking, chunks actually placed in the prompt</td></tr>
+<tr><td>Tool call</td><td>Tool name, validated arguments, result size, latency, error, whether human approval was required and given</td></tr>
+<tr><td>Guardrail</td><td>Which check, verdict, score, action taken (block, redact, warn)</td></tr>
+<tr><td>Agent run</td><td>Step count, budget consumed, termination reason (done, budget, loop detected, user cancelled)</td></tr>
+</tbody></table></div>
+<p>Whether to store full prompt and completion text is a policy decision (see PII below). Many teams store full payloads for a sampled or opted-in fraction and metadata for everything.</p>
+
+<h3>OpenTelemetry and the GenAI conventions</h3>
+<p>Use OpenTelemetry for transport so LLM spans sit in the same traces as your HTTP, database and queue spans. OpenTelemetry defines <a href="https://github.com/open-telemetry/semantic-conventions-genai">GenAI semantic conventions</a> for model, agent and tool spans, with attributes such as <code>gen_ai.operation.name</code>, <code>gen_ai.request.model</code>, <code>gen_ai.response.model</code>, <code>gen_ai.usage.input_tokens</code> and <code>gen_ai.usage.output_tokens</code>. As of late 2026 these conventions are still marked <em>Development</em> (not stable) and moved to a dedicated <code>semantic-conventions-genai</code> repository in mid-2026, so expect attribute names to change. Pin an instrumentation version and map to your own stable internal names in the collector. Several vendors' SDKs (OpenLLMetry, OpenInference) emit OTel-compatible spans.</p>
+
+<h2>Metrics that matter</h2>
+<div class="tbl"><table>
+<thead><tr><th>Category</th><th>Metric</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Latency</td><td>TTFT p50/p95/p99, time per output token (TPOT), end-to-end latency, queue wait</td><td>TTFT is perceived latency for streaming; TPOT reveals overloaded backends</td></tr>
+<tr><td>Volume</td><td>Requests, input/output tokens per second, concurrency, by model and tenant</td><td>Capacity planning and rate-limit headroom</td></tr>
+<tr><td>Cost</td><td>Cost per request, per conversation, per resolved task, per tenant and feature; daily burn vs budget</td><td>Unit economics; catching runaway spend</td></tr>
+<tr><td>Caching</td><td>Prompt cache hit rate (cached input tokens / input tokens), semantic cache hit rate</td><td>A drop usually means someone broke the stable prefix</td></tr>
+<tr><td>Reliability</td><td>Error rate by type (429, 5xx, timeout, schema-invalid output), retry and fallback rates, truncations (finish reason = length)</td><td>Provider health and prompt bugs</td></tr>
+<tr><td>Safety</td><td>Guardrail block and redaction rates, refusal rate, injection detections</td><td>Shifts indicate model changes, prompt bugs or attacks</td></tr>
+<tr><td>Quality</td><td>Sampled judge scores (faithfulness, policy), thumbs up/down, regenerate and edit rates, escalation rate, task success</td><td>The metric classic monitoring lacks</td></tr>
+<tr><td>Agents</td><td>Steps per run, tokens per run, runs hitting budget, loop detections, tool error rates</td><td>Agents fail by wandering, not by crashing</td></tr>
+</tbody></table></div>
+<div class="callout"><span class="ci"></span><p>Alert on quality and cost, not just errors. "Faithfulness score on sampled support traces fell from 0.93 to 0.81 in the last hour" and "tenant X has spent 6× its daily average by noon" are the alerts that catch real LLM incidents.</p></div>
+
+<h2>The telemetry pipeline</h2>
+<figure class="dg" data-diagram="observability-pipeline"></figure>
+<ul>
+<li><strong>Emit from two places</strong>: the application SDK (business context: feature, user, conversation, retrieval details) and the <a href="#gateway-reliability">LLM gateway</a> (authoritative usage, cost, provider, retries). Join them by trace id.</li>
+<li><strong>Collector</strong>: redact PII, drop or sample payloads, batch, and route. Tail-based sampling keeps 100% of errors, slow requests, flagged and low-scored traces, and a small fraction of the rest.</li>
+<li><strong>Stores</strong>: a trace store for debugging individual requests; a metrics time-series database for dashboards and alerts; a warehouse (ClickHouse, BigQuery, Snowflake) for cost attribution, cohort analysis and joining with product data. Token and cost records belong in the warehouse unsampled, because billing and budgets need exact totals.</li>
+<li><strong>Online evals</strong> read sampled traces, run judges, and write scores back as span attributes or metrics.</li>
+</ul>
+
+<h2>Cost attribution</h2>
+<p>LLM spend is variable and concentrated: a few tenants, features or agent runs often dominate. Attribute every token:</p>
+<pre><code>cost = uncached_input_tokens × in_price + cache_read_tokens × cache_read_price
+     + cache_write_tokens × cache_write_price + output_tokens × out_price
+     (reasoning tokens are billed as output and, on most APIs, already counted in output_tokens)
+
+tag every call with: tenant_id, feature, model, prompt_version, agent_run_id</code></pre>
+<ul>
+<li>Keep a <strong>price table versioned by model and date</strong> in the gateway; never hard-code prices in services.</li>
+<li>Report <strong>unit costs</strong> that map to value: cost per resolved ticket, per merged PR, per active user per month. A model that costs 2× per call but resolves twice as many tickets without escalation is cheaper per outcome.</li>
+<li>For self-hosted models, allocate GPU-hours by each tenant's share of tokens (weighting prefill and decode differently if you want precision).</li>
+<li>Feed attribution into <strong>budgets and quotas</strong>: per-tenant monthly caps, per-run agent budgets, alerts at 50/80/100%.</li>
+</ul>
+
+<h2>Versioning prompts and models</h2>
+<p>A prompt is code that runs on someone else's computer, with a behavior you can only measure statistically. Manage it accordingly:</p>
+<ul>
+<li><strong>Prompt registry.</strong> Templates live in version control or a registry with immutable versions (<code>support-answer@v14</code>), owners, change descriptions and linked eval results. Services reference a version or a label (<code>production</code>, <code>canary</code>), never inline strings.</li>
+<li><strong>Configuration bundle.</strong> Version the whole behavior, not just the text: prompt, model id (pinned to a dated snapshot, not a floating alias), parameters, tool definitions, retrieval settings. A change to any of them is a release.</li>
+<li><strong>Record versions on every trace</strong> so you can slice quality by version and answer "when did this start?"</li>
+<li><strong>Provider model updates</strong> are releases you didn't write. Pin snapshots, track deprecation dates, and run the full eval suite before moving to a new snapshot.</li>
+</ul>
+
+<h2>Safe rollouts</h2>
+<figure class="dg" data-diagram="observability-rollout"></figure>
+<ol>
+<li><strong>Offline evals</strong> gate the change (see <a href="#evaluation">Evaluation</a>).</li>
+<li><strong>Shadow mode</strong>: the new version runs on a copy of live traffic; outputs are scored but not shown. Catches distribution differences your eval set missed. Costs double inference for the shadowed slice, so shadow a sample, and never let shadow runs execute side-effecting tools.</li>
+<li><strong>Canary</strong>: serve a small percentage of users or low-risk tenants via feature flags, sticky per user or conversation so experiences are consistent. Compare quality scores, implicit feedback, refusal and guardrail rates, latency and cost against control.</li>
+<li><strong>Ramp</strong> to 100% with automatic rollback when guardrail metrics breach thresholds. Rollback must be a flag flip, not a deploy.</li>
+</ol>
+
+<h2>Drift and quality monitoring</h2>
+<ul>
+<li><strong>Input drift</strong>: cluster incoming queries by embedding and watch for new clusters (a product launch, a new language, an outage driving questions) where your eval coverage is thin.</li>
+<li><strong>Retrieval drift</strong>: falling top retrieval scores or rising "no relevant documents" rates point to stale or missing content.</li>
+<li><strong>Output drift</strong>: changes in response length, refusal rate, tool-call mix or format errors, often caused by a provider-side model change.</li>
+<li><strong>Quality scores over time</strong> from sampled judges and implicit feedback, per slice. Use control charts or rolling baselines rather than fixed thresholds, since scores vary by day and traffic mix.</li>
+</ul>
+
+<h2>Incident playbooks</h2>
+<div class="tbl"><table>
+<thead><tr><th>Incident</th><th>Detect</th><th>Respond</th></tr></thead>
+<tbody>
+<tr><td>Provider outage or degradation</td><td>Error rate, 429s, TTFT spikes per provider and region</td><td>Gateway circuit breaker, fail over to another region, provider or model tier; shed low-priority and batch traffic; communicate degraded mode in the UI (see <a href="#gateway-reliability">Gateways &amp; Reliability</a>)</td></tr>
+<tr><td>Quality regression</td><td>Judge scores, thumbs-down, escalations, regenerate rate</td><td>Correlate with versions on traces (prompt, model snapshot, index, retrieval config); roll back the flag; add the failing cases to the regression set</td></tr>
+<tr><td>Runaway agent cost</td><td>Per-run token burn, steps, tenant spend vs baseline</td><td>Hard budgets enforced in the gateway kill the run; loop detection; per-tenant caps; post-mortem on why the agent looped</td></tr>
+<tr><td>Prompt-injection attack or abuse</td><td>Guardrail trigger spikes, unusual tool-call patterns, data-egress attempts</td><td>Block the source, disable the affected tool, review traces, add attacks to red-team evals</td></tr>
+<tr><td>Cache breakage</td><td>Prompt cache hit rate collapses, TTFT and cost jump</td><td>Find the change that altered the prefix (timestamp in system prompt, reordered tools) and restore prefix stability</td></tr>
+<tr><td>Data leak report</td><td>User report, privacy eval, audit</td><td>Trace back to retrieval and cache keys; purge affected caches and indexes; fix scoping; notify per policy</td></tr>
+</tbody></table></div>
+
+<h2>PII, retention and access</h2>
+<p>LLM traces are full of user content: support conversations, documents, code. Treat the trace store as a production database of sensitive data.</p>
+<ul>
+<li><strong>Redact at the collector</strong> (emails, phone numbers, card numbers, secrets) before data leaves the service boundary; keep a reversible token vault only if a workflow truly needs re-identification.</li>
+<li><strong>Tiered retention</strong>: metadata and metrics for months; full payloads for days or weeks unless the customer opts in for longer; honor deletion requests across traces, eval datasets and fine-tuning sets.</li>
+<li><strong>Access control and audit</strong> for anyone reading payloads; enterprise customers will ask, and some will require zero retention of content.</li>
+<li><strong>Consent</strong> before using production traces in eval sets or training data, per your terms and the customer's contract.</li>
+</ul>
+
+<h2>Closing the loop</h2>
+<p>Observability is the input to improvement. A healthy loop looks like: alerts and sampled judging surface bad traces, someone triages and labels the failure mode, the case lands in the golden dataset, a fix is developed against it, the fix passes the gate, and the canary confirms it in production. Track the loop itself: time from a failure report to a regression test, and the share of eval cases that came from production.</p>
+
+<h2>Tooling landscape</h2>
+<div class="tbl"><table>
+<thead><tr><th>Category</th><th>Examples</th></tr></thead>
+<tbody>
+<tr><td>LLM-native tracing + evals</td><td><a href="https://langfuse.com/">Langfuse</a> (open source), <a href="https://www.langchain.com/langsmith">LangSmith</a>, <a href="https://phoenix.arize.com/">Arize Phoenix</a> (open source), <a href="https://www.braintrust.dev/">Braintrust</a>, W&amp;B Weave</td></tr>
+<tr><td>Proxy / gateway-based logging</td><td>Helicone, Portkey, LiteLLM proxy, cloud AI gateways: capture usage and cost by sitting in the request path</td></tr>
+<tr><td>General APM with LLM features</td><td>Datadog LLM Observability, Grafana, New Relic, Honeycomb: useful when you want LLM spans next to the rest of your stack</td></tr>
+<tr><td>Instrumentation</td><td>OpenTelemetry SDKs, OpenLLMetry, OpenInference</td></tr>
+<tr><td>Product analytics</td><td>Feedback and outcome events (accepts, edits, escalations) in your analytics stack, joined to trace ids</td></tr>
+</tbody></table></div>
+<p>In an interview, name the categories and one example, and spend your time on what you'd record and alert on.</p>
+
+<h2>Observability in System Design Interviews</h2>
+<h3>When to bring it up</h3>
+<ul>
+<li>When you finish the high-level design: "Every step emits a span with versions and token counts, so we can debug any bad answer end to end."</li>
+<li>When cost comes up: "The gateway attributes cost per tenant and feature, and enforces budgets."</li>
+<li>When the interviewer asks how you'd ship changes or handle a provider outage, or "how would you know if quality dropped?"</li>
+</ul>
+<h3>How to introduce it</h3>
+<ol>
+<li><strong>Tracing</strong>: one trace per request, spans for retrieval, model and tool calls, with prompt and model versions and token counts.</li>
+<li><strong>Metrics and alerts</strong>: TTFT/TPOT, errors and fallbacks, cost per unit of value, cache hit rate, guardrail rates, sampled quality scores.</li>
+<li><strong>Release process</strong>: versioned prompt and model bundles, offline gate, shadow, canary, flag-based rollback.</li>
+<li><strong>Data handling</strong>: redaction, retention tiers, access audit.</li>
+<li><strong>Loop</strong>: bad traces become eval cases.</li>
+</ol>
+
+<h3>Common deep-dive questions</h3>
+<h4>"Support tickets say answers got worse yesterday, but there were no errors. What do you do?"</h4>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Read some logs and tweak the prompt</h5><p><span class="lbl">Challenges:</span> no way to localize the cause or confirm the fix; the tweak may break other cases.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Check recent deploys and roll back</h5><p><span class="lbl">Approach:</span> look for prompt or code changes in the window and revert them.</p><p><span class="lbl">Challenges:</span> misses causes outside your deploys: provider model updates, stale indexes, new traffic patterns.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Slice quality by every versioned dimension, then fix and gate</h5><p><span class="lbl">Approach:</span> plot sampled judge scores and implicit feedback by prompt version, model snapshot, index version, tenant and query cluster to localize the change; inspect low-scoring traces (retrieved chunks, tool results); roll back the responsible flag; add the failing traces to the golden set; ship the real fix through the gate and canary.</p><p><span class="lbl">Challenges:</span> requires versions on every span and online quality scoring, which is why you build them up front.</p></div>
+<h4>"How do you stop one agent run from spending $500?"</h4>
+<p>Budgets enforced outside the model (in the gateway or orchestrator): max steps, tokens and wall-clock per run, per-tenant daily caps, loop detection on repeated tool calls, real-time spend metrics per run with alerts, and a kill switch.</p>
+<h4>"What would you put on the on-call dashboard?"</h4>
+<p>TTFT and TPOT percentiles, error and fallback rates per provider, tokens per second vs rate limits, cost burn vs budget, prompt cache hit rate, guardrail and refusal rates, sampled quality score, and agent budget hits, each sliceable by tenant, feature and version.</p>
+
+<h2>Summary</h2>
+<ul>
+<li>Trace every request end to end with versions, tokens, retrieval results and tool calls; use OpenTelemetry, knowing the GenAI conventions are still evolving.</li>
+<li>Monitor quality and cost as first-class signals alongside latency and errors.</li>
+<li>Attribute cost per tenant, feature and outcome; enforce budgets in the gateway.</li>
+<li>Version prompt, model and retrieval config as one bundle; roll out via shadow and canary with flag-based rollback.</li>
+<li>Redact, tier retention and audit access: traces are sensitive data.</li>
+<li>Close the loop: production failures become eval cases (see <a href="#evaluation">Evaluation</a>), and the gateway that emits much of this telemetry is covered in <a href="#gateway-reliability">Gateways, Routing &amp; Reliability</a>.</li>
+</ul>
+</section>

@@ -1,0 +1,251 @@
+<section class="page" id="p-vector-search" data-title="Embeddings &amp; Vector Search" data-kw="embeddings embedding model dimensions matryoshka mteb cosine dot product normalization ann approximate nearest neighbor hnsw efsearch efconstruction ivf nprobe nlist product quantization pq scalar quantization binary quantization diskann cagra gpu index recall latency filtering pre-filter post-filter acorn multi-tenancy namespace sharding replication re-embedding migration dual write hybrid bm25 splade colbert late interaction pgvector pinecone weaviate qdrant milvus elasticsearch opensearch turbopuffer lancedb vespa redis storage math">
+<div class="banner" style="--banner:#7fb3d5" data-bt="Vector Search" data-bs="embeddings, ann indexes, scale"></div>
+<p class="eyebrow">LLM System Design · Core Concepts</p>
+<h1>Embeddings &amp; Vector Search</h1>
+<p class="lead">How text becomes vectors, how approximate nearest-neighbor indexes actually work, and how to size, filter, shard and migrate a vector index in a production design.</p>
+<hr class="sep">
+
+<p>Almost every retrieval, memory, semantic-cache and recommendation feature in an LLM system ends in the same operation: "find the stored vectors closest to this one." In interviews that operation usually gets one box labeled "vector DB" and no further thought. That is where strong candidates separate themselves. The box hides a model choice, an index algorithm with tunable recall, a memory bill that can reach terabytes, a filtering problem that silently breaks multi-tenant apps, and a migration problem every time you change embedding models.</p>
+<p>This page goes one level below the <a href="#core-concepts">Core Concepts</a> summary. By the end you should be able to explain how HNSW finds neighbors, size an index for 10 million or 1 billion vectors, pick a filtering and tenancy strategy, and describe how to swap embedding models without downtime. Retrieval pipelines built on top of this (chunking, hybrid fusion, reranking) are covered in <a href="#rag-deep-dive">RAG in Depth</a>.</p>
+
+<h2>What embeddings are</h2>
+<p>An <strong>embedding model</strong> is a neural network (usually a transformer encoder) that maps an input (a query, a chunk of text, an image, a code snippet) to a fixed-length vector of floats. It is trained, typically with contrastive learning on query–passage pairs, so that inputs with related meaning land near each other. "How do I reset my password" and "forgot login credentials" end up close; "reset the router" ends up further away even though it shares a word.</p>
+<p>Three properties matter for system design:</p>
+<ul>
+<li><strong>The vector space is model-specific.</strong> Vectors from two different models (or two versions of the same model) are not comparable. Changing models means re-embedding the whole corpus. This is the root of the migration problem below.</li>
+<li><strong>Queries and documents may be embedded differently.</strong> Many retrieval models expect a prefix or a separate mode for queries vs passages (asymmetric search). Getting this wrong quietly costs recall.</li>
+<li><strong>Embeddings compress meaning, not exact tokens.</strong> An error code like <code>E-4012</code>, a SKU or a rare surname may not survive the compression. That is why production retrieval is almost always hybrid (see <a href="#vector-search--hybrid-search-sparse-dense-and-late-interaction">hybrid search</a> below).</li>
+</ul>
+
+<h3>Choosing an embedding model</h3>
+<div class="tbl"><table>
+<thead><tr><th>Dimension</th><th>What to consider</th></tr></thead>
+<tbody>
+<tr><td>Quality on <em>your</em> data</td><td>Public leaderboards such as <a href="https://arxiv.org/abs/2210.07316">MTEB</a> are a starting filter, not an answer. Scores average many tasks (classification, clustering, retrieval), some models have trained on data close to the benchmark sets, and your domain (legal, code, medical, multilingual support tickets) may rank models differently. Build a small labeled query set and measure recall@k yourself.</td></tr>
+<tr><td>Dimensions</td><td>Common sizes run from 384 to 3,072. Memory and search cost scale linearly with dimensions, so a 3,072-dim model costs 4× the RAM of a 768-dim model for every vector you store.</td></tr>
+<tr><td>Matryoshka truncation</td><td>Models trained with <a href="https://arxiv.org/abs/2205.13147">Matryoshka Representation Learning</a> pack the most important information into the leading dimensions, so you can keep only the first 256 or 512 values with modest quality loss. OpenAI's <code>text-embedding-3</code> models expose this as a <code>dimensions</code> parameter. This is a cheap way to trade recall for memory.</td></tr>
+<tr><td>Max input length</td><td>Embedding models have their own context limits (often 512 to 32K tokens). Long chunks get truncated silently.</td></tr>
+<tr><td>Languages and modality</td><td>Multilingual models let a Spanish query match an English document; separate code and image embedders exist. Mixing languages in one index with a monolingual model hurts recall.</td></tr>
+<tr><td>Hosted vs self-hosted</td><td>Hosted APIs are simple and billed per token. Self-hosting a small open model on a GPU (or even CPU) gives lower latency, no per-token bill for re-embedding, and keeps data in your network.</td></tr>
+<tr><td>Cost of re-embedding</td><td>The corpus has to be re-embedded on every model change. A cheap, fast model makes migrations routine; an expensive one makes them painful.</td></tr>
+</tbody></table></div>
+
+<h3>Distance metrics and normalization</h3>
+<p>The three metrics you'll see are <strong>cosine similarity</strong> (angle between vectors), <strong>dot product</strong> (angle and magnitude) and <strong>Euclidean (L2) distance</strong>. If vectors are L2-normalized to unit length, all three give the same ranking: cosine equals dot product, and squared L2 distance equals 2 − 2·cosine. Most text embedding models are meant to be used with cosine, so the usual practice is to normalize at write time and use dot product (the cheapest to compute) at query time. Use whatever metric the model card says; using L2 on unnormalized vectors from a cosine-trained model degrades results.</p>
+
+<h2>Exact vs approximate search</h2>
+<p>Exact (brute-force, "flat") search compares the query with every stored vector. Cost is <code>N × d</code> multiply-adds per query: for 10M vectors at 1,024 dims that's about 10 billion operations, hundreds of milliseconds to seconds per query on CPU depending on hardware (less with batched queries or GPUs). It's perfectly fine for small sets (up to roughly 100K–500K vectors, or a single tenant's slice of data) and it gives perfect recall, which makes it the ground truth for measuring everything else.</p>
+<p>Beyond that, you use an <strong>approximate nearest neighbor (ANN)</strong> index, which examines a small fraction of the vectors and returns most of the true neighbors. The quality metric is <strong>recall@k</strong>: of the true top-k neighbors (from brute force), what fraction did the index return? Production systems usually target 0.9–0.99. Every ANN index exposes a knob that trades recall against latency, and the right setting depends on your data, so you measure it.</p>
+<div class="callout"><span class="ci"></span><p>Keep ANN recall and retrieval quality separate in your head. ANN recall measures whether the index found the vectors brute force would have found. Retrieval quality measures whether those vectors were the <em>relevant</em> documents. A perfect index on a weak embedding model still retrieves the wrong chunks.</p></div>
+
+<h2>HNSW in depth</h2>
+<p><strong>Hierarchical Navigable Small World</strong> graphs (<a href="https://arxiv.org/abs/1603.09320">Malkov &amp; Yashunin</a>) are the most widely used index in pgvector, Qdrant, Weaviate, Elasticsearch/OpenSearch, Redis, Milvus and most others. Understand this one well.</p>
+<figure class="dg" data-diagram="vector-search-hnsw"></figure>
+<h3>How it works</h3>
+<ol>
+<li><strong>A layered graph.</strong> Every vector is a node in layer 0 and is linked to its closest neighbors. Each node is also promoted to higher layers with exponentially decreasing probability, so layer 1 has a fraction of the nodes, layer 2 a fraction of that, and so on. Higher layers are sparse, so their links span long distances, like an express train.</li>
+<li><strong>Greedy search from the top.</strong> A query starts at a fixed entry point in the top layer, repeatedly moves to whichever neighbor is closest to the query, and when no neighbor is closer, drops down a layer and continues. Each layer narrows the region. On layer 0 it does a wider best-first search, keeping a candidate list of size <code>efSearch</code>, and returns the best k.</li>
+<li><strong>Inserts</strong> run the same search to find a new node's neighbors on each layer it belongs to, then link it in and prune neighbor lists to stay within the degree limit.</li>
+</ol>
+<p>Search touches roughly logarithmically many nodes, which is why HNSW stays in the low milliseconds at tens of millions of vectors.</p>
+
+<h3>The three knobs</h3>
+<div class="tbl"><table>
+<thead><tr><th>Parameter</th><th>What it controls</th><th>Typical values</th><th>Effect of raising it</th></tr></thead>
+<tbody>
+<tr><td><code>M</code></td><td>Max links per node (layer 0 usually allows 2·M)</td><td>16–64</td><td>Better recall, especially in high dimensions; more memory; slower builds</td></tr>
+<tr><td><code>efConstruction</code></td><td>Candidate list size while inserting</td><td>64–512</td><td>Better graph quality and recall ceiling; slower inserts. Set once at build time</td></tr>
+<tr><td><code>efSearch</code> (<code>ef</code>)</td><td>Candidate list size while querying; must be ≥ k</td><td>40–500</td><td>Higher recall, higher latency. Tunable per query, so you can sweep it in production</td></tr>
+</tbody></table></div>
+<p>For reference, pgvector's defaults are <code>m = 16</code>, <code>ef_construction = 64</code> and <code>hnsw.ef_search = 40</code> (<a href="https://github.com/pgvector/pgvector">pgvector README</a>). <code>efSearch</code> is the knob you tune: plot recall@10 against p99 latency for a few values on a held-out query set and pick the knee of the curve.</p>
+
+<h3>Memory</h3>
+<p>HNSW wants the vectors <em>and</em> the graph in RAM. The Faiss guidelines give a per-vector cost of about <code>d × 4 + M × 2 × 4</code> bytes for float32 vectors (<a href="https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index">Faiss wiki</a>):</p>
+<pre><code>vectors: d × 4 bytes          <span class="c">// float32</span>
+graph:   M × 2 × 4 bytes      <span class="c">// ~2M neighbor ids of 4 bytes on layer 0; upper layers add little</span>
+
+d = 1,024, M = 16:  4,096 + 128 = <span class="k">≈ 4.2 KB per vector</span>
+10M vectors      ≈ <span class="k">42 GB</span> before metadata, replicas and headroom</code></pre>
+<p>The graph is small next to the raw vectors at typical dimensions, which is why compressing the vectors (quantization, below) is the main memory lever.</p>
+
+<h3>Updates and deletes</h3>
+<ul>
+<li><strong>Inserts are online</strong> but cost an ANN search plus link updates each, so bulk loads are much slower than for IVF. Bulk-building a fresh index and swapping it in is often faster than inserting millions of rows one by one.</li>
+<li><strong>Deletes are usually tombstones.</strong> Removing a node would break paths through it, so most implementations mark it deleted, skip it in results, and repair or rebuild later. Heavy delete churn leaves dead nodes that still cost memory and traversal time, and recall can drift. Plan periodic compaction or rebuilds, and monitor recall over time rather than measuring it once.</li>
+<li><strong>Updates</strong> to a vector are delete plus insert.</li>
+</ul>
+
+<h2>Other index families</h2>
+<h3>IVF: cluster, then search a few clusters</h3>
+<p><strong>Inverted file</strong> indexes run k-means to produce <code>nlist</code> centroids, assign each vector to its nearest centroid's list, and at query time scan only the <code>nprobe</code> closest lists. The Faiss guidelines suggest <code>nlist</code> between roughly 4·√N and 16·√N. Raising <code>nprobe</code> raises recall and latency. IVF builds fast, uses less memory than HNSW (no graph), and pairs naturally with compression. Its weaknesses: it needs a training step on representative data, and if the data distribution drifts after training, clusters become unbalanced and recall drops until you retrain.</p>
+
+<h3>Quantization: shrinking each vector</h3>
+<div class="tbl"><table>
+<thead><tr><th>Method</th><th>How</th><th class="num">Bytes for d = 1,024</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>float32</td><td>Baseline</td><td class="num">4,096</td><td>Exact distances</td></tr>
+<tr><td>float16 / bfloat16</td><td>Half precision</td><td class="num">2,048</td><td>Near-lossless for retrieval; easy win (pgvector <code>halfvec</code>)</td></tr>
+<tr><td>Scalar (int8)</td><td>Map each dimension's range to 256 buckets</td><td class="num">1,024</td><td>4× smaller, small recall loss; needs calibration data for ranges</td></tr>
+<tr><td>Product quantization (PQ)</td><td>Split the vector into <code>m</code> sub-vectors; replace each with the id of its nearest of 256 learned centroids</td><td class="num">64 (m = 64)</td><td>32–64× smaller; distances approximate, so rescore top candidates with full vectors</td></tr>
+<tr><td>Binary</td><td>Keep only the sign of each dimension; compare with Hamming distance</td><td class="num">128</td><td>32× smaller and very fast; works well only for some models, and needs rescoring</td></tr>
+</tbody></table></div>
+<p>The common pattern is <strong>search compressed, rescore exact</strong>: run the ANN search over compressed vectors held in RAM, fetch, say, the top 100–400 candidates' full-precision vectors from disk or a cheaper tier, recompute exact distances, and return the top k. Hugging Face and mixedbread measured binary quantization alone retaining about 92.5% of retrieval performance, rising to around 96% with rescoring, at a 32× memory reduction (<a href="https://huggingface.co/blog/embedding-quantization">Embedding Quantization</a>). Your model may behave differently; measure.</p>
+
+<h3>DiskANN: graphs on SSD</h3>
+<p><a href="https://papers.nips.cc/paper/2019/hash/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Abstract.html">DiskANN</a> (Microsoft, NeurIPS 2019) keeps a graph index (Vamana) and full vectors on SSD and only PQ-compressed vectors in RAM. Search navigates using the in-memory compressed vectors and reads full vectors from SSD for the final candidates. The paper indexed a billion points on a single machine with 64 GB of RAM and an SSD while keeping high recall at millisecond latencies. Disk-based indexes are how you get to billion scale without a terabyte of RAM; the cost is SSD reads per query (higher and less predictable latency than in-memory HNSW).</p>
+
+<h3>GPU indexes</h3>
+<p>For very high query throughput or fast index builds, GPU indexes such as NVIDIA's <a href="https://arxiv.org/abs/2308.15136">CAGRA</a> (in the cuVS library, used by Milvus and Faiss) build and search graph indexes on the GPU. They shine with large query batches (offline deduplication, recommendation candidate generation, re-indexing a whole corpus) and are usually overkill for interactive RAG, where a single query per request and CPU HNSW are plenty.</p>
+
+<h3>Choosing an index</h3>
+<div class="tbl"><table>
+<thead><tr><th>Situation</th><th>Reasonable default</th></tr></thead>
+<tbody>
+<tr><td>&lt; ~100K–500K vectors, or per-tenant slices that small</td><td>Flat (brute force). Perfect recall, nothing to tune</td></tr>
+<tr><td>Up to tens of millions, RAM available, low latency</td><td>HNSW, optionally with int8 or float16 vectors</td></tr>
+<tr><td>Hundreds of millions, memory-constrained</td><td>IVF-PQ or HNSW over PQ/binary codes with rescoring</td></tr>
+<tr><td>Billions on a modest fleet</td><td>DiskANN-style SSD index, or sharded IVF-PQ</td></tr>
+<tr><td>Massive batch workloads</td><td>GPU index (CAGRA, IVF on GPU)</td></tr>
+</tbody></table></div>
+
+<h2>Filtering</h2>
+<p>Real queries are never "nearest vectors in the whole corpus." They are "nearest vectors <em>for tenant 42, that this user can read, updated after January</em>." How the engine combines the filter with ANN search decides whether you get correct results.</p>
+<figure class="dg" data-diagram="vector-search-filtering"></figure>
+<ul>
+<li><strong>Pre-filtering</strong> evaluates the metadata filter first, then searches only matching vectors. With brute force over the subset it's exact, but if the filter matches millions of rows it's slow, and you can't use the global graph directly because skipping non-matching nodes disconnects it.</li>
+<li><strong>Post-filtering</strong> runs ANN for the top k (or k × some factor), then drops non-matching results. It's fast but wrong for selective filters: if tenant 42 owns 0.1% of the corpus, the global top 100 likely contains zero of their documents, and the user gets "no results." Over-fetching helps only up to a point.</li>
+<li><strong>Filtered traversal (in-filter)</strong> applies the predicate during graph search: non-matching nodes can still be used for navigation but are not returned, and search continues until it has k matches. This is what Qdrant's filterable HNSW does; pgvector's iterative index scans (added in 0.8.0) reach a similar result differently, filtering after each index scan and continuing until enough rows match. Research like <a href="https://arxiv.org/abs/2403.04871">ACORN</a> builds denser graphs so that the subgraph of matching nodes stays navigable for arbitrary predicates; Weaviate ships an ACORN-based filter strategy. Good engines also have a query planner that switches to pre-filter brute force when the filter is very selective (a few thousand matches), because exact search over a tiny set is both fast and perfect.</li>
+</ul>
+<div class="callout warn"><span class="ci w"></span><p>Permission filtering must happen inside the search, never after generation. If you post-filter by ACL, you either leak documents into the prompt or return empty results. Say this explicitly in any multi-tenant or enterprise RAG interview.</p></div>
+
+<h2>Multi-tenancy</h2>
+<div class="tbl"><table>
+<thead><tr><th>Strategy</th><th>How</th><th>Good for</th><th>Watch out</th></tr></thead>
+<tbody>
+<tr><td>Shared index + tenant filter</td><td>One big index; every query filters on <code>tenant_id</code></td><td>Many small tenants with similar data</td><td>Depends entirely on filtered-search quality; noisy neighbors; a bug in the filter leaks data across tenants</td></tr>
+<tr><td>Namespace / partition per tenant</td><td>Separate small index per tenant (Pinecone namespaces, turbopuffer namespaces, Weaviate tenants, a partition key in Milvus)</td><td>Strong isolation, easy per-tenant deletion (drop the namespace), small per-tenant indexes that can even be brute-forced</td><td>Per-index overhead with very many tenants; cross-tenant queries are hard; inactive tenants should be offloaded to cheap storage</td></tr>
+<tr><td>Dedicated cluster per tenant</td><td>Separate deployment</td><td>A few huge or regulated customers</td><td>Expensive; operational burden</td></tr>
+</tbody></table></div>
+<p>A common hybrid: namespace per tenant for the long tail, dedicated capacity for the largest customers. Systems built on object storage (turbopuffer, LanceDB) make millions of mostly-idle namespaces cheap because cold data lives in S3 and only hot namespaces are cached on SSD or in memory; the trade-off is slower first queries on cold namespaces.</p>
+
+<h2>Scaling: sharding and replication</h2>
+<p>When one node can't hold the index or serve the QPS, you scale like any search system:</p>
+<figure class="dg" data-diagram="vector-search-sharding"></figure>
+<ul>
+<li><strong>Sharding for size.</strong> Split vectors across shards, either randomly/by hash (every query fans out to every shard, and each returns a local top-k that a coordinator merges) or by a partition key such as tenant (queries hit one shard, but shards can become unbalanced). Random sharding is simpler and keeps load even; tail latency is set by the slowest shard, so keep shard count modest and over-fetch slightly per shard.</li>
+<li><strong>Replication for QPS and availability.</strong> Each shard has replicas; queries load-balance across them. Adding replicas raises throughput linearly; adding shards does not (every query still hits all of them).</li>
+<li><strong>Separating writes from reads.</strong> Heavy ingestion competes with queries for CPU. Many systems buffer writes into a small fresh segment searched by brute force or a small index, then merge into the main index in the background (log-structured, like Lucene segments). This is why newly written vectors are sometimes not visible for a few seconds: ask about freshness requirements.</li>
+</ul>
+
+<h2>Storage math, worked</h2>
+<h3>10 million chunks</h3>
+<pre><code>10M × 1,024 dims × 4 bytes        = <span class="k">41 GB</span> raw float32
+HNSW graph (M = 16): 10M × 128 B  = 1.3 GB
+metadata (ids, tenant, ACL, ~200 B) = 2 GB
+                                  ≈ 44 GB → fits one large-memory node
+with float16 vectors              ≈ 24 GB
+with int8 vectors                 ≈ 14 GB
+2 replicas for availability       × 2</code></pre>
+<p>Conclusion for the interviewer: 10M chunks is a single-node problem (plus replicas). pgvector on a big Postgres instance or any vector DB handles it. Don't propose a 20-node cluster.</p>
+
+<h3>1 billion vectors</h3>
+<pre><code>1B × 768 dims × 4 bytes           = <span class="k">3.1 TB</span> raw float32
+HNSW graph (M = 32): 1B × 256 B   = 256 GB
+                                  ≈ 3.3 TB in RAM for plain HNSW
+  → ~14 nodes at 256 GB usable RAM each, ×2 replicas ≈ 28 nodes
+
+PQ, 96 bytes per vector           = 96 GB of codes in RAM
+  + full vectors on SSD for rescoring (3.1 TB of NVMe)
+  → a handful of nodes, or one DiskANN-style node per few hundred million vectors</code></pre>
+<p>Here the interesting discussion is the trade-off between RAM cost and latency: plain HNSW in RAM gives the lowest, most predictable latency; compressed or SSD-resident indexes cut hardware cost by an order of magnitude at the price of rescoring reads and a slight recall loss. Mention Matryoshka truncation too: dropping from 768 to 256 dims cuts the raw vector storage by 3×.</p>
+
+<h2>Changing embedding models without downtime</h2>
+<p>New embedding models arrive constantly, and vectors from the old and new models can't be mixed. A migration is a re-index of the whole corpus:</p>
+<figure class="dg" data-diagram="vector-search-migration"></figure>
+<ol>
+<li><strong>Create a versioned index</strong> (<code>chunks_v2</code>) alongside the serving one. Store the embedding model id and version on every vector so mixed states are detectable.</li>
+<li><strong>Dual-write</strong> new and changed documents to both indexes, embedding with both models.</li>
+<li><strong>Backfill</strong> the existing corpus into v2 with a batch job, using cheaper batch APIs or a GPU pool, throttled so it doesn't starve the online embedding path. Make it resumable and idempotent (keyed by chunk id and content hash).</li>
+<li><strong>Shadow-read and compare.</strong> Run real or golden queries against both and compare recall@k, answer quality in your eval suite, and latency.</li>
+<li><strong>Flip the read alias</strong> (or a feature flag) to v2, gradually if possible, and keep v1 for a rollback window before deleting it.</li>
+</ol>
+<p>Budget it: re-embedding 10M chunks of 500 tokens is 5 billion tokens. At hosted prices of a few cents per million tokens that's on the order of a hundred dollars, so the real cost is engineering time and the temporary doubled storage, not the embedding bill. At billions of chunks it becomes a planned project.</p>
+
+<h2>Hybrid search: sparse, dense and late interaction</h2>
+<ul>
+<li><strong>BM25 (lexical, sparse).</strong> Classic inverted-index scoring by term frequency and rarity. Exact matches on identifiers, names, error codes and rare terms. Cheap and well understood.</li>
+<li><strong>Learned sparse (<a href="https://arxiv.org/abs/2107.05720">SPLADE</a>).</strong> A model produces sparse term weights, including expansion terms that weren't in the text, so "car" can match "automobile" while still using an inverted index.</li>
+<li><strong>Dense.</strong> One vector per chunk; strong on paraphrase and meaning.</li>
+<li><strong>Late interaction (<a href="https://arxiv.org/abs/2004.12832">ColBERT</a>).</strong> Keep one vector per <em>token</em> and score a document by summing, for each query token, its best match among document tokens (MaxSim). More precise than single-vector dense retrieval, at the cost of storing many vectors per chunk (ColBERTv2 compresses them heavily). Used either as a first-stage retriever in engines that support it (Vespa, some specialized libraries) or as a reranker. The same idea powers ColPali for retrieving page images directly.</li>
+</ul>
+<p>Production systems run BM25 and dense in parallel and fuse the rankings (reciprocal rank fusion), then rerank. The fusion and reranking stages are in <a href="#rag-deep-dive">RAG in Depth</a>.</p>
+
+<h2>The vector database landscape</h2>
+<div class="tbl"><table>
+<thead><tr><th>System</th><th>What it is</th><th>Choose it when</th></tr></thead>
+<tbody>
+<tr><td>pgvector</td><td>Postgres extension: HNSW and IVFFlat, half-precision, binary and sparse vectors, iterative filtered scans</td><td>You already run Postgres and have up to tens of millions of vectors; you want vectors, metadata and ACL joins in one transactional store</td></tr>
+<tr><td>Pinecone</td><td>Managed, serverless vector DB with namespaces</td><td>You want zero ops and per-tenant namespaces; you accept a proprietary managed service</td></tr>
+<tr><td>Qdrant</td><td>Open-source (Rust), filterable HNSW with payload indexes, quantization; cloud or self-hosted</td><td>Heavy metadata filtering, self-hosting, strong performance per node</td></tr>
+<tr><td>Weaviate</td><td>Open-source (Go), built-in hybrid search, native multi-tenancy with offloadable tenants</td><td>Many tenants, hybrid out of the box</td></tr>
+<tr><td>Milvus / Zilliz</td><td>Open-source distributed vector DB with many index types (HNSW, IVF-PQ, DiskANN, GPU)</td><td>Hundreds of millions to billions of vectors, index flexibility, GPU indexing</td></tr>
+<tr><td>Elasticsearch / OpenSearch</td><td>Search engines with BM25, kNN (HNSW) and hybrid ranking</td><td>Keyword relevance matters as much as semantics; you already run them; rich aggregations</td></tr>
+<tr><td>turbopuffer</td><td>Managed search on object storage with SSD/memory caching</td><td>Very many namespaces (per user, per repo) at low cost; can tolerate slower cold queries</td></tr>
+<tr><td>LanceDB</td><td>Embedded or serverless, built on the Lance columnar format, works directly on object storage</td><td>Embedded/local use, multimodal data, analytics plus search on the same files</td></tr>
+<tr><td>Vespa</td><td>Full ranking engine with tensors, hybrid and multi-phase ranking, late interaction</td><td>Large-scale search/recommendation with custom ranking logic</td></tr>
+<tr><td>Redis</td><td>In-memory vector search (Redis Query Engine, vector sets)</td><td>Low-latency semantic caching and small, hot indexes next to existing Redis usage</td></tr>
+</tbody></table></div>
+<p>The <a href="#key-technologies">Key Technologies</a> page has a decision tree. In an interview, name one, justify it in a sentence, and move on unless asked; the interviewer cares more that you know <em>why</em> (scale, filtering, tenancy, ops) than which logo you pick.</p>
+
+<h2>Common problems and how to handle them</h2>
+<div class="tbl"><table>
+<thead><tr><th>Problem</th><th>Symptom</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Selective filters with post-filtering</td><td>Empty or short result lists for small tenants</td><td>Filtered traversal, per-tenant namespaces, or brute force on small subsets</td></tr>
+<tr><td>Tombstone build-up</td><td>Recall and latency degrade over months</td><td>Scheduled compaction/rebuild; monitor recall on a fixed query set</td></tr>
+<tr><td>Mixed embedding versions</td><td>Quality drops after a partial migration</td><td>Versioned indexes, model id on every vector, alias flip only when the backfill is complete</td></tr>
+<tr><td>Exact-term misses</td><td>Searches for codes, SKUs, names fail</td><td>Hybrid with BM25; metadata filters for structured fields</td></tr>
+<tr><td>Memory blow-up</td><td>Index no longer fits RAM</td><td>float16/int8, PQ or binary with rescoring, Matryoshka truncation, DiskANN, sharding</td></tr>
+<tr><td>Stale index</td><td>Answers reference deleted or old content</td><td>Change-event ingestion, deletion propagation, freshness SLOs (see <a href="#rag-deep-dive">RAG in Depth</a>)</td></tr>
+<tr><td>Hot shards</td><td>One tenant's traffic slows everyone</td><td>Per-tenant rate limits, replicas for hot partitions, dedicated capacity for large tenants</td></tr>
+</tbody></table></div>
+
+<h2>Vector Search in System Design Interviews</h2>
+<h3>When to bring it up</h3>
+<ul>
+<li><strong>Any semantic retrieval</strong>: "Users ask in their own words, so keyword search alone won't find the right article. I'll embed chunks and run hybrid search."</li>
+<li><strong>Semantic caching and memory</strong>: "Long-term memories are embedded so we can retrieve the few relevant ones per turn."</li>
+<li><strong>Deduplication and clustering</strong>: "We embed incoming tickets and cluster them to find recurring issues."</li>
+<li><strong>When scale numbers appear</strong>: if the interviewer says "a billion documents," that is your cue for the storage math and the sharding/compression discussion.</li>
+</ul>
+<h3>How to introduce it</h3>
+<ol>
+<li><strong>State what's embedded and with what.</strong> "Chunks of ~500 tokens, embedded with a 1,024-dim retrieval model; queries embedded with the same model in query mode."</li>
+<li><strong>Size it.</strong> One line of math: count × dims × bytes, plus graph overhead. Conclude whether it fits a node.</li>
+<li><strong>Pick the index and say how you'll tune it.</strong> "HNSW; we tune efSearch against a recall@10 target of 0.95 measured with brute force on a sample."</li>
+<li><strong>Address filtering and tenancy.</strong> "ACL and tenant filters are applied during the search; large tenants get their own namespace."</li>
+<li><strong>Say how it stays fresh and how it evolves.</strong> Change-driven upserts, tombstones and compaction, and versioned indexes for model upgrades.</li>
+</ol>
+
+<h3>Common deep-dive questions</h3>
+<h4>"Your corpus grows from 10M to 1B vectors. What changes?"</h4>
+<p>Redo the memory math (≈3 TB float32 at 768 dims), then choose between sharded in-RAM HNSW (fast, expensive) and compressed or SSD-resident indexes with rescoring (cheaper, slightly slower). Add replicas for QPS, discuss fan-out tail latency, and consider Matryoshka truncation or a smaller embedding model.</p>
+<h4>"How do you make sure tenant A never sees tenant B's documents?"</h4>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Filter results after retrieval</h5><p><span class="lbl">Challenges:</span> post-filtering returns too few results for small tenants and any bug in the filter leaks data into prompts.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Tenant id as a mandatory in-search filter</h5><p><span class="lbl">Approach:</span> every query is built by a server-side retrieval service that injects <code>tenant_id</code> and the user's ACL groups from the auth context; the engine applies them during traversal.</p><p><span class="lbl">Challenges:</span> still one shared index, so isolation depends on code correctness; noisy neighbors.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Namespace per tenant, ACL filter inside, defense in depth</h5><p><span class="lbl">Approach:</span> physical separation per tenant (namespace or partition), so a missing filter returns nothing rather than someone else's data; document-level ACLs as in-search filters; per-tenant encryption keys where required; tenant id also checked on the returned chunks before prompt assembly; deletion by dropping the namespace.</p><p><span class="lbl">Challenges:</span> per-namespace overhead with many tenants, solved by object-storage-backed engines or offloading idle tenants.</p></div>
+<h4>"How would you upgrade the embedding model?"</h4>
+<p>Versioned index, dual-write, resumable backfill, shadow evaluation, alias flip, rollback window. Mention the doubled storage during migration and that queries must be embedded with the model matching the index they hit.</p>
+<h4>"Recall dropped this month but nothing was deployed. Why?"</h4>
+<p>Candidates: tombstone build-up from deletes, IVF clusters drifting from new data distribution, a partial re-embedding, a new content type the model handles poorly, or filters that became more selective as tenants grew. Show you'd detect it with a scheduled recall check against brute force on a fixed query sample.</p>
+
+<h2>Summary</h2>
+<ul>
+<li>Embeddings are model-specific; changing models means a full re-index, so version everything.</li>
+<li>HNSW is the default: tune <code>efSearch</code> for recall vs latency, budget about <code>4d + 8M</code> bytes per vector, and plan for tombstones.</li>
+<li>Memory is the main cost; quantization with rescoring, Matryoshka truncation and SSD-resident indexes are the levers.</li>
+<li>Filtering is where naive designs break. Filter inside the search, and prefer physical separation for tenants.</li>
+<li>Do the storage math out loud: 10M vectors is a single-node problem; 1B is a sharding and compression discussion.</li>
+<li>Hybrid (BM25 + dense) beats either alone; fusion and reranking live in <a href="#rag-deep-dive">RAG in Depth</a>, and semantic caching in <a href="#llm-caching">Caching for LLMs</a>.</li>
+</ul>
+</section>

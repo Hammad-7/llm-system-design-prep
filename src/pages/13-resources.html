@@ -8,27 +8,52 @@
 <h2>Interview guides and question reports</h2>
 <ul>
 <li>★ <a href="https://www.hellointerview.com/learn/system-design/in-a-hurry/introduction">Hello Interview: System Design in a Hurry</a>: the classic system design foundation this guide's structure follows, plus its <a href="https://www.hellointerview.com/learn/system-design/problem-breakdowns/chatgpt">ChatGPT breakdown</a> and <a href="https://www.hellointerview.com/learn/system-design/deep-dives/vector-databases">vector databases deep dive</a>.</li>
-<li><a href="https://www.aced.io/blog/anthropic-system-design-interview">Exponent: Anthropic system design interview guide</a>: reported questions, including inference batching and file distribution.</li>
+<li><a href="https://www.aced.io/blog/anthropic-system-design-interview">Aced (formerly Exponent): Anthropic system design interview guide</a>: reported questions, including inference batching and file distribution.</li>
 <li><a href="https://www.designgurus.io/answers/detail/what-to-expect-in-the-openai-system-design-interview">DesignGurus: What to expect in the OpenAI system design interview</a>.</li>
 <li><a href="https://igotanoffer.com/en/advice/generative-ai-system-design-interview">IGotAnOffer: Generative AI system design interview</a>: real questions by company and evaluation criteria.</li>
-<li><a href="https://github.com/alexeygrigorev/ai-engineering-field-guide/blob/main/interview/questions/04-ai-system-design.md">AI Engineering Field Guide: AI system design questions</a>: a crowd-collected list with sources.</li>
+<li><a href="https://github.com/alexeygrigorev/ai-engineering-field-guide/blob/main/interview/questions/04-ai-system-design.md">AI Engineering Field Guide: AI system design questions</a>: a list compiled from public interview reports, with sources.</li>
 <li><a href="https://www.kdnuggets.com/how-to-answer-ai-system-design-interview-questions">KDnuggets: How to answer AI system design interview questions</a>: a reusable framework and reference architectures.</li>
 <li><a href="https://prachub.com/companies/openai/categories/system-design">PracHub: OpenAI system design questions</a> and <a href="https://prachub.com/companies/anthropic/categories/system-design">Anthropic system design questions</a>.</li>
 </ul>
 
 <h2>Agents and context</h2>
 <ul>
-<li>★ <a href="https://www.anthropic.com/engineering/building-effective-agents">Anthropic: Building effective agents</a>: workflows vs agents and the five workflow patterns.</li>
-<li><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">Anthropic: Effective context engineering for AI agents</a>: compaction, notes, sub-agents.</li>
-<li><a href="https://www.anthropic.com/engineering/built-multi-agent-research-system">Anthropic: How we built our multi-agent research system</a>: orchestrator-workers in production, token economics, evaluation.</li>
-<li><a href="https://modelcontextprotocol.io/">Model Context Protocol</a>: specification and the <a href="https://claude.com/blog/bringing-mcp-2026-07-28-to-claude">2026-07-28 stateless release</a>.</li>
+<li>★ <a href="https://www.anthropic.com/research/building-effective-agents">Anthropic: Building effective agents</a>: workflows vs agents and the five workflow patterns.</li>
+<li><a href="https://www.anthropic.com/research/effective-context-engineering-for-ai-agents">Anthropic: Effective context engineering for AI agents</a>: compaction, notes, sub-agents.</li>
+<li><a href="https://www.anthropic.com/research/multi-agent-research-system">Anthropic: How we built our multi-agent research system</a>: orchestrator-workers in production, token economics, evaluation.</li>
+<li><a href="https://www.anthropic.com/research/writing-tools-for-agents">Anthropic: Writing effective tools for agents</a>: tool granularity, descriptions, token-efficient outputs, evaluating tools.</li>
+<li><a href="https://www.anthropic.com/research/equipping-agents-for-the-real-world-with-agent-skills">Anthropic: Equipping agents for the real world with Agent Skills</a>: progressive disclosure of procedural knowledge.</li>
+<li><a href="https://cognition.com/blog/dont-build-multi-agents">Cognition: Don't Build Multi-Agents</a>: the counter-argument on context sharing; read it next to Anthropic's multi-agent post.</li>
+<li><a href="https://modelcontextprotocol.io/">Model Context Protocol</a>: specification and the <a href="https://claude.com/resources/articles/bringing-mcp-2026-07-28-to-claude">2026-07-28 stateless release</a>.</li>
+</ul>
+
+<h2>Agent harnesses and coding agents</h2>
+<ul>
+<li>★ <a href="https://claude.com/resources/articles/building-agents-with-the-claude-agent-sdk">Anthropic: Building agents with the Claude Agent SDK</a>: the gather context → act → verify loop behind Claude Code. Pairs with the <a href="#design-claude-code">Design Claude Code</a> breakdown.</li>
+<li><a href="https://www.anthropic.com/research/claude-code-sandboxing">Anthropic: Claude Code sandboxing</a>: filesystem and network isolation instead of permission prompts.</li>
+<li><a href="https://code.claude.com/docs">Claude Code documentation</a>: memory files, permissions, hooks, subagents, MCP, headless mode.</li>
+<li><a href="https://learn.chatgpt.com/docs/agent-approvals-security">OpenAI Codex: agent approvals and security</a>: the same problem solved with Seatbelt, bubblewrap and seccomp.</li>
+<li><a href="https://github.blog/ai-and-ml/github-copilot/how-github-copilot-is-getting-better-at-understanding-your-code/">GitHub: How Copilot understands your code</a> and <a href="https://cursor.com/blog/tab-rl">Cursor: online RL for Tab</a>: inline completion in production.</li>
+<li><a href="https://openai.com/index/introducing-swe-bench-verified/">SWE-bench Verified</a> and <a href="https://www.tbench.ai/">Terminal-Bench</a>: how coding agents are benchmarked.</li>
 </ul>
 
 <h2>Retrieval</h2>
 <ul>
-<li>★ <a href="https://www.anthropic.com/news/contextual-retrieval">Anthropic: Introducing Contextual Retrieval</a>: hybrid search, reranking, measured failure-rate reductions.</li>
+<li>★ <a href="https://www.anthropic.com/research/contextual-retrieval">Anthropic: Introducing Contextual Retrieval</a>: hybrid search, reranking, measured failure-rate reductions.</li>
 <li><a href="https://arxiv.org/abs/2307.03172">Lost in the Middle: How Language Models Use Long Contexts</a>: why more context isn't automatically better.</li>
 <li><a href="https://docs.ragas.io/">Ragas documentation</a>: RAG evaluation metrics.</li>
+<li><a href="https://arxiv.org/abs/1603.09320">HNSW (Malkov &amp; Yashunin)</a> and <a href="https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index">Faiss: guidelines to choose an index</a>: the vector-index trade-offs in <a href="#vector-search">Embeddings &amp; Vector Search</a>.</li>
+<li><a href="https://arxiv.org/abs/2404.16130">GraphRAG (Microsoft)</a>: when entity graphs beat chunk retrieval, and what they cost.</li>
+</ul>
+
+<h2>Context, memory and evaluation</h2>
+<ul>
+<li>★ <a href="https://www.anthropic.com/research/effective-context-engineering-for-ai-agents">Anthropic: Effective context engineering</a> and <a href="https://www.trychroma.com/research/context-rot">Chroma: Context Rot</a>: why bigger windows don't remove the need to curate.</li>
+<li><a href="https://arxiv.org/abs/2310.08560">MemGPT</a> and <a href="https://arxiv.org/abs/2504.19413">Mem0</a>: long-term memory architectures.</li>
+<li><a href="https://arxiv.org/abs/2306.05685">Judging LLM-as-a-Judge (Zheng et al.)</a>: judge biases and how to measure agreement.</li>
+<li><a href="https://www.anthropic.com/research/statistical-approach-to-model-evals">Anthropic: A statistical approach to model evaluations</a>: confidence intervals for eval scores.</li>
+<li><a href="https://hamel.dev/blog/posts/evals/">Hamel Husain: Your AI product needs evals</a>: the practitioner's version of the eval flywheel.</li>
+<li><a href="https://github.com/open-telemetry/semantic-conventions-genai">OpenTelemetry GenAI semantic conventions</a>: a vendor-neutral schema for LLM traces.</li>
 </ul>
 
 <h2>Inference and serving</h2>
@@ -36,19 +61,31 @@
 <li>★ <a href="https://arxiv.org/abs/2309.06180">Efficient Memory Management for LLM Serving with PagedAttention (vLLM)</a>: KV cache, batching, why memory caps throughput.</li>
 <li><a href="https://www.usenix.org/conference/osdi22/presentation/yu">Orca: iteration-level scheduling (OSDI 2022)</a>: the origin of continuous batching.</li>
 <li><a href="https://arxiv.org/abs/2211.17192">Fast Inference from Transformers via Speculative Decoding</a>.</li>
+<li><a href="https://arxiv.org/abs/2401.09670">DistServe</a> and <a href="https://arxiv.org/abs/2407.00079">Mooncake</a>: prefill/decode disaggregation and KV-centric serving.</li>
+<li><a href="https://arxiv.org/abs/2312.07104">SGLang (RadixAttention)</a>: prefix sharing as a radix tree, the basis of engine-level prompt caching.</li>
+<li><a href="https://arxiv.org/abs/2106.09685">LoRA</a>, <a href="https://arxiv.org/abs/2305.14314">QLoRA</a> and <a href="https://arxiv.org/abs/2305.18290">DPO</a>: the three fine-tuning papers worth knowing, covered in <a href="#fine-tuning">Fine-tuning &amp; Adaptation</a>.</li>
 <li><a href="https://github.com/vllm-project/vllm">vLLM</a>, <a href="https://github.com/sgl-project/sglang">SGLang</a> and <a href="https://github.com/llm-d/llm-d">llm-d</a> on GitHub.</li>
 </ul>
 
 <h2>Security and safety</h2>
 <ul>
 <li>★ <a href="https://genai.owasp.org/llm-top-10/">OWASP Top 10 for LLM Applications</a>.</li>
-<li><a href="https://simonwillison.net/series/prompt-injection/">Simon Willison's prompt injection series</a>: the clearest running commentary on why injection is hard.</li>
+<li><a href="https://simonwillison.net/series/prompt-injection/">Simon Willison's prompt injection series</a>: the clearest running commentary on why injection is hard, including the "lethal trifecta."</li>
+<li><a href="https://arxiv.org/abs/2506.08837">Design Patterns for Securing LLM Agents against Prompt Injections</a> and <a href="https://arxiv.org/abs/2503.18813">CaMeL</a>: architectural defenses rather than filters.</li>
+<li><a href="https://genai.owasp.org/">OWASP GenAI Security Project</a>: the LLM Top 10 and the agentic risk list.</li>
+</ul>
+
+<h2>Real-time, voice and reliability</h2>
+<ul>
+<li><a href="https://docs.livekit.io/agents/">LiveKit Agents</a> and <a href="https://github.com/pipecat-ai/pipecat">Pipecat</a>: open-source voice agent frameworks; read their turn-detection docs.</li>
+<li><a href="https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter">AWS Builders' Library: timeouts, retries and backoff with jitter</a>: the reliability basics every LLM gateway reuses.</li>
+<li><a href="https://research.google/pubs/the-tail-at-scale/">Dean &amp; Barroso: The Tail at Scale</a>: hedged requests and tail latency.</li>
 </ul>
 
 <h2>Pricing and limits (check before quoting numbers)</h2>
 <ul>
 <li><a href="https://platform.claude.com/docs/en/about-claude/pricing">Claude API pricing</a>, including prompt caching and batch discounts.</li>
 <li><a href="https://openai.com/api/pricing/">OpenAI API pricing</a>.</li>
-<li><a href="https://ai.google.dev/gemini-api/docs/pricing">Gemini API pricing</a>.</li>
+<li><a href="https://aistudio.google.com/docs/pricing">Gemini API pricing</a>.</li>
 </ul>
 </section>

@@ -1,0 +1,148 @@
+<section class="page" id="p-design-deep-research" data-title="Deep Research Agent" data-kw="deep research agent multi-agent orchestrator workers lead agent subagents parallel search browse citations citation agent durable execution temporal memory context token cost effort scaling llm judge evaluation fan-out rate limits report">
+<div class="banner" style="--banner:#c79ad6" data-bt="Deep Research Agent" data-bs="worked example · multi-agent"></div>
+<p class="eyebrow">Question Breakdown · Hard</p>
+<h1>Design a Deep Research Agent</h1>
+<p class="lead">A multi-agent system that takes an open-ended question, searches and reads the web for 5–30 minutes, and returns a structured report with citations. Representative of "design a deep research agent", "design a multi-agent system" and "design an agent that writes a cited report" prompts.</p>
+<hr class="sep">
+
+<h2>Understanding the Problem</h2>
+<p>A user asks something that no single search answers: "Compare the regulatory approaches to AI model evaluation in the EU, UK and US, and what they mean for a startup shipping in all three." The system plans an investigation, runs many searches in parallel, reads dozens of sources, follows leads, reconciles conflicting information, and writes a report in which every claim links to a source. The user can watch progress, close the tab, and come back later.</p>
+<p>Compared to the <a href="#design-answer-engine">answer engine</a>, the latency budget flips from seconds to minutes, and the core problems become <strong>orchestration</strong> (how work is split across agents), <strong>context management</strong> (no single context can hold everything read), <strong>durability</strong> (a 30-minute run must survive crashes and deploys) and <strong>cost control</strong> (each run burns orders of magnitude more tokens than a chat turn).</p>
+<div class="callout"><span class="ci"></span><p>The best public reference for this design is Anthropic's write-up of the multi-agent research system behind Claude's Research feature (<a href="https://www.anthropic.com/research/multi-agent-research-system">How we built our multi-agent research system</a>). Interviewers at AI companies often know it; citing its trade-offs accurately is a strong signal.</p></div>
+
+<h3>Functional Requirements</h3>
+<ol>
+<li>Users should be able to submit a research question (and answer optional clarifying questions) and receive a structured report with citations.</li>
+<li>Users should be able to follow progress live (plan, sources being read), cancel, and come back later to a finished report.</li>
+<li>Users should be able to ask follow-up questions that extend or revise the report.</li>
+</ol>
+<p><strong>Below the line:</strong> private data connectors (Drive, Slack, email) beyond a mention of how they plug in as tools, scheduled recurring research, collaborative editing of reports.</p>
+
+<h3>Non-Functional Requirements</h3>
+<ol>
+<li><strong>Durability:</strong> runs of up to 30–60 minutes survive process crashes, deploys and provider blips, resuming rather than restarting.</li>
+<li><strong>Bounded cost:</strong> per-run token, tool-call and wall-clock budgets enforced by the platform, scaled to question difficulty.</li>
+<li><strong>Quality:</strong> claims are supported by cited sources; factual accuracy, citation accuracy and completeness measured on an evaluation set.</li>
+<li><strong>Scale:</strong> assume 200K runs/day averaging 15 minutes.</li>
+<li><strong>Fairness to dependencies:</strong> search APIs, model rate limits and websites are shared resources; fan-out must be controlled.</li>
+</ol>
+
+<h2>The Set Up</h2>
+<h3>Core Entities</h3>
+<ul>
+<li><strong>ResearchRun</strong>: question, clarifications, status, effort level, budget and spend, workflow ID.</li>
+<li><strong>Plan</strong>: the lead agent's decomposition of the question; saved outside the context window.</li>
+<li><strong>SubTask</strong>: one subagent assignment: objective, expected output format, tool and source guidance, boundaries, budget.</li>
+<li><strong>Source</strong>: URL, fetched content reference, access time, quality signals.</li>
+<li><strong>Finding</strong>: a claim with references to source spans, produced by a subagent.</li>
+<li><strong>Report</strong>: sections, claims and citations, version (follow-ups create new versions).</li>
+</ul>
+
+<h3>API</h3>
+<pre><code>POST /research                     { question, effort? }        → 202 { runId, clarifyingQuestions? }
+POST /research/{id}/clarifications { answers }
+GET  /research/{id}/events                                      <span class="c">// SSE: plan, subtask_started, source_read, subtask_done, report_delta, done</span>
+GET  /research/{id}                                             → { status, report?, sources[], spend }
+POST /research/{id}/followups      { message }                  → 202 { runId }
+POST /research/{id}/cancel</code></pre>
+<p>Everything is asynchronous. The run outlives the HTTP request, so creation returns immediately and the client subscribes to events (and gets a push or email notification on completion).</p>
+
+<h3>Capacity and cost estimate</h3>
+<pre><code>Concurrency:  200K runs/day × 15 min ÷ 1,440 min/day ≈ <span class="k">2,100 concurrent runs</span> (≈6K at a 3× peak)
+
+Tokens per run (a medium question, bottom-up):
+  lead:        ~10 turns × ~30K context                   ≈ 0.3M input
+  subagents:   5 × ~15 tool turns × ~20K context           ≈ 1.5M input
+  output:      plans, notes, report                        ≈ 50K
+  total        <span class="k">≈ 2M tokens</span>  (vs ~10–20K for a chat turn)
+
+Tools per run: ~50 searches + ~100 page fetches
+  → 10M searches/day ≈ 115/s average, ~350/s peak
+
+Cost per run at Sonnet 5.5 list prices ($2 / M input, $10 / M output, cache writes 1.25×, reads 0.05×):
+  no caching:    2M × $2 + 50K × $10            ≈ <span class="k">$4.50</span>
+  80% cache hits (misses written to cache): 0.4M × $2.50 + 1.6M × $0.10 + $0.50 ≈ <span class="k">$1.66</span></code></pre>
+<p>Two takeaways for the interview. First, this is a premium, rate-limited feature, not something you give away per keystroke; Anthropic reports agents use about 4× the tokens of chat and multi-agent systems about 15× (<a href="https://www.anthropic.com/research/multi-agent-research-system">Anthropic</a>). Second, agent loops re-send a growing transcript every turn, so <a href="#llm-caching">prompt caching</a> on the stable prefix is the biggest single cost lever.</p>
+
+<h2>High-Level Design</h2>
+<h3>1) Researching a question with a lead agent and parallel subagents</h3>
+<p>Use the <strong>orchestrator-workers</strong> pattern (see <a href="#agents-tool-use">Agents, Tools &amp; MCP</a>):</p>
+<figure class="dg" data-diagram="design-deep-research-loop"></figure>
+<ol>
+<li><strong>Clarify and plan.</strong> The lead agent (the strongest model) reads the question, optionally asks one or two clarifying questions, and writes a plan: sub-questions, what kind of sources each needs, and how much effort the question deserves. It saves the plan to external memory, because a long run will outgrow its context.</li>
+<li><strong>Delegate.</strong> The lead spawns subagents, each with a task spec: the objective, the output format, which tools and sources to prefer, and explicit boundaries ("cover only UK regulation; the EU is handled elsewhere"). Subagents run in parallel, each with its own clean context.</li>
+<li><strong>Search and read.</strong> Each subagent runs its own tool loop: start with short, broad queries, look at what's available, then narrow; fetch and read promising pages; evaluate source quality; stop when the objective is met or the budget runs out.</li>
+<li><strong>Return condensed findings.</strong> A subagent returns a compact summary (a few hundred to a couple of thousand tokens) of claims with source references, and writes its full notes and the raw pages to the findings store. The lead never sees the 100K tokens of pages a subagent read, only the distilled result. Separate contexts act as compression.</li>
+<li><strong>Synthesize or iterate.</strong> The lead merges findings, spots gaps or contradictions, and either spawns another round of subagents or drafts the report.</li>
+<li><strong>Cite.</strong> A citation agent maps each claim in the draft to specific spans in the stored sources and inserts citations; claims without support get flagged, softened or removed.</li>
+</ol>
+
+<h3>2) Following progress and coming back later</h3>
+<p>A run is far too long to live inside a web request or a single process, so it runs as a <strong>durable workflow</strong> (Temporal, AWS Step Functions, or a home-grown equivalent; see <a href="#key-technologies">Key Technologies</a>). Every model call and tool call is an activity with timeouts and retries, and the workflow's history is the source of truth for where the run is. The workflow emits progress events (plan created, subagent started, source read, section drafted) to an event stream that the client reads over SSE; on completion it sends a notification. Reconnecting clients replay events from the last ID they saw (see <a href="#api-streaming">API Design &amp; Streaming</a>).</p>
+
+<h3>3) Follow-ups</h3>
+<p>A follow-up starts a new, usually smaller run seeded with the previous plan, the report and the findings store, so the lead can reuse sources instead of re-searching. The report is versioned; the new version shows what changed.</p>
+<figure class="dg" data-diagram="design-deep-research-final"></figure>
+
+<h2>Potential Deep Dives</h2>
+<h3>1) Why multi-agent, and how many agents?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>One agent, one ever-growing context</h5><p><span class="lbl">Approach:</span> a single agent searches, reads and writes sequentially.</p><p><span class="lbl">Challenges:</span> the context fills with raw page text after a dozen sources, quality degrades as it grows, the search is strictly sequential (slow), and an early wrong turn biases everything after it.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>A fixed pipeline: generate queries, search, summarize, write</h5><p><span class="lbl">Approach:</span> an LLM generates N queries, results are fetched and summarized in parallel, and a final call writes the report.</p><p><span class="lbl">Challenges:</span> predictable and cheap, but it can't follow leads, notice that a sub-question needs a different kind of source, or decide that the answer is already found. Research is path-dependent in a way a static pipeline can't express.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Lead agent plus parallel subagents, with explicit effort scaling</h5><p><span class="lbl">Approach:</span> the orchestrator-workers design above. Anthropic reports that a multi-agent system with a Claude Opus 4 lead and Claude Sonnet 4 subagents outperformed single-agent Claude Opus 4 by 90.2% on its internal research evaluation, and that on the BrowseComp benchmark token usage alone explained about 80% of the variance in performance (token usage, number of tool calls and model choice together explained about 95%). Multi-agent systems work largely because they let you spend more tokens in parallel across separate contexts.</p><p>Effort scaling is written into the lead's prompt, using Anthropic's published rules of thumb: simple fact-finding gets one agent with 3–10 tool calls; direct comparisons get 2–4 subagents with 10–15 calls each; complex research gets more than 10 subagents with clearly divided responsibilities.</p><p><span class="lbl">Challenges:</span> about 15× the tokens of chat, so it only pays for valuable, breadth-heavy questions. It fits poorly when all agents need the same context or have many dependencies on each other (Anthropic notes most coding tasks are like this). Say when you <em>wouldn't</em> use it.</p></div>
+
+<h3>2) How do we stop agents from duplicating work, over-spawning or searching forever?</h3>
+<p>Anthropic describes exactly these early failure modes: spawning 50 subagents for simple queries, scouring the web endlessly for sources that don't exist, subagents distracting each other with excessive updates, and vague task descriptions that led several subagents to research the same thing. The fixes are part prompt, part platform:</p>
+<ul>
+<li><strong>Task specs, not one-liners.</strong> Every subagent gets an objective, an output format, guidance on tools and sources, and boundaries that say what other subagents are covering.</li>
+<li><strong>Effort rules in the lead prompt</strong> (above), plus a hard platform cap on parallel subagents per run (say 5 at a time) and on total subagents.</li>
+<li><strong>Per-subagent budgets</strong> for tool calls, tokens and wall-clock time, enforced by the orchestrator and the <a href="#gateway-reliability">LLM gateway</a>, not just requested in the prompt.</li>
+<li><strong>A shared source registry</strong> per run: fetched URLs are recorded, and a second fetch returns the stored copy, which cuts duplicate reading and cost.</li>
+<li><strong>Loop and stall detection:</strong> repeated near-identical queries or no new sources over several turns trigger a "summarize what you have and stop" instruction.</li>
+<li><strong>Search strategy guidance:</strong> start wide with short queries, then narrow, instead of starting with long, over-specific queries that return nothing.</li>
+</ul>
+
+<h3>3) How does a 30-minute run survive failures?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Run the agent loop in an API server process</h5><p><span class="lbl">Challenges:</span> any deploy, crash or OOM kills every run on that host, and the user loses up to 30 minutes of work and dollars of tokens. Restarting from scratch also gives a different result, which confuses users.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Checkpoint the transcript after every step</h5><p><span class="lbl">Approach:</span> workers persist each agent's messages to a database after each model or tool call; a supervisor restarts orphaned runs from the last checkpoint.</p><p><span class="lbl">Challenges:</span> you're hand-building a workflow engine: leases, timeouts, retries, and coordinating a lead waiting on five subagents are all easy to get subtly wrong.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Durable execution with activities, versioned deploys and pause-on-outage</h5><p><span class="lbl">Approach:</span> model the lead and each subagent as workflows (or child workflows) whose model calls and tool calls are activities. Completed activities are recorded in history and not re-executed on replay, so a crash resumes mid-run. Tools are reads (search, fetch), so retries are safe. Long provider outages pause runs instead of failing them. Deploy with versioning (Anthropic describes "rainbow deployments" that shift traffic gradually so in-flight agents keep running on the old version). Anthropic also notes the value of letting the model know when a tool failed so it can adapt, combined with deterministic safeguards such as retries and checkpoints.</p><p><span class="lbl">Challenges:</span> the lead waiting synchronously for each batch of subagents is simple but leaves time on the table; asynchronous subagents that report while the lead keeps working add parallelism but make result coordination, state consistency and error propagation harder. Start synchronous and say why.</p></div>
+
+<h3>4) How do we manage context and memory?</h3>
+<ul>
+<li><strong>Plan in memory:</strong> the lead writes its plan to an external store early. Anthropic notes that contexts beyond 200K tokens get truncated in their system, so the plan has to survive outside the window.</li>
+<li><strong>Condensed returns:</strong> subagents return summaries with source IDs, not raw pages.</li>
+<li><strong>Artifacts by reference:</strong> subagents write full notes and long outputs to the artifact store and pass back lightweight references, avoiding a "game of telephone" where each hop loses detail.</li>
+<li><strong>Fresh contexts with handoffs:</strong> when an agent nears its limit, it summarizes completed work into memory and a new agent continues from that summary. See <a href="#context-engineering">Context Engineering &amp; Memory</a>.</li>
+<li><strong>Stable prefixes:</strong> system prompt and tool definitions first, unchanged across turns, so every turn of every agent hits the prompt cache.</li>
+</ul>
+
+<h3>5) How do we keep sources trustworthy and citations accurate?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Let the writer add citations as it goes</h5><p><span class="lbl">Challenges:</span> by the time the lead writes the report, it's working from summaries of summaries; citations drift from the exact source that supports each claim.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Findings carry source IDs end to end</h5><p><span class="lbl">Approach:</span> every finding a subagent returns is tied to source IDs; the writer must cite one of those IDs for each claim.</p><p><span class="lbl">Challenges:</span> source-level IDs don't prove the specific claim is in the source, and the writer can merge findings into claims no single source supports.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>A dedicated citation pass over stored spans, plus source-quality guidance</h5><p><span class="lbl">Approach:</span> after drafting, a citation agent reads the report and the stored documents and attaches each claim to specific spans (Anthropic's system uses a CitationAgent for this step). Unsupported claims are flagged and revised. Upstream, prompts and ranking push subagents toward primary and authoritative sources; Anthropic's human testers found early agents preferred SEO-optimized content farms over authoritative sources such as academic PDFs, and fixed it with source-quality heuristics in the prompts. Treat all fetched text as untrusted input (it can contain injected instructions) and give research agents no tools with side effects beyond writing to their own run's store.</p><p><span class="lbl">Challenges:</span> the citation pass adds a long-context call per report; it's worth it because citation accuracy is what users check first.</p></div>
+
+<h3>6) How do we control fan-out against rate limits?</h3>
+<p>At peak, 6K concurrent runs each with up to 5 subagents is 30K agents competing for the same search API quota, model tokens-per-minute and websites.</p>
+<ul>
+<li><strong>Admission control:</strong> research is asynchronous, so queue new runs when capacity is saturated instead of failing them; show "starting soon" with a position.</li>
+<li><strong>Global token buckets</strong> per dependency (search API calls/s, model input and output tokens/min per provider and region) in Redis, with per-run and per-tenant fair-share caps so one heavy user can't starve the rest.</li>
+<li><strong>Priority:</strong> interactive chat outranks background research at the gateway; research absorbs spare capacity and slows down under load.</li>
+<li><strong>Per-host politeness</strong> on fetches across all runs, plus caching fetched pages across runs (popular sources are read by many runs).</li>
+<li><strong>Backpressure into the agent:</strong> when a tool call is throttled, the activity waits and retries with backoff; the agent never sees a raw 429 it might "work around" by issuing more calls.</li>
+</ul>
+
+<h3>7) How do we evaluate a system whose path changes every run?</h3>
+<ul>
+<li><strong>Start small, early.</strong> Anthropic started with about 20 queries representing real usage, because early changes have large effects that a small set detects. Don't wait for a thousand-item benchmark.</li>
+<li><strong>Judge the end state, not the path.</strong> Two runs can take different, equally valid routes. An LLM judge scores the final report against a rubric: factual accuracy, citation accuracy, completeness, source quality and tool efficiency. Anthropic found a single judge call producing 0.0–1.0 scores and a pass/fail grade most consistent with human judgment.</li>
+<li><strong>Humans for the edge cases:</strong> manual testers catch failure modes that rubrics miss (hallucinated answers on unusual queries, system failures, subtle source bias).</li>
+<li><strong>Tracing:</strong> full production traces of agent decisions (which tools, which subagents, why) are how you debug non-deterministic failures; monitor decision patterns and aggregate metrics without reading users' conversation content. See <a href="#observability">Observability &amp; LLMOps</a> and <a href="#evaluation">Evaluation</a>.</li>
+<li><strong>Improve tools, not just prompts:</strong> Anthropic had an agent test tools and rewrite their descriptions, which cut task completion time by 40% for later agents using those tools.</li>
+</ul>
+
+<h2>What is Expected at Each Level?</h2>
+<div class="levels">
+<div><h4>Mid-level</h4>An agent loop with search and fetch tools, an async API with progress events, a report with citations tied to sources, and budgets on steps and tokens.</div>
+<div><h4>Senior</h4>Orchestrator-workers with task specs and effort scaling, durable execution with resumption, context management through condensed returns and external memory, a citation pass, token-cost math with caching, and an LLM-judge eval rubric.</div>
+<div><h4>Staff+</h4>Explains when multi-agent is and isn't worth 15× the tokens, designs fair-share fan-out across shared rate limits, versioned deploys for long-lived runs, sync vs async subagent trade-offs, and an evaluation strategy for non-deterministic paths that ties quality to cost per useful report.</div>
+</div>
+</section>

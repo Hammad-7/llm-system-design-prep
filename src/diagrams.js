@@ -150,15 +150,15 @@ D["tech-map"]={w:770,h:320,label:"Map of LLM technology categories: LLM gateway 
   {id:"x2",x:580,y:140,w:180,h:80,t:"Guardrails",sub:"Llama Guard · Presidio",c:"red",fs:16},
   {id:"x3",x:580,y:234,w:180,h:72,t:"Sandboxes",sub:"Firecracker · gVisor",c:"red",fs:16}
  ]};
-D["vector-choice"]={w:775,h:310,label:"Decision tree for picking a vector store: pgvector if you are already on Postgres at moderate scale; a search engine like OpenSearch or Vespa if keyword ranking matters as much as semantics; otherwise a managed or self-run vector database.",
+D["vector-choice"]={w:775,h:310,label:"Decision tree for picking a vector store: pgvector if you are already on Postgres at moderate scale; a search engine like OpenSearch or Vespa if keyword ranking matters as much as semantics; otherwise a managed-only service or an open-source vector database (self-run or on its vendor's cloud).",
  nodes:[
   {id:"q1",x:10,y:110,w:175,h:90,t:"On Postgres and\n< tens of millions\nof chunks?",c:"gray",fs:14},
   {id:"pg",x:240,y:22,w:150,h:56,t:"pgvector",c:"teal",fs:17},
   {id:"q2",x:240,y:150,w:180,h:84,t:"Keyword ranking\nas important as\nsemantic?",c:"gray",fs:14},
   {id:"os",x:475,y:96,w:185,h:62,t:"OpenSearch /\nElasticsearch / Vespa",c:"teal",fs:14},
-  {id:"q3",x:475,y:206,w:135,h:70,t:"Managed or\nself-run?",c:"gray",fs:14},
-  {id:"mg",x:655,y:156,w:112,h:66,t:"Managed:\nPinecone /\nturbopuffer",c:"teal",fs:12},
-  {id:"sr",x:655,y:236,w:112,h:66,t:"Self-run:\nQdrant / Milvus\n/ Weaviate",c:"teal",fs:12}
+  {id:"q3",x:475,y:206,w:135,h:70,t:"Managed-only or\nopen source?",c:"gray",fs:14},
+  {id:"mg",x:655,y:156,w:112,h:66,t:"Managed-only:\nPinecone /\nturbopuffer",c:"teal",fs:12},
+  {id:"sr",x:655,y:236,w:112,h:66,t:"Open source:\nQdrant / Milvus\n/ Weaviate",c:"teal",fs:12}
  ],
  edges:[{a:"q1",b:"pg",t:"yes"},{a:"q1",b:"q2",t:"no"},{a:"q2",b:"os",t:"yes"},{a:"q2",b:"q3",t:"no"},{a:"q3",b:"mg"},{a:"q3",b:"sr"}]};
 D["rag"]={w:800,h:400,label:"RAG architecture: an offline path ingests documents through a change queue, parsing, chunking, enrichment and embedding into a vector and BM25 index; the online path rewrites the query, runs permission-filtered hybrid search, reranks, and has the LLM answer with citations.",
@@ -246,7 +246,7 @@ D["cache-layers"]={w:780,h:210,label:"Layered caching: a request checks an exact
   {id:"f",x:640,y:76,w:128,h:68,t:"Full prefill\n+ decode",c:"orange",fs:15}
  ],
  edges:[{a:"r",b:"e"},{a:"e",b:"s",t:"miss"},{a:"s",b:"p",t:"miss"},{a:"p",b:"f",t:"miss"}],
- notes:[{x:180,y:38,t:"hit: ~ms, free",a:"middle",fs:14,c:"teal"},{x:347,y:38,t:"hit: strict threshold",a:"middle",fs:14,c:"teal"},{x:522,y:38,t:"hit: ~0.1× input,\nlower TTFT",a:"middle",fs:14,c:"teal"},{x:704,y:38,t:"full price",a:"middle",fs:14,c:"orange"},
+ notes:[{x:180,y:38,t:"hit: ~ms, free",a:"middle",fs:14,c:"teal"},{x:347,y:38,t:"hit: strict threshold",a:"middle",fs:14,c:"teal"},{x:522,y:38,t:"hit: ≤0.1× input,\nlower TTFT",a:"middle",fs:14,c:"teal"},{x:704,y:38,t:"full price",a:"middle",fs:14,c:"orange"},
   {x:390,y:186,t:"every key scoped by tenant (and user for personal data)",a:"middle",fs:14,c:"red"}]};
 D["cascade"]={w:770,h:250,label:"Model routing and cascades: a router sends easy requests to a small model whose output is checked; failures escalate to a frontier model; hard requests go straight to the frontier model, which falls back to another provider on errors.",
  nodes:[

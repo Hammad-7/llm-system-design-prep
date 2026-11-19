@@ -30,7 +30,7 @@
 <h4>Serving engines</h4>
 <p><span class="pill">vLLM</span><span class="pill">SGLang</span><span class="pill">TensorRT-LLM</span></p>
 <div class="kv"><b>What they do</b><span>Turn model weights into a high-throughput, OpenAI-compatible endpoint: continuous batching, paged KV cache, prefix caching, quantization, speculative decoding, multi-GPU parallelism, multi-LoRA serving.</span>
-<b>Differences</b><span><a href="https://github.com/vllm-project/vllm">vLLM</a> (PagedAttention) is the broadest default. <a href="https://github.com/sgl-project/sglang">SGLang</a> centers its scheduler on prefix reuse (RadixAttention) and does well on multi-turn and shared-prefix workloads. TensorRT-LLM is NVIDIA's compiled, highly tuned option.</span>
+<b>Differences</b><span><a href="https://github.com/vllm-project/vllm">vLLM</a> (PagedAttention) is the broadest default. <a href="https://github.com/sgl-project/sglang">SGLang</a> centers its scheduler on prefix reuse (RadixAttention) and does well on multi-turn and shared-prefix workloads. TensorRT-LLM is NVIDIA's highly tuned option for its own GPUs.</span>
 <b>Say</b><span>"Each replica runs vLLM with continuous batching and prefix caching; the router is what makes the fleet efficient."</span></div>
 </div>
 <div class="tech">
@@ -40,6 +40,7 @@
 <b>Say</b><span>"Round-robin wastes prefix caches. I'd route by conversation or prefix hash with a load-aware fallback."</span></div>
 </div>
 
+<p class="src">Deep dive: <a href="#inference-serving">Inference &amp; Serving</a></p>
 <h2>Retrieval</h2>
 <div class="tech">
 <h4>Vector databases and search engines</h4>
@@ -60,12 +61,13 @@
 <div class="kv"><b>Why it matters</b><span>Garbage in, garbage retrieved. PDFs, tables and slides need layout-aware parsing; scanned documents need OCR or a vision model. Ingestion is a pipeline (fetch → parse → chunk → enrich → embed → upsert) run by workers off a queue, triggered by change events.</span></div>
 </div>
 
+<p class="src">Deep dive: <a href="#vector-search">Embeddings &amp; Vector Search</a> · <a href="#rag-deep-dive">RAG in Depth</a></p>
 <h2>Gateways and orchestration</h2>
 <div class="tech">
 <h4>LLM gateways</h4>
 <p><span class="pill">LiteLLM</span><span class="pill">Portkey</span><span class="pill">Envoy AI Gateway</span><span class="pill">Kong AI Gateway</span><span class="pill">Cloudflare AI Gateway</span></p>
 <div class="kv"><b>What it does</b><span>A single internal API in front of every model: provider keys, routing and fallback, per-tenant token quotas and budgets, caching, PII redaction, logging and cost attribution.</span>
-<b>Say</b><span>"Every model call goes through the gateway, which gives us one place for quotas, fallbacks and cost tracking. Uber built exactly this kind of GenAI gateway to serve dozens of internal use cases."</span></div>
+<b>Say</b><span>"Every model call goes through the gateway, which gives us one place for quotas, fallbacks and cost tracking. Uber built exactly this kind of GenAI gateway, used by close to 30 internal teams."</span></div>
 </div>
 <div class="tech">
 <h4>Agent and LLM application frameworks</h4>
@@ -82,17 +84,19 @@
 <div class="tech">
 <h4>Protocols</h4>
 <p><span class="pill">Model Context Protocol (MCP)</span><span class="pill">Agent2Agent (A2A)</span><span class="pill">OpenAI-compatible APIs</span></p>
-<div class="kv"><b>Know</b><span>MCP standardizes how models discover and call tools and data sources; its 2026-07-28 spec made the core stateless and standardized OAuth-based authorization for remote servers. A2A covers agent-to-agent communication. The OpenAI-compatible HTTP API is the de facto interface most serving engines and gateways expose.</span></div>
+<div class="kv"><b>Know</b><span>MCP standardizes how models discover and call tools and data sources; its 2026-07-28 spec made the core stateless and tightened the OAuth-based authorization for remote servers (introduced in 2025). A2A covers agent-to-agent communication. The OpenAI-compatible HTTP API is the de facto interface most serving engines and gateways expose.</span></div>
 </div>
 
+<p class="src">Deep dive: <a href="#gateway-reliability">Gateways, Routing &amp; Reliability</a> · <a href="#agents-tool-use">Agents, Tools &amp; MCP</a></p>
 <h2>Evaluation and observability</h2>
 <div class="tech">
 <h4>Tracing, evals and prompt management</h4>
 <p><span class="pill">Langfuse</span><span class="pill">LangSmith</span><span class="pill">Arize Phoenix</span><span class="pill">Braintrust</span><span class="pill">Ragas</span><span class="pill">promptfoo</span><span class="pill">OpenTelemetry GenAI conventions</span></p>
-<div class="kv"><b>What they do</b><span>Capture each request as a trace (prompt version, retrieved chunks, tool calls, tokens, latency, cost), run offline eval suites with LLM judges, compare prompt and model versions, and collect user feedback. <a href="https://langfuse.com/">Langfuse</a> and Phoenix are open source; LangSmith and Braintrust are managed.</span>
+<div class="kv"><b>What they do</b><span>Capture each request as a trace (prompt version, retrieved chunks, tool calls, tokens, latency, cost), run offline eval suites with LLM judges, compare prompt and model versions, and collect user feedback. <a href="https://langfuse.com/">Langfuse</a> and Phoenix can be self-hosted (Langfuse is open source; Phoenix is source-available under the Elastic License); LangSmith and Braintrust are managed.</span>
 <b>Say</b><span>"Every trace is tagged with prompt and model version, so we can slice quality and cost by release and replay failures into the eval set."</span></div>
 </div>
 
+<p class="src">Deep dive: <a href="#evaluation">Evaluation</a> · <a href="#observability">Observability &amp; LLMOps</a></p>
 <h2>Safety and security</h2>
 <div class="tech">
 <h4>Guardrails</h4>
@@ -106,6 +110,7 @@
 <div class="kv"><b>Use when</b><span>The model writes and runs code, browses, or touches files. Each run gets an isolated, short-lived environment with CPU/memory/time limits, no secrets, and an egress allowlist.</span></div>
 </div>
 
+<p class="src">Deep dive: <a href="#guardrails-security">Guardrails &amp; Security</a></p>
 <h2>Classic infrastructure, LLM-flavored</h2>
 <div class="tbl"><table>
 <thead><tr><th>Technology</th><th>Typical role in an LLM system</th></tr></thead>

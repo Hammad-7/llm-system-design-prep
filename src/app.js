@@ -1,7 +1,7 @@
 (function(){
 "use strict";
 var NS="http://www.w3.org/2000/svg";
-var ORDER=["introduction","how-to-prepare","delivery-framework","core-concepts","key-technologies","common-patterns","question-breakdowns","design-chatgpt","design-support-assistant","design-inference-batching","design-coding-agent","question-bank","resources"];
+var ORDER=["introduction","how-to-prepare","delivery-framework","core-concepts","key-technologies","common-patterns","question-breakdowns","inference-serving","context-engineering","vector-search","rag-deep-dive","llm-caching","agents-tool-use","evaluation","guardrails-security","api-streaming","gateway-reliability","observability","fine-tuning","numbers-to-know","design-chatgpt","design-support-assistant","design-inference-batching","design-coding-agent","design-claude-code","design-code-completion","design-answer-engine","design-deep-research","design-llm-gateway","design-voice-agent","design-doc-extraction","question-bank","resources"];
 function $(s,r){return (r||document).querySelector(s)}
 function $$(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s))}
 function el(tag,attrs,parent){var e=document.createElementNS(NS,tag);for(var k in attrs){if(attrs[k]!==undefined&&attrs[k]!==null)e.setAttribute(k,attrs[k])}if(parent)parent.appendChild(e);return e}
@@ -113,6 +113,7 @@ function renderDiagram(fig){
       txt(svg,n.x+n.w/2,top+th/2,n.t,c,fs); txt(svg,n.x+n.w/2,top+th+5+sh/2,n.sub,"c-gray",12); }
     else txt(svg,n.x+n.w/2,n.y+n.h/2,n.t,c,fs);
   });
+  svg.appendChild(lg); // edge labels above nodes so short hops stay readable
   (D.notes||[]).forEach(function(n){ txt(svg,n.x,n.y,n.t,"c-"+(n.c||"gray"),n.fs||13,n.a||"start"); });
 }
 
@@ -232,8 +233,8 @@ var CHARTS={
     max:6,ticks:6,tickFmt:function(v){return fmt(v)+"%"},valFmt:function(v){return fmt(v,1)+"%"},left:220,highlight:3})},
   "prompt-cache":function(box){
     var x=[1,2,5,10,20,50,100];
-    lineChart(box,{aria:"Line chart: cumulative cost of a 20,000-token shared prefix at $3 per million input tokens. Without caching it reaches $6.00 after 100 requests; with caching it reaches $0.67.",
-      x:x,xNum:false,series:[{name:"No cache",v:[0.06,0.12,0.30,0.60,1.20,3.00,6.00],col:"var(--series-2)",pts:true},{name:"Cached",v:[0.075,0.081,0.099,0.129,0.189,0.369,0.669],col:"var(--series-1)",pts:true}],
+    lineChart(box,{aria:"Line chart: cumulative cost of a 20,000-token shared prefix at $2 per million input tokens. Without caching it reaches $4.00 after 100 requests; with caching it reaches $0.25.",
+      x:x,xNum:false,series:[{name:"No cache",v:[0.04,0.08,0.20,0.40,0.80,2.00,4.00],col:"var(--series-2)",pts:true},{name:"Cached",v:[0.050,0.052,0.058,0.068,0.088,0.148,0.248],col:"var(--series-1)",pts:true}],
       yFmt:function(v,full){return "$"+fmt(v,2)},xLabel:"Requests reusing the same prefix (within cache lifetime)",yLabel:"Cumulative prefix cost (USD)",tipX:function(v){return v+" request"+(v>1?"s":"")}});
   },
   "batch-curve":function(box){
@@ -245,11 +246,11 @@ var CHARTS={
       pts:pts,xmax:10000,ymax:250,xLabel:"Aggregate throughput (tokens/s per GPU)",yLabel:"Per-user speed (tokens/s)"});
   },
   "latency-budget":function(box){
-    var steps=[["Auth + rate limit",0,8],["Input guardrail",8,40],["Load history + memory",8,30],["Retrieval (if needed)",40,160],["Queue + prefill (TTFT)",160,550],["Decode 400 tokens",550,6250],["Output guard (streamed, chunked)",600,6300],["Persist + trace (async)",6250,6290]];
-    var W=680,rowH=34,l=230,r=30,t=8,H=t+steps.length*rowH+34,max=6400;
-    var svg=el("svg",{viewBox:"0 0 "+W+" "+H,role:"img","aria-label":"Gantt-style latency budget: the user sees the first token at about 550 ms, and decoding 400 tokens dominates the total of about 6.3 seconds."},null);box.appendChild(svg);
+    var steps=[["Auth + rate limit",0,8],["Input guardrail",8,40],["Load history + memory",8,30],["Retrieval (if needed)",40,160],["Queue + prefill (TTFT)",160,550],["Decode 500 tokens",550,7690],["Output guard (streamed, chunked)",600,7740],["Persist + trace (async)",7690,7730]];
+    var W=680,rowH=34,l=230,r=30,t=8,H=t+steps.length*rowH+34,max=8000;
+    var svg=el("svg",{viewBox:"0 0 "+W+" "+H,role:"img","aria-label":"Gantt-style latency budget: the user sees the first token at about 550 ms, and decoding 500 tokens dominates the total of about 7.7 seconds."},null);box.appendChild(svg);
     var X=function(v){return l+(W-l-r)*v/max};
-    [0,1000,2000,3000,4000,5000,6000].forEach(function(v){el("line",{x1:X(v),x2:X(v),y1:t,y2:H-26,"class":"gl"},svg);var tx=el("text",{x:X(v),y:H-8,"text-anchor":"middle"},svg);tx.textContent=(v/1000)+" s"});
+    [0,1000,2000,3000,4000,5000,6000,7000,8000].forEach(function(v){el("line",{x1:X(v),x2:X(v),y1:t,y2:H-26,"class":"gl"},svg);var tx=el("text",{x:X(v),y:H-8,"text-anchor":"middle"},svg);tx.textContent=(v/1000)+" s"});
     steps.forEach(function(s,i){var y=t+i*rowH+7,h=rowH-14;var lab=el("text",{x:l-10,y:y+h/2,"text-anchor":"end","dominant-baseline":"central","class":"lab"},svg);lab.textContent=s[0];
       var w=Math.max(3,X(s[2])-X(s[1]));el("rect",{x:X(s[1]),y:y,width:w,height:h,rx:3,fill:i===4?"var(--series-2)":"var(--series-1)",opacity:i===4||i===5?1:.75},svg);
       var hit=el("rect",{x:0,y:y-5,width:W,height:h+10,fill:"transparent"},svg);

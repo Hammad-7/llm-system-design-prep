@@ -1,0 +1,199 @@
+<section class="page" id="p-evaluation" data-title="Evaluation" data-kw="evaluation evals golden dataset test set assertions reference based llm as judge rubric pairwise human review cohen kappa calibration position bias verbosity bias self preference confidence interval binomial sample size contamination rag metrics faithfulness agent evals trajectory outcome pass@k pass^k tau-bench swe-bench sandbox red team safety online evals a/b test implicit feedback regression gate ci eval infrastructure braintrust langsmith langfuse phoenix promptfoo inspect openai evals ragas">
+<div class="banner" style="--banner:#e8907a" data-bt="Evaluation" data-bs="how you know it works"></div>
+<p class="eyebrow">LLM System Design · Core Concepts</p>
+<h1>Evaluation</h1>
+<p class="lead">How to measure the quality of non-deterministic systems: graders, golden datasets and their statistics, LLM judges you can trust, agent and safety evals, online evaluation, and the infrastructure that turns evals into release gates.</p>
+<hr class="sep">
+
+<p>In conventional systems, tests tell you whether code is correct. In LLM systems, the same input can produce different outputs, "correct" is often a judgment call, and a one-line prompt change can fix one behavior while breaking three others you weren't looking at. Without evaluation you can't safely change a prompt, upgrade a model, tune retrieval or compare vendors. That is why experienced AI teams describe evals as the core of LLM engineering, and why interviewers treat a missing eval story as a major gap.</p>
+<p>The <a href="#core-concepts">Core Concepts</a> page introduced offline and online evals. This page covers how to actually build them: choosing graders, sizing datasets so results mean something, making LLM judges trustworthy, evaluating agents, and wiring it all into CI and production.</p>
+
+<h2>What you're evaluating</h2>
+<p>Start from the product, not from metrics. Write down what "good" means for this feature in terms a user would recognize, and what failures cost:</p>
+<ul>
+<li>A support bot: resolves the issue, cites the right policy, never invents a refund promise, escalates when unsure.</li>
+<li>A coding agent: the change compiles, tests pass, the diff is minimal and reviewable.</li>
+<li>An extraction pipeline: fields match the document exactly; missing fields are marked missing, not guessed.</li>
+</ul>
+<p>Then read real outputs. Error analysis (reading a few dozen to a hundred traces and labeling what went wrong) usually reveals that a handful of failure modes account for most problems. Those failure modes, not generic metrics like "helpfulness," become your eval criteria. Hamel Husain's <a href="https://hamel.dev/blog/posts/evals/">Your AI product needs evals</a> is a good practitioner write-up of this workflow.</p>
+
+<h2>The grader ladder</h2>
+<figure class="dg" data-diagram="evaluation-ladder"></figure>
+<div class="tbl"><table>
+<thead><tr><th>Grader</th><th>How it works</th><th>Use for</th><th>Limits</th></tr></thead>
+<tbody>
+<tr><td>Code assertions</td><td>Deterministic checks: valid JSON against schema, regex, required fields, length, forbidden phrases, code compiles, tool called with valid arguments</td><td>Format and hard constraints; run on every commit, essentially free</td><td>Can't judge meaning</td></tr>
+<tr><td>Reference-based</td><td>Compare with a known answer: exact match, F1, numeric tolerance, SQL execution match, unit tests for generated code</td><td>Extraction, classification, math, SQL, code</td><td>Needs labeled references; penalizes valid alternative answers in open-ended tasks</td></tr>
+<tr><td>LLM judge (rubric)</td><td>A model scores the output against criteria, often with the reference or the source context</td><td>Faithfulness, tone, policy compliance, completeness</td><td>Biases and cost; must be calibrated against humans</td></tr>
+<tr><td>LLM judge (pairwise)</td><td>A model picks the better of two outputs for the same input</td><td>Comparing prompt or model versions</td><td>Position bias; tells you which is better, not whether either is good</td></tr>
+<tr><td>Human review</td><td>Domain experts label outputs</td><td>Ground truth for calibration, high-stakes domains, new failure discovery</td><td>Slow, expensive, inconsistent without guidelines</td></tr>
+<tr><td>Task success</td><td>Did the agent reach the goal state? (tests pass, record updated, booking made)</td><td>Agents and workflows</td><td>Needs a resettable environment</td></tr>
+</tbody></table></div>
+<div class="callout"><span class="ci"></span><p>Prefer the cheapest grader that measures what you care about. If you can check it with code, don't ask a model. Many teams find that a large share of their important checks are plain assertions once they've done error analysis.</p></div>
+
+<h2>Building golden datasets</h2>
+<h3>Sourcing</h3>
+<ul>
+<li><strong>Production traces</strong> (sampled, with consent and PII handling) are the most valuable source because they reflect real phrasing and real difficulty. Every user-reported failure becomes a test case.</li>
+<li><strong>Expert-written cases</strong> for important scenarios that are rare in traffic: policy edge cases, dangerous requests, multi-step tasks.</li>
+<li><strong>Synthetic cases</strong> generated by an LLM from your documents or from templates ("write 50 questions a frustrated customer might ask about refunds in the EU"), reviewed by a human. Good for coverage before launch; tends to be easier and more uniform than real traffic.</li>
+<li><strong>Adversarial cases</strong>: jailbreaks, injections, out-of-scope requests, unanswerable questions.</li>
+</ul>
+<h3>Stratification</h3>
+<p>Tag each case by intent, difficulty, customer segment, language and failure mode, and report metrics per slice. An overall score of 88% can hide a 50% score on the slice your biggest customer cares about. Keep a fixed regression set (never edited, so scores are comparable over time) separate from a growing set where new cases land.</p>
+
+<h3>How big? The statistics</h3>
+<p>Every eval score is an estimate with uncertainty. For a pass/fail metric over <em>n</em> independent cases, the 95% confidence interval is roughly:</p>
+<pre><code>p ± 1.96 × √( p(1 − p) / n )
+
+n = 200, p = 0.85:  √(0.85 × 0.15 / 200) = 0.0252
+                    1.96 × 0.0252 = <span class="k">± 4.9 points</span>   → "85%" means 80–90%
+
+To get ±2 points at p ≈ 0.85:
+  n = 1.96² × 0.85 × 0.15 / 0.02² ≈ <span class="k">1,225 cases</span></code></pre>
+<p>Two practical consequences:</p>
+<ul>
+<li>With 200 cases, a jump from 85% to 87% after a prompt change is noise. Don't ship (or roll back) on it.</li>
+<li>Compare versions <strong>on the same cases</strong> and look at the paired differences (cases that flipped from pass to fail and vice versa), using a paired test such as McNemar's. Paired comparisons detect much smaller real differences than comparing two independent percentages.</li>
+</ul>
+<p>Non-determinism adds variance too: run each case several times (lowering temperature reduces but does not eliminate variance on hosted APIs) for flaky behaviors, and report the variance. Anthropic's write-up on <a href="https://www.anthropic.com/research/statistical-approach-to-model-evals">a statistical approach to model evaluations</a> covers standard errors, clustering and paired differences in more depth.</p>
+
+<h3>Contamination</h3>
+<p>If eval cases appear in training data (fine-tuning sets, few-shot examples in the prompt, or a public benchmark the model was trained on), scores overstate real quality. Keep eval data out of prompts and fine-tuning sets, hold out a private test set that only the eval runner can read, and be skeptical of public benchmark numbers for model selection.</p>
+
+<h2>LLM-as-judge done right</h2>
+<p>Strong LLM judges agree with human preferences at roughly the rate humans agree with each other: <a href="https://arxiv.org/abs/2306.05685">Zheng et al.</a> found GPT-4 judgments matched human preferences over 80% of the time on MT-Bench and Chatbot Arena data, the same level as human–human agreement. The same paper documented the judge biases you have to design around.</p>
+<h3>Designing the judge</h3>
+<ul>
+<li><strong>One criterion per judge.</strong> "Is every claim supported by the context?" is gradeable; "rate the overall quality 1–10" is not. Several narrow judges beat one broad one.</li>
+<li><strong>Binary or short scales</strong> with written definitions and examples for each level. Pass/fail with a reason is easier to calibrate and act on than a 1–10 score.</li>
+<li><strong>Give the judge what it needs</strong>: the input, the output, and the reference answer or retrieved context. A judge asked about faithfulness without the context is guessing.</li>
+<li><strong>Reason before verdict.</strong> Ask for a short critique and then the label, in structured output. This improves accuracy and gives you an explanation to debug.</li>
+<li><strong>Use a strong model</strong>, ideally from a different family than the system under test, and pin its version: a judge that changes silently changes all your scores.</li>
+</ul>
+<h3>Known biases and mitigations</h3>
+<div class="tbl"><table>
+<thead><tr><th>Bias</th><th>What happens</th><th>Mitigation</th></tr></thead>
+<tbody>
+<tr><td>Position</td><td>In pairwise comparisons the judge favors one slot (often the first)</td><td>Run both orders; count a win only if consistent, otherwise a tie</td></tr>
+<tr><td>Verbosity</td><td>Longer answers score higher even when worse</td><td>Rubrics that reward concision; length-controlled comparisons; explicit "do not prefer longer answers"</td></tr>
+<tr><td>Self-preference</td><td>Judges favor outputs from their own model family</td><td>Judge from a different family, or an ensemble</td></tr>
+<tr><td>Leniency / anchoring</td><td>Scores cluster high; small differences invisible</td><td>Binary criteria, few-shot examples of failing outputs</td></tr>
+<tr><td>Limited expertise</td><td>Judge can't verify math, code or domain facts</td><td>Give references, use tools (run the code), or route to humans</td></tr>
+</tbody></table></div>
+<h3>Calibrating against humans</h3>
+<figure class="dg" data-diagram="evaluation-judge"></figure>
+<p>Before trusting a judge, have humans label a sample (100–200 cases is typical), run the judge on the same cases, and measure agreement. Raw agreement can mislead when one label dominates, so also compute <strong>Cohen's kappa</strong>, which corrects for chance:</p>
+<pre><code>κ = (p_o − p_e) / (1 − p_e)
+
+Humans say "pass" 70% of the time, the judge 75%, and they agree on 85% of cases.
+p_e = 0.70 × 0.75 + 0.30 × 0.25 = 0.60          <span class="c">// agreement expected by chance</span>
+κ   = (0.85 − 0.60) / (1 − 0.60) = <span class="k">0.625</span>      <span class="c">// "substantial" on the common Landis–Koch scale</span></code></pre>
+<p>Also look at the confusion matrix: a judge that misses most real failures (low recall on "fail") is useless as a gate even with decent kappa. When agreement is low, read the disagreements: usually the rubric is ambiguous, and fixing it improves both the judge and the human labelers. Re-calibrate whenever you change the judge model or rubric.</p>
+
+<h2>RAG-specific metrics</h2>
+<p>Split retrieval from generation. Retrieval: recall@k, MRR and nDCG against labeled relevant chunks; context precision. Generation: faithfulness (claims supported by context), answer relevance, correctness against a reference, citation accuracy, and abstention on unanswerable questions. The full list and how to build the labeled set are on <a href="#rag-deep-dive">RAG in Depth</a>.</p>
+
+<h2>Evaluating agents</h2>
+<p>Agents take many steps, call tools with side effects, and can succeed by different paths, so evaluation needs more structure.</p>
+<ul>
+<li><strong>Outcome vs trajectory.</strong> Outcome grading checks the end state (are the tests passing, is the refund recorded with the right amount). Trajectory grading checks the path (did it call forbidden tools, ask for confirmation before the irreversible step, waste 40 steps). Grade outcomes primarily, since many paths are valid, and add trajectory checks for safety and efficiency.</li>
+<li><strong>Sandboxed, resettable environments.</strong> Each eval run needs a fresh copy of the world: a container with the repo at a fixed commit, a mock CRM seeded with known records, a fake email server. Benchmarks like <a href="https://arxiv.org/abs/2310.06770">SWE-bench</a> (real GitHub issues graded by hidden tests) and <a href="https://arxiv.org/abs/2406.12045">τ-bench</a> (simulated users plus tool APIs, graded on final database state) are templates for building your own from historical tasks.</li>
+<li><strong>Simulated users</strong> for conversational agents: an LLM plays the customer with a scripted goal and persona, so multi-turn behavior can be tested automatically.</li>
+<li><strong>Reliability, not just capability.</strong> Agents are stochastic, so run each task several times. τ-bench introduced <strong>pass^k</strong> (succeeds on all k tries) alongside the familiar <strong>pass@k</strong> (succeeds on at least one):</li>
+</ul>
+<pre><code>per-trial success p = 0.7, k = 3
+pass@3 = 1 − (1 − 0.7)³ = <span class="k">0.973</span>   <span class="c">// "it can do it"</span>
+pass^3 = 0.7³           = <span class="k">0.343</span>   <span class="c">// "it does it every time": what customers experience</span></code></pre>
+<p>For a customer-facing agent pass^k is the honest number. Also track cost and steps per successful task, since a model that succeeds more often but costs 5× more may not be better.</p>
+
+<h2>Safety and red-team evals</h2>
+<ul>
+<li><strong>Policy evals</strong>: sets of disallowed requests (and near-miss allowed requests, to catch over-refusal), graded for correct refusal or compliance.</li>
+<li><strong>Injection evals</strong>: documents, emails, tool results and web pages containing hidden instructions; success means the agent didn't follow them and didn't leak data or take unrequested actions.</li>
+<li><strong>Automated red-teaming</strong>: an attacker model generates and mutates attacks against your system; tools like promptfoo include red-team modes. Feed successful attacks into the regression set.</li>
+<li><strong>Privacy evals</strong>: attempts to extract other tenants' data, system prompts or PII.</li>
+</ul>
+<p>See <a href="#guardrails-security">Guardrails &amp; Security</a> for the defenses these evals test.</p>
+
+<h2>Online evaluation</h2>
+<p>Offline sets can't cover everything users do. In production:</p>
+<ul>
+<li><strong>A/B tests</strong> for prompt and model changes, measuring product outcomes (resolution rate, task completion, retention, conversion) alongside quality, latency and cost. LLM features often need larger samples than UI tests because outcomes are noisy.</li>
+<li><strong>Implicit feedback</strong>: regenerations, edits to suggestions, copy events, accept/reject rates for code suggestions, follow-up rephrasing ("no, I meant…"), escalations to humans, session abandonment. Usually more abundant and less biased than thumbs ratings, which only a small fraction of users give.</li>
+<li><strong>Sampled judging</strong>: run your calibrated LLM judges on a sample of live traces (for example 1–5%, plus 100% of flagged ones) for faithfulness, policy compliance and tone, and alert on drops.</li>
+<li><strong>Guardrail metrics</strong>: rates of input blocks, output blocks, refusals and PII redactions. A sudden change signals a model update, a prompt bug or an attack.</li>
+<li><strong>Drift</strong>: new topics or languages in traffic, shifts in retrieval scores, rising "I don't know" rates.</li>
+</ul>
+<p>Production failures flow back into the golden set; that loop is the <a href="#common-patterns">eval flywheel</a>, and the telemetry that feeds it is on <a href="#observability">Observability &amp; LLMOps</a>.</p>
+
+<h2>Regression gates in CI</h2>
+<p>Treat prompts, model versions, retrieval settings and tool definitions as code. Any change to them triggers the eval suite, and the merge or deploy is blocked if:</p>
+<ul>
+<li>any hard assertion regresses (schema, safety, forbidden actions): zero tolerance;</li>
+<li>a key metric drops beyond its noise band on the paired comparison (for example, faithfulness falls more than 2 points with a significant paired test);</li>
+<li>cost per task or p95 latency rises beyond budget.</li>
+</ul>
+<p>Keep a fast tier (a few hundred cases, minutes, on every PR) and a full tier (thousands of cases, agent tasks, red-team set) nightly and before releases.</p>
+
+<h2>Eval infrastructure</h2>
+<figure class="dg" data-diagram="evaluation-infra"></figure>
+<ul>
+<li><strong>Dataset store</strong>: versioned datasets with case metadata and slices; access-controlled because cases may contain customer data.</li>
+<li><strong>Runner</strong>: executes the system under test against a dataset with high parallelism, respecting provider rate limits; caches outputs by (input, config hash) so re-running only the judges is cheap; supports multiple trials per case.</li>
+<li><strong>Grader pool</strong>: code checks, judge models (pinned versions), and a human review queue with labeling guidelines.</li>
+<li><strong>Results warehouse</strong>: per-case outputs, scores, judge reasoning, cost and latency, keyed by experiment, so you can diff any two runs case by case.</li>
+<li><strong>Dashboards and gate verdicts</strong> reported back to the PR.</li>
+</ul>
+<h3>Cost of evals</h3>
+<pre><code>1,000 cases × 3 trials × (system call ~6K tokens + 3 judges × ~4K tokens)
+≈ 3,000 × 18K = <span class="k">54M tokens per full run</span></code></pre>
+<p>At a few dollars per million tokens that's on the order of a hundred dollars per full run, so nightly full runs are affordable but running the full suite on every commit may not be. Use the fast tier on PRs, batch APIs (commonly 50% cheaper) for nightly runs, prompt caching for shared judge rubrics, and small fine-tuned judges for high-volume criteria once you've calibrated them.</p>
+
+<h3>Tooling</h3>
+<p>You can build the above with a dataset table, a script and a notebook, and many teams start there. Commonly used tools (check current feature sets; this space moves fast):</p>
+<div class="tbl"><table>
+<thead><tr><th>Tool</th><th>What it is</th></tr></thead>
+<tbody>
+<tr><td><a href="https://www.braintrust.dev/">Braintrust</a></td><td>Commercial eval and observability platform: datasets, experiments with scorers, side-by-side diffs, prompt playground</td></tr>
+<tr><td><a href="https://www.langchain.com/langsmith">LangSmith</a></td><td>LangChain's tracing, dataset and evaluation platform; works with or without LangChain</td></tr>
+<tr><td><a href="https://langfuse.com/">Langfuse</a></td><td>Open-source, self-hostable tracing, prompt management and evals (part of ClickHouse since January 2026)</td></tr>
+<tr><td><a href="https://phoenix.arize.com/">Arize Phoenix</a></td><td>Open-source tracing and evaluation built on OpenTelemetry/OpenInference</td></tr>
+<tr><td><a href="https://www.promptfoo.dev/">promptfoo</a></td><td>Open-source CLI for prompt test matrices and red-teaming, config-as-code friendly for CI (OpenAI announced its acquisition in March 2026 and said the open-source project continues)</td></tr>
+<tr><td><a href="https://inspect.aisi.org.uk/">Inspect</a></td><td>Open-source evaluation framework from the UK AI Security Institute, strong for agent and safety evals with sandboxing</td></tr>
+<tr><td><a href="https://github.com/openai/evals">OpenAI Evals</a></td><td>Open-source eval framework and registry, plus hosted evals in OpenAI's platform</td></tr>
+<tr><td><a href="https://docs.ragas.io/">Ragas</a></td><td>Library of RAG and agent metrics (faithfulness, context precision/recall)</td></tr>
+</tbody></table></div>
+
+<h2>Evaluation in System Design Interviews</h2>
+<h3>When to bring it up</h3>
+<p>Always. Reserve two or three minutes in every LLM design for it, ideally right after the high-level design: "Before deep dives, here's how we'll know this works and catch regressions." It's also the natural answer to "how would you choose between model A and model B," "how do you know the RAG answers are correct," and "how do you safely change the prompt."</p>
+<h3>How to introduce it</h3>
+<ol>
+<li><strong>Define success in product terms</strong> and the critical failure modes ("never promise refunds outside policy").</li>
+<li><strong>Offline</strong>: a golden set from real traffic and expert cases, stratified; graders chosen per criterion (assertions first, calibrated judges for semantics); sized so differences are meaningful.</li>
+<li><strong>Gate</strong>: every prompt, model or retrieval change runs the suite in CI; paired comparison with thresholds.</li>
+<li><strong>Online</strong>: A/B or canary with product metrics, implicit feedback, sampled judging, guardrail rates.</li>
+<li><strong>Loop</strong>: production failures become new cases.</li>
+</ol>
+
+<h3>Common deep-dive questions</h3>
+<h4>"How do you know your LLM judge is right?"</h4>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Use GPT-class judge scores as ground truth</h5><p><span class="lbl">Challenges:</span> unvalidated judges have position, verbosity and self-preference biases and may miss exactly the failures you care about.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Spot-check judge outputs by hand</h5><p><span class="lbl">Approach:</span> read a sample of judge verdicts and adjust the prompt when they look wrong.</p><p><span class="lbl">Challenges:</span> no measurement of agreement, no way to know when the judge drifts.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Calibrate, measure kappa and recall on failures, re-check periodically</h5><p><span class="lbl">Approach:</span> narrow binary criteria with examples, human labels on 100–200 stratified cases, Cohen's kappa and per-class recall vs humans, both-order pairwise comparisons, pinned judge versions, and periodic re-calibration on fresh production samples.</p><p><span class="lbl">Challenges:</span> human labeling cost; mitigate by labeling disagreements and edge cases first.</p></div>
+<h4>"Your new prompt scores 2 points higher. Ship it?"</h4>
+<p>Check the confidence interval and use a paired comparison on the same cases: with a few hundred cases, 2 points is likely noise. Look at which cases flipped and why, check slices for hidden regressions, check cost and latency, then canary it online.</p>
+<h4>"How would you evaluate an agent that books travel?"</h4>
+<p>Sandboxed booking APIs seeded with known inventory, simulated users with goals and constraints, outcome grading on the final booking state, trajectory checks (confirmation before payment, no duplicate bookings), pass^k over multiple trials, cost and steps per success, and an injection set (malicious hotel descriptions).</p>
+
+<h2>Summary</h2>
+<ul>
+<li>Start with error analysis on real outputs; turn the dominant failure modes into specific, gradeable criteria.</li>
+<li>Use the cheapest adequate grader: assertions, then references, then calibrated LLM judges, then humans.</li>
+<li>Size datasets with the binomial math; compare versions with paired tests; report per-slice results.</li>
+<li>Calibrate judges against human labels with kappa, mitigate known biases, pin judge versions.</li>
+<li>Agents need sandboxed environments, outcome-first grading and pass^k reliability.</li>
+<li>Gate every change in CI, then confirm online with product metrics; feed failures back into the set.</li>
+</ul>
+</section>

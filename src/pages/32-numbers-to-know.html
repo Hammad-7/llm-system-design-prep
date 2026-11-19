@@ -1,0 +1,251 @@
+<section class="page" id="p-numbers-to-know" data-title="Numbers to Know" data-kw="numbers estimation back of envelope capacity planning tokens words pages latency gpu specs a100 h100 h200 b200 mi300x hbm bandwidth tflops memory weights fp16 fp8 int4 kv cache per token cost per million tokens api pricing self-hosted gpu hour vector storage network bandwidth nvlink infiniband dau qps estimate">
+<div class="banner" style="--banner:#d7b45a" data-bt="Numbers to Know" data-bs="back-of-envelope, LLM edition"></div>
+<p class="eyebrow">LLM System Design · Core Concepts</p>
+<h1>Numbers to Know</h1>
+<p class="lead">The reference figures and formulas behind capacity, latency and cost estimates for LLM systems, followed by five fully worked estimates you can adapt in an interview.</p>
+<hr class="sep">
+
+<p>Classic system design has its "latency numbers every programmer should know." LLM systems add a new set: tokens per word, KV bytes per token, GPU bandwidth, dollars per million tokens. Interviewers rarely care whether you remember an exact figure; they care whether you can turn a product requirement into tokens per second, then into GPUs or dollars, and spot which number drives the design.</p>
+<div class="callout warn"><span class="ci w"></span><p>Prices and hardware specs move fast. Figures here are rounded and were checked in <strong>November 2026</strong>. Hardware specs come from vendor datasheets; API prices are given as bands. Quote orders of magnitude in interviews, and check the official pricing pages before using a number for a real budget.</p></div>
+
+<h2>Tokens and text</h2>
+<div class="tbl"><table>
+<thead><tr><th>Quantity</th><th>Rule of thumb</th></tr></thead>
+<tbody>
+<tr><td>English text</td><td>1 token ≈ 4 characters ≈ 0.75 words; 1,000 words ≈ 1,300 tokens. Varies by tokenizer: Claude 4.7 and later produce ~30% more tokens for the same text</td></tr>
+<tr><td>A page of prose</td><td>~500 words ≈ 650–700 tokens</td></tr>
+<tr><td>A 300-page book</td><td>~100K words ≈ 130K tokens</td></tr>
+<tr><td>Source code</td><td>More tokens per character than prose (whitespace, symbols); budget ~8–12 tokens per line</td></tr>
+<tr><td>Non-English text</td><td>Often 1.5–3× the tokens of the English equivalent, depending on language and tokenizer</td></tr>
+<tr><td>Speech</td><td>~150 spoken words/min ≈ 200 tokens/min ≈ 12K tokens per hour of audio transcript</td></tr>
+<tr><td>Images (Claude)</td><td>≈ (width ÷ 28) × (height ÷ 28) tokens, one per 28×28-pixel patch; a 1000×1000 image ≈ 1,296 tokens, and large images are downscaled to a per-model cap (<a href="https://platform.claude.com/docs/en/build-with-claude/vision">vision docs</a>). Other providers use tile-based formulas of a similar magnitude.</td></tr>
+<tr><td>Chat turn in a product</td><td>Input 2K–10K tokens (system prompt, history, retrieved context, tools); output 100–800</td></tr>
+<tr><td>Agent step</td><td>Input grows each step (10K → 100K+), output 100–1,000 per step</td></tr>
+</tbody></table></div>
+
+<h2>Time</h2>
+<h3>Converting rates</h3>
+<pre><code>1 day   = 86,400 s ≈ 10^5 s           1 month ≈ 2.6M s ≈ 30 days
+1M requests/day  ≈ 12 req/s average   100M requests/day ≈ 1,160 req/s
+peak ≈ 2–3 × average for consumer traffic (higher for spiky B2B or launch days)</code></pre>
+<h3>Latency of each pipeline stage</h3>
+<figure class="dg" data-diagram="numbers-to-know-ladder"></figure>
+<div class="tbl"><table>
+<thead><tr><th>Operation</th><th>Rough latency</th></tr></thead>
+<tbody>
+<tr><td>Network round trip, same region / cross-continent</td><td>~1 ms / 70–150 ms</td></tr>
+<tr><td>Redis GET; indexed Postgres query</td><td>&lt; 1 ms; 1–10 ms</td></tr>
+<tr><td>Embedding a query (self-hosted small model / hosted API)</td><td>~5–20 ms / ~50–200 ms</td></tr>
+<tr><td>ANN vector search, millions of vectors in RAM</td><td>~5–50 ms</td></tr>
+<tr><td>Cross-encoder reranking of 50–100 candidates</td><td>~50–200 ms</td></tr>
+<tr><td>Small-model classification call (router, guard)</td><td>~50–300 ms</td></tr>
+<tr><td>Time to first token, hosted API</td><td>~0.2–2 s (longer for long prompts and under load)</td></tr>
+<tr><td>Decode speed per stream</td><td>~30–150 tok/s typical; small or speculative setups faster</td></tr>
+<tr><td>Reasoning ("thinking") phase</td><td>Seconds to minutes, depending on effort budget</td></tr>
+<tr><td>Web search API call</td><td>~0.3–2 s</td></tr>
+<tr><td>Streaming speech-to-text final transcript after end of speech</td><td>~100–300 ms</td></tr>
+<tr><td>Text-to-speech time to first audio</td><td>~100–300 ms</td></tr>
+<tr><td>MicroVM / sandbox start from snapshot</td><td>~100 ms to a few seconds</td></tr>
+<tr><td>Human reading speed</td><td>~4–5 words/s (≈ 5–7 tok/s), so 20+ tok/s streaming feels instant</td></tr>
+<tr><td>Natural gap between speakers in conversation</td><td>~200 ms (<a href="https://www.pnas.org/doi/10.1073/pnas.0903616106">Stivers et al., PNAS 2009</a>)</td></tr>
+</tbody></table></div>
+
+<h2>Hardware</h2>
+<h3>Accelerators</h3>
+<div class="tbl"><table>
+<thead><tr><th>GPU</th><th class="num">HBM</th><th class="num">Bandwidth</th><th class="num">BF16 dense</th><th class="num">FP8 dense</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>NVIDIA A100 SXM</td><td class="num">80 GB</td><td class="num">2.0 TB/s</td><td class="num">312 TFLOP/s</td><td class="num">n/a</td><td>No FP8; still common for fine-tuning and older fleets</td></tr>
+<tr><td>NVIDIA H100 SXM</td><td class="num">80 GB</td><td class="num">3.35 TB/s</td><td class="num">989 TFLOP/s</td><td class="num">1,979 TFLOP/s</td><td>The reference GPU for most estimates</td></tr>
+<tr><td>NVIDIA H200 SXM</td><td class="num">141 GB</td><td class="num">4.8 TB/s</td><td class="num">989 TFLOP/s</td><td class="num">1,979 TFLOP/s</td><td>Same compute as H100, more and faster memory: better decode</td></tr>
+<tr><td>NVIDIA B200</td><td class="num">180–192 GB</td><td class="num">8 TB/s</td><td class="num">~2,250 TFLOP/s</td><td class="num">~4,500 TFLOP/s</td><td>FP4 ~9,000 TFLOP/s; capacity varies by system</td></tr>
+<tr><td>AMD MI300X</td><td class="num">192 GB</td><td class="num">5.3 TB/s</td><td class="num">1,307 TFLOP/s</td><td class="num">2,615 TFLOP/s</td><td>Large memory per GPU; served via vLLM/SGLang on ROCm</td></tr>
+</tbody></table></div>
+<p class="src">Dense (non-sparse) figures from vendor datasheets: <a href="https://www.nvidia.com/en-us/data-center/h100/">H100</a>, <a href="https://www.nvidia.com/en-us/data-center/h200/">H200</a>, <a href="https://www.nvidia.com/en-us/data-center/dgx-b200/">DGX B200</a>, <a href="https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/data-sheets/amd-instinct-mi300x-data-sheet.pdf">MI300X</a>. Marketing pages often quote sparse numbers, which are 2× these. Newer parts (Blackwell Ultra and beyond) raise memory further; the method below is what matters.</p>
+<p>Two derived numbers matter most: <strong>bandwidth</strong> sets decode speed and <strong>HBM</strong> sets how many tokens of KV cache you can hold. See <a href="#inference-serving">Inference &amp; Serving</a> for why.</p>
+
+<h3>Interconnect and network</h3>
+<div class="tbl"><table>
+<thead><tr><th>Link</th><th>Bandwidth</th><th>Example: move 140 GB of weights</th></tr></thead>
+<tbody>
+<tr><td>NVLink 4 (H100), per GPU</td><td>900 GB/s total</td><td>&lt; 1 s</td></tr>
+<tr><td>NVLink 5 (B200), per GPU</td><td>1.8 TB/s total</td><td>&lt; 0.1 s per GPU's share</td></tr>
+<tr><td>PCIe Gen5 x16</td><td>~64 GB/s per direction</td><td>~2–3 s</td></tr>
+<tr><td>InfiniBand NDR / 400 GbE</td><td>400 Gb/s ≈ 50 GB/s per port</td><td>~3 s</td></tr>
+<tr><td>100 GbE</td><td>12.5 GB/s</td><td>~11 s</td></tr>
+<tr><td>10 GbE</td><td>1.25 GB/s</td><td>~2 min</td></tr>
+<tr><td>Local NVMe SSD</td><td>~5–7 GB/s read</td><td>~20–30 s</td></tr>
+<tr><td>Object storage, single stream / parallel</td><td>~0.1–0.5 GB/s / several GB/s</td><td>minutes / under a minute</td></tr>
+</tbody></table></div>
+
+<h2>Memory</h2>
+<h3>Model weights</h3>
+<pre><code>weight bytes = parameters × bytes per parameter
+  FP32 = 4    BF16/FP16 = 2    FP8/INT8 = 1    INT4/FP4 ≈ 0.5 (+ small scale overhead)</code></pre>
+<div class="tbl"><table>
+<thead><tr><th>Model size</th><th class="num">BF16</th><th class="num">FP8</th><th class="num">INT4</th><th>Minimum practical GPUs (BF16 / FP8)</th></tr></thead>
+<tbody>
+<tr><td>8B</td><td class="num">16 GB</td><td class="num">8 GB</td><td class="num">4 GB</td><td>1 / 1 (runs on a laptop at INT4)</td></tr>
+<tr><td>70B</td><td class="num">140 GB</td><td class="num">70 GB</td><td class="num">35 GB</td><td>2–4 H100 / 1–2 H100 (more for KV room)</td></tr>
+<tr><td>405B</td><td class="num">810 GB</td><td class="num">405 GB</td><td class="num">~200 GB</td><td>16 H100 (2 nodes) / 8 H100 or 8 H200</td></tr>
+<tr><td>671B MoE (37B active)</td><td class="num">~1.3 TB</td><td class="num">~670 GB</td><td class="num">~340 GB</td><td>Multi-node / one 8×H200 or 8×B200 node</td></tr>
+</tbody></table></div>
+<h3>KV cache per token (FP16)</h3>
+<div class="tbl"><table>
+<thead><tr><th>Model</th><th>Shape</th><th class="num">KV / token</th><th class="num">128K-token context</th></tr></thead>
+<tbody>
+<tr><td>Llama 3 8B</td><td>32 layers, 8 KV heads, dim 128</td><td class="num">128 KB</td><td class="num">16 GB</td></tr>
+<tr><td>Llama 3 70B / Qwen-2.5 72B</td><td>80 layers, 8 KV heads, dim 128</td><td class="num">320 KB</td><td class="num">40 GB</td></tr>
+<tr><td>Llama 3.1 405B</td><td>126 layers, 8 KV heads, dim 128</td><td class="num">516 KB</td><td class="num">66 GB</td></tr>
+<tr><td>DeepSeek-V3 (MLA)</td><td>61 layers, 576-dim latent</td><td class="num">~70 KB</td><td class="num">9 GB</td></tr>
+</tbody></table></div>
+<p>Sizes use binary units (320 KB = 327,680 bytes, which papers often round to 327 KB). Halve these with an FP8 KV cache. Reserve another <strong>~10–20%</strong> of HBM for activations, CUDA graphs, framework overhead and fragmentation.</p>
+<pre><code>KV capacity (tokens) ≈ (total HBM × 0.9 − weight bytes) ÷ KV bytes per token
+8 × H100, Llama 3 70B FP16:  (640 × 0.9 − 140) GB ÷ 320 KB ≈ <span class="k">1.3M tokens</span>
+concurrent sequences ≈ KV capacity ÷ average live context length</code></pre>
+
+<h3>Training memory (for fine-tuning questions)</h3>
+<pre><code>full fine-tune with Adam, mixed precision ≈ 16 bytes/param + activations
+  (2 weights + 2 grads + 4 FP32 master + 8 Adam moments)
+  7B → ~112 GB   70B → ~1.1 TB  (shard with FSDP/ZeRO)
+LoRA: frozen base (2 bytes/param, or ~0.5 with QLoRA) + tiny adapter states</code></pre>
+<p>Details in <a href="#fine-tuning">Fine-tuning &amp; Adaptation</a>.</p>
+
+<h3>Vector storage</h3>
+<pre><code>raw vector bytes = count × dimensions × bytes per dimension</code></pre>
+<div class="tbl"><table>
+<thead><tr><th>Vectors (1,024 dims)</th><th class="num">float32</th><th class="num">int8 / scalar quantized</th><th class="num">binary</th></tr></thead>
+<tbody>
+<tr><td>1M</td><td class="num">4.1 GB</td><td class="num">1 GB</td><td class="num">128 MB</td></tr>
+<tr><td>100M</td><td class="num">410 GB</td><td class="num">102 GB</td><td class="num">13 GB</td></tr>
+<tr><td>1B</td><td class="num">4.1 TB</td><td class="num">1 TB</td><td class="num">128 GB</td></tr>
+</tbody></table></div>
+<p>Add index overhead (an HNSW graph with M=16 stores roughly 32 neighbor IDs per vector on the base layer, ~130 bytes or more), metadata, and the chunk text itself. More in <a href="#vector-search">Embeddings &amp; Vector Search</a>.</p>
+
+<h2>Throughput and cost</h2>
+<h3>Formulas</h3>
+<pre><code>API cost per request = in_tokens × in_price + out_tokens × out_price
+                     − cached_in_tokens × in_price × (1 − cache_read_multiplier)
+
+decode throughput (per replica) ≈ batch × 1 ÷ step_time
+step_time ≈ (weight bytes + KV bytes read) ÷ HBM bandwidth     <span class="c">// lower bound</span>
+prefill time ≈ 2 × params × prompt_tokens ÷ (FLOP/s × MFU)      <span class="c">// MFU ~40–60%</span>
+
+self-hosted $ per 1M output tokens = (GPUs × $/GPU-hour) ÷ (tokens/s × 3,600) × 10^6 ÷ utilization</code></pre>
+<p>Example: one 8×H100 node at $3 per GPU-hour costs $24/hour. If it sustains 5,000 output tok/s at your latency SLO, that's 18M tokens/hour, or <strong>$1.33 per 1M output tokens at 100% utilization</strong>, and $3.33 at a more realistic 40% average utilization. GPU rental prices vary widely by provider, commitment and generation, so treat $/GPU-hour as an input to state, not a constant.</p>
+
+<h3>API price bands (November 2026)</h3>
+<div class="tbl"><table>
+<thead><tr><th>Tier</th><th class="num">Input $/1M tokens</th><th class="num">Output $/1M tokens</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td>Small / fast</td><td class="num">~0.05–1</td><td class="num">~0.40–5</td><td>Routing, classification, extraction, summaries, guards</td></tr>
+<tr><td>Mid-tier</td><td class="num">~0.25–3</td><td class="num">~2–15</td><td>Most product features, RAG answers, agents</td></tr>
+<tr><td>Frontier</td><td class="num">~2–15</td><td class="num">~10–75</td><td>Hardest reasoning, coding, high-stakes answers</td></tr>
+<tr><td>Embeddings</td><td class="num">~0.02–0.20</td><td class="num">n/a</td><td>Indexing and query embedding</td></tr>
+</tbody></table></div>
+<ul>
+<li><strong>Output costs ~4–8× input</strong> per token on most models.</li>
+<li><strong>Prompt cache reads</strong> cost ~0.1× base input on most Anthropic models (0.05× or less on the newest; writes 1.25× for the 5-minute cache), with similar large discounts elsewhere.</li>
+<li><strong>Batch APIs</strong> are typically 50% off for work that can wait up to 24 hours.</li>
+<li>Very long prompts may be billed at a higher rate past a context threshold on some models.</li>
+<li>Premium "pro" tiers and fast modes are priced well above these bands.</li>
+</ul>
+<p class="src">Check current figures: <a href="https://platform.claude.com/docs/en/about-claude/pricing">Claude pricing</a>, <a href="https://openai.com/api/pricing/">OpenAI pricing</a>, <a href="https://aistudio.google.com/docs/pricing">Gemini pricing</a>. Bands are rounded from these pages and third-party trackers in November 2026.</p>
+
+<h2>The estimation method</h2>
+<figure class="dg" data-diagram="numbers-to-know-method"></figure>
+<ol>
+<li><strong>Start from users and actions,</strong> not requests: DAU × actions per user per day.</li>
+<li><strong>Convert to requests/s</strong> (÷ 86,400) and apply a peak factor.</li>
+<li><strong>Convert to tokens/s,</strong> separately for input and output, and note how much input is cacheable.</li>
+<li><strong>Split by phase</strong>: input tokens drive prefill compute (or API input cost); output tokens drive decode time, KV residency and output cost.</li>
+<li><strong>Turn into GPUs or dollars</strong>, add headroom (N+1 replicas, 30–50% for spikes), then sanity-check against something you know.</li>
+</ol>
+<div class="callout"><span class="ci"></span><p>Say your assumptions out loud and round aggressively (2,000 not 1,873). The interviewer is grading whether the number changes a decision: "that's $3M a month on the frontier API, so routing 70% of turns to a small model is worth the complexity."</p></div>
+
+<h2>Worked estimates</h2>
+<h3>1) GPUs for a 1M-DAU chat product on a self-hosted 70B model</h3>
+<pre><code>Traffic:   1M DAU × 10 messages/day = 10M requests/day ≈ 116 req/s, peak ×3 ≈ <span class="k">350 req/s</span>
+Tokens:    input 2,000 (history; ~50% prefix-cached), output 400
+Decode:    350 × 400 = 140K output tok/s at peak
+           realistic node (8×H100, FP16, TPOT ≤ 30 ms) ≈ 5,000 output tok/s
+           → 140K ÷ 5K ≈ 28 nodes
+Prefill:   350 × 2,000 × 50% uncached = 350K tok/s
+           2 × 70e9 × 350e3 ≈ 4.9e16 FLOP/s ÷ (8 × 989e12 × 0.5 ≈ 4e15 per node) ≈ 12 nodes of compute
+           decode leaves most compute idle, so chunked prefill absorbs much of this on the same nodes
+KV check:  concurrent streams ≈ 350 req/s × (400 ÷ 30 tok/s ≈ 13 s) ≈ 4,700
+           per node ≈ 4,700 ÷ 30 ≈ 160 streams × ~2.4K tokens ≈ 380K tokens ≪ 1.3M capacity ✓
+Answer:    ~30–40 nodes at peak + headroom ≈ <span class="k">40–45 nodes (320–360 H100s)</span>
+Cost:      40 × 8 × $3 ≈ $960/hour at peak; autoscaled average ~half ≈ $350K/month</code></pre>
+<p>Sanity check against an API: 10M requests/day at a mid-tier price ($2 in, $10 out per million) is roughly $40K/day of uncached input (less with caching) plus $40K/day of output, around $2.4M/month. That gap is why high-volume products move some traffic to self-hosted or smaller models, though the comparison only holds if the open model meets the quality bar.</p>
+
+<h3>2) Monthly cost of a RAG support assistant on an API</h3>
+<pre><code>Traffic:   50K conversations/day × 4 turns = 200K turns/day ≈ 6M turns/month
+Per turn:  system prompt + tool definitions 3K (cached) + retrieved chunks 3K
+           + history 1K + question 100 ≈ 7.1K input; 300 output
+Price:     mid-tier $2/M in, $10/M out (Sonnet 5.5), cache reads 0.05×
+Input:     3K × 0.05 + 4.1K = 4.25K effective × $2/M ≈ $0.0085
+Output:    300 × $10/M ≈ $0.003
+Extras:    query rewrite on a small model, embeddings, rerank ≈ $0.001
+Per turn ≈ <span class="k">$0.0125</span> → per conversation ≈ $0.05 → ≈ <span class="k">$75K/month</span></code></pre>
+<p>Levers, in order of impact: cut retrieved context (better reranking, fewer chunks), route simple FAQ turns to a small model, shorten answers, raise the cached share of the prompt. See <a href="#design-support-assistant">the support assistant breakdown</a>.</p>
+
+<h3>3) Embedding and storing a 50M-document corpus</h3>
+<pre><code>Corpus:    50M docs × 2,000 tokens = 100B tokens
+Chunks:    500-token chunks, 10% overlap → ≈ 220M chunks
+API cost:  100B × $0.02/M ≈ $2,000 (≈ $1,000 via batch)
+Rate:      at 10M tokens/min of quota → 10,000 min ≈ <span class="k">7 days</span>   <span class="c">// quota, not dollars, is the constraint</span>
+Self-host: 2 × 335M params × 100e9 tokens ≈ 6.7e19 FLOPs
+           ÷ (989e12 × 30% MFU ≈ 3e14) ≈ 2.2e5 s ≈ 62 H100-hours → a few hours on 16 GPUs
+Storage:   220M × 1,024 × 4 B ≈ <span class="k">900 GB</span> float32; ≈ 225 GB int8; ≈ 28 GB binary
+           + HNSW graph (~30–60 GB) + chunk text (~400 GB) + metadata</code></pre>
+<p>Decisions this drives: shard the index (or use a disk-based index with quantized vectors in RAM), keep full-precision vectors on disk for rescoring, and plan re-embedding (a model upgrade means paying all of this again). See <a href="#vector-search">Embeddings &amp; Vector Search</a>.</p>
+
+<h3>4) Cost of one coding-agent run</h3>
+<pre><code>Run:       40 steps; context grows 10K → 80K (average 45K input per step); 500 output per step
+Input:     40 × 45K = 1.8M tokens
+  no caching:     1.8M × $2/M ≈ $3.60
+  with caching:   ~90% of each step's input is a cache hit
+                  1.8M × (0.9 × 0.05 + 0.1 × 1.25) ≈ 0.31M effective ≈ $0.61
+Output:    40 × 500 = 20K × $10/M ≈ $0.20
+Total ≈ <span class="k">$0.81 per run with caching</span> vs ≈ $3.80 without; sandbox minutes are cents</code></pre>
+<p>Input dominates and grows roughly quadratically with step count because every step resends the history. That is why agents rely on prompt caching, tool-output truncation, compaction and sub-agents (<a href="#context-engineering">Context Engineering</a>, <a href="#design-claude-code">Design Claude Code</a>).</p>
+
+<h3>5) Voice agent latency budget</h3>
+<pre><code>Target: reply audio starts &lt; ~1 s after the user stops talking (humans: ~200 ms gaps)
+
+End-of-turn detection (VAD + endpointing)   200–500 ms   <span class="c">// the biggest, most tunable chunk</span>
+Final STT transcript                        100–300 ms   (overlaps with endpointing when streaming)
+LLM time to first token                     300–700 ms   (small/fast model, short prompt, cached prefix)
+First sentence of text (~15 tokens)          ~100–300 ms
+TTS time to first audio                     100–250 ms
+Network (client ↔ server, both ways)         50–150 ms
+Total ≈ <span class="k">0.9–2.2 s</span> naive; ≈ 0.7–1.0 s with streaming at every stage and tight endpointing</code></pre>
+<p>Every stage must stream into the next. Speech-to-speech models collapse STT, LLM and TTS into one model and remove some of these hops. See <a href="#design-voice-agent">Real-time Voice Agent</a>.</p>
+
+<h2>Numbers in System Design Interviews</h2>
+<h3>When to estimate</h3>
+<ul>
+<li>Right after non-functional requirements, when scale shapes the architecture: "Let me size this quickly, because whether we need a GPU fleet or an API budget changes the design."</li>
+<li>When choosing between options: model tiers, self-host vs API, RAG vs long context.</li>
+<li>When the interviewer pushes on cost or latency in a deep dive.</li>
+</ul>
+<h3>How to keep it fast</h3>
+<ol>
+<li>Memorize a few anchors: 4 chars/token, 10^5 s/day, H100 = 80 GB and 3.35 TB/s, 70B FP16 = 140 GB, 320 KB KV/token for 70B, output ≈ 5× input price, cache reads ≈ 0.05–0.1×.</li>
+<li>Write the chain on the board (users → req/s → tokens/s → GPUs or $) so the interviewer can follow and correct assumptions.</li>
+<li>Compute only what decides something. If the answer is "fits on one node" or "costs $500/month," move on.</li>
+<li>Finish with the implication: "so prompt caching is mandatory," "so we need to shard the index," "so the small model handles the first pass."</li>
+</ol>
+<h3>Common mistakes</h3>
+<ul>
+<li>Counting requests instead of tokens (one agent request can be 100× a chat turn).</li>
+<li>Forgetting that conversation history makes input grow every turn.</li>
+<li>Sizing GPUs by compute when KV memory or bandwidth is the binding constraint.</li>
+<li>Using sparse TFLOP/s figures from marketing material.</li>
+<li>Ignoring rate limits and quotas, which often bind before budget does.</li>
+</ul>
+
+<h2>Summary</h2>
+<p>Convert everything to tokens, split input from output, and know the handful of hardware anchors that turn tokens into seconds and dollars. Then let the numbers drive decisions: caching, routing, sharding, self-hosting. For the mechanisms behind these figures read <a href="#inference-serving">Inference &amp; Serving</a>; for where they show up in practice, see the <a href="#question-breakdowns">worked examples</a>.</p>
+</section>

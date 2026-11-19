@@ -5,10 +5,10 @@
 <p class="lead">Learn to design LLM-powered applications for interviews, fast. The essentials of retrieval, agents, inference, evaluation and safety, organized the way interviewers actually grade.</p>
 <hr class="sep">
 
-<p>A few years ago the canonical system design prompt was "Design YouTube." Today a growing share of loops open with "Design ChatGPT," "Design a support bot over our knowledge base," or "Design an inference batching service." Prep companies now report that LLM infrastructure prompts have spread beyond ML roles into general software engineering loops (<a href="https://www.tryexponent.com/blog/system-design-interview-guide">Exponent, 2026</a>), and practitioner guides describe "design an LLM-based system for X" as the most common ML system design question of 2026 (<a href="https://www.techinterview.org/post/3233474925/ml-engineer-interview-post-llm-era/">techinterview.org</a>).</p>
+<p>A few years ago the canonical system design prompt was "Design YouTube." Today a growing share of loops open with "Design ChatGPT," "Design a support bot over our knowledge base," or "Design an inference batching service." Prep companies now report that LLM infrastructure prompts have spread beyond ML roles into general software engineering loops (<a href="https://www.aced.io/blog/system-design-interview-guide">Aced (formerly Exponent), 2026</a>), and practitioner guides describe "design an LLM-based system for X" as the most common ML system design question of 2026 (<a href="https://www.techinterview.org/post/3233474925/ml-engineer-interview-post-llm-era/">techinterview.org</a>).</p>
 <p>This guide works backwards from those interviews. It keeps the bones of a classic system design interview (requirements, APIs, data, scale) and adds the parts that are new when one of your components is a probabilistic, expensive, GPU-bound text generator. It's useful for two reasons:</p>
 <ol>
-<li>If your interview is soon, you get the highest-leverage material first: a delivery framework, the concepts that come up every time, and four fully worked examples.</li>
+<li>If your interview is soon, you get the highest-leverage material first: a delivery framework, the concepts that come up every time, and eleven fully worked examples.</li>
 <li>If you build LLM features at work, everything here maps to real production decisions. Nothing is interview theater.</li>
 </ol>
 
@@ -20,7 +20,7 @@
 
 <h2>What are LLM system design interviews?</h2>
 <p>An LLM system design interview asks you to design a production system where a large language model does part of the work. Like any design round it's open-ended: you get a vague prompt and are expected to drive toward a working architecture in about 45 minutes while explaining your trade-offs.</p>
-<p>What changes is the shape of the hard problems. Your new component is <strong>non-deterministic</strong> (the same input can produce different outputs), <strong>slow and expensive per call</strong> (seconds and fractions of a cent, metered in tokens), <strong>bounded by a context window</strong>, <strong>wrong in fluent ways</strong> (hallucination), and <strong>steerable by its inputs</strong>, including attacker-controlled inputs. Most of the interview is about building deterministic scaffolding around that component so the overall system is fast, affordable, measurable and safe.</p>
+<p>What changes is the shape of the hard problems. Your new component is <strong>non-deterministic</strong> (the same input can produce different outputs), <strong>slow and expensive per call</strong> (seconds and anywhere from fractions of a cent to several cents, metered in tokens), <strong>bounded by a context window</strong>, <strong>wrong in fluent ways</strong> (hallucination), and <strong>steerable by its inputs</strong>, including attacker-controlled inputs. Most of the interview is about building deterministic scaffolding around that component so the overall system is fast, affordable, measurable and safe.</p>
 
 <div class="tbl"><table>
 <thead><tr><th>Classic concern</th><th>What it becomes with an LLM in the loop</th></tr></thead>
@@ -90,10 +90,17 @@
 <li><a href="#how-to-prepare">How to Prepare</a> gives you a plan for one, four or eight weeks.</li>
 <li><a href="#delivery-framework">Delivery Framework</a> is the step-by-step structure you'll use in the room, adapted for LLM systems.</li>
 <li><a href="#core-concepts">Core Concepts</a>, <a href="#key-technologies">Key Technologies</a> and <a href="#common-patterns">Common Patterns</a> are the building blocks every answer reuses.</li>
-<li><a href="#question-breakdowns">Question Breakdowns</a> walks through four complete interviews with Bad / Good / Great options for each deep dive.</li>
-<li>The <a href="#question-bank">Question Bank</a> has 50+ prompts to practice cold, filterable by type and difficulty.</li>
+<li>The <strong>Core Concepts</strong> group in the sidebar goes deep where the Fast Track stays brief: one page each on <a href="#inference-serving">inference and serving</a>, <a href="#context-engineering">context and memory</a>, <a href="#vector-search">vector search</a>, <a href="#rag-deep-dive">RAG</a>, <a href="#llm-caching">caching</a>, <a href="#agents-tool-use">agents and MCP</a>, <a href="#evaluation">evaluation</a>, <a href="#guardrails-security">security</a>, <a href="#api-streaming">streaming APIs</a>, <a href="#gateway-reliability">gateways and reliability</a>, <a href="#observability">observability</a>, <a href="#fine-tuning">fine-tuning</a> and the <a href="#numbers-to-know">numbers to know</a>. Use them when an interview leans on a topic, or when a breakdown mentions something you can't yet explain.</li>
+<li><a href="#question-breakdowns">Question Breakdowns</a> walks through eleven complete interviews, from ChatGPT to <a href="#design-claude-code">Claude Code</a>, with Bad / Good / Great options for each deep dive.</li>
+<li>The <a href="#question-bank">Question Bank</a> has 55+ prompts to practice cold, filterable by type and difficulty.</li>
 </ul>
 <p>Short on time? Read the Delivery Framework, the Core Concepts sections on inference, RAG and evaluation, and the ChatGPT and Support Assistant breakdowns. That covers the majority of what gets asked.</p>
+<div class="callout info"><span class="ci"></span><span class="ct">Which deep dives for which role?</span><ul>
+<li><strong>AI / full-stack AI developer:</strong> <a href="#rag-deep-dive">RAG in Depth</a>, <a href="#api-streaming">API Design &amp; Streaming</a>, <a href="#context-engineering">Context Engineering</a>, <a href="#evaluation">Evaluation</a>; breakdowns: ChatGPT, Support Assistant, Answer Engine.</li>
+<li><strong>Founding engineer:</strong> <a href="#numbers-to-know">Numbers to Know</a> (cost math), <a href="#gateway-reliability">Gateways &amp; Reliability</a>, <a href="#agents-tool-use">Agents</a>, <a href="#observability">Observability</a>; breakdowns: Claude Code, Document Extraction, LLM Gateway.</li>
+<li><strong>AI solutions engineer:</strong> <a href="#rag-deep-dive">RAG</a>, <a href="#guardrails-security">Guardrails &amp; Security</a>, <a href="#fine-tuning">Fine-tuning</a> (when not to), <a href="#evaluation">Evaluation</a>; breakdowns: Support Assistant, Voice Agent, Document Extraction.</li>
+<li><strong>Frontier-lab or infra roles:</strong> <a href="#inference-serving">Inference &amp; Serving</a>, <a href="#llm-caching">Caching</a>, <a href="#numbers-to-know">Numbers to Know</a>; breakdowns: Inference Batching, LLM Gateway, Deep Research.</li>
+</ul></div>
 
 <h2>Conclusion</h2>
 <p>LLM system design is classic system design with a new, strange component in the middle. If you can reason about tokens the way you reason about bytes, treat quality as something you measure, and treat every model input as untrusted, you'll stand out. Mark this page as read and move on to preparation.</p>

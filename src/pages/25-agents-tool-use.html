@@ -1,0 +1,381 @@
+<section class="page" id="p-agents-tool-use" data-title="Agents, Tools &amp; MCP" data-kw="agents agent loop tool use function calling tool_choice parallel tool calls structured outputs react plan and execute orchestrator workers subagents multi-agent handoffs evaluator optimizer tool design mcp model context protocol streamable http stdio oauth a2a skills durable execution temporal human in the loop approvals budgets loop detection computer use agent sdk langgraph adk crewai">
+<div class="banner" style="--banner:#9aa7e0" data-bt="Agents &amp; Tools" data-bs="loops, tools, mcp, durability"></div>
+<p class="eyebrow">LLM System Design · Core Concepts</p>
+<h1>Agents, Tools &amp; MCP</h1>
+<p class="lead">How tool calling works on the wire, how to structure an agent loop that terminates, which multi-agent architectures are worth their cost, how to design tools a model can use well, and how MCP, skills and durable execution fit into a production agent platform.</p>
+<hr class="sep">
+
+<p>Agent questions are now the most common "new" prompt in LLM system design rounds: design a coding agent, a research agent, a support agent that can issue refunds, an internal ops assistant. Interviewers are rarely testing whether you know a framework. They are testing whether you understand that an agent is <strong>a loop around a stateless model</strong>, and that every interesting property of the system (correctness, cost, latency, safety, reliability) is decided by the code around that loop: what goes into the context, which tools exist, who authorizes them, when the loop stops, and what happens when something crashes halfway.</p>
+<p>This page goes one level below the <a href="#core-concepts">Fast Track summary</a>. You'll learn the exact message contract behind function calling, the main agent architectures and when each wins, tool design principles that measurably improve agent accuracy, the Model Context Protocol in enough depth to discuss transports and auth, and how to make long-running agents durable, bounded and affordable. Security for agents gets its own page: <a href="#guardrails-security">Guardrails &amp; Security</a>.</p>
+
+<h2>How tool calling actually works</h2>
+<p>A model never executes anything. "Tool use" (also called function calling) is a structured conversation protocol: you describe tools with JSON Schema, the model replies with a request to call one, your code executes it and sends back the result as a message, and the model continues. Everything else in this page is built on that contract.</p>
+<figure class="dg" data-diagram="agents-tool-use-call"></figure>
+
+<h3>The message contract</h3>
+<p>Provider APIs differ in field names but share the same shape. A request carries the conversation plus tool definitions:</p>
+<pre><code><span class="c">// request (shape shared by Anthropic, OpenAI, Gemini; field names vary)</span>
+{
+  "model": "...",
+  "system": "You are a support agent for ACME...",
+  "tools": [{
+    "name": "get_order",
+    "description": "Look up one order by its ID. Returns status, items, total and refund eligibility. Use when the customer mentions an order number.",
+    "input_schema": {
+      "type": "object",
+      "properties": { "order_id": { "type": "string", "pattern": "^ORD-[0-9]{8}$" } },
+      "required": ["order_id"]
+    }
+  }],
+  "messages": [{ "role": "user", "content": "Where is order ORD-00412345?" }]
+}
+
+<span class="c">// response: the model asks for a tool call and stops</span>
+{ "stop_reason": "tool_use",
+  "content": [
+    { "type": "text", "text": "Let me look that up." },
+    { "type": "tool_use", "id": "toolu_01A", "name": "get_order", "input": { "order_id": "ORD-00412345" } } ] }
+
+<span class="c">// next request: append the assistant turn, then the result as a user-side message</span>
+{ "role": "user", "content": [
+    { "type": "tool_result", "tool_use_id": "toolu_01A", "content": "{\"status\":\"shipped\",\"eta\":\"2026-11-21\"}" } ] }</code></pre>
+<p>Three details interviewers like to probe:</p>
+<ul>
+<li><strong>The tool definitions are prompt tokens.</strong> Names, descriptions and schemas are serialized into the context on every call. Fifty verbose tools can cost tens of thousands of tokens before the user says anything, which matters for cost, latency and prompt caching (see <a href="#llm-caching">Caching for LLMs</a>).</li>
+<li><strong>The model can be wrong about arguments.</strong> It may invent an order ID, pass a string where you wanted an integer, or call a tool that doesn't fit. Your runtime validates against the schema and returns a helpful error as the tool result rather than crashing.</li>
+<li><strong>The ID links call and result.</strong> With parallel calls the model emits several <code>tool_use</code> blocks in one turn and you must return one <code>tool_result</code> per ID, in a single follow-up message (OpenAI Chat Completions instead takes one <code>role: "tool"</code> message per call ID).</li>
+</ul>
+
+<h3>tool_choice and parallel calls</h3>
+<div class="tbl"><table>
+<thead><tr><th>Setting</th><th>Behavior</th><th>Use it for</th></tr></thead>
+<tbody>
+<tr><td><code>auto</code> (default)</td><td>Model decides whether to call a tool or answer</td><td>Agents and assistants</td></tr>
+<tr><td><code>any</code> / <code>required</code></td><td>Model must call some tool</td><td>Router steps where text output is never valid</td></tr>
+<tr><td>Specific tool</td><td>Model must call this tool</td><td>Forcing structured extraction through one schema</td></tr>
+<tr><td><code>none</code></td><td>Tools visible but not callable</td><td>A final "summarize what you did" turn without removing tool definitions from the cached prefix</td></tr>
+<tr><td>Disable parallel calls</td><td>At most one tool per turn</td><td>Tools with ordering dependencies or shared side effects</td></tr>
+</tbody></table></div>
+<p>Parallel tool calls are a large latency win for read-heavy agents: five independent lookups in one turn cost one model round trip instead of five. Execute them concurrently in your runtime, with a per-call timeout, and return partial failures as error results rather than failing the whole turn.</p>
+
+<h3>Structured outputs vs tools</h3>
+<p>If code consumes the answer, you don't need an agent; you need <strong>structured output</strong>. Most providers now support schema-constrained decoding ("strict" mode), where the server masks tokens that would violate the JSON Schema, so the output always parses. Two caveats: strict modes support a subset of JSON Schema (recursive or very large schemas may be rejected or slow to compile on first use), and a parseable object can still be wrong. Validate business rules (amount ≤ order total, date in the future) in code. Tool inputs can usually be made strict the same way, which removes a whole class of "malformed arguments" retries.</p>
+
+<h3>What the runtime owns</h3>
+<p>The model proposes; the runtime disposes. For every tool call your executor should:</p>
+<ol>
+<li><strong>Validate</strong> arguments against the schema and business rules.</li>
+<li><strong>Authorize</strong> against the <em>end user's</em> permissions, not the agent's service account. The model is never the authorization layer.</li>
+<li><strong>Classify the side effect</strong> (read, reversible write, irreversible or external) and require confirmation where policy says so.</li>
+<li><strong>Execute with a timeout</strong> and an idempotency key for writes.</li>
+<li><strong>Shape the result</strong>: truncate, paginate, strip noise, mark it as untrusted content, and return errors as instructive text (<code>is_error: true</code>) so the model can recover.</li>
+<li><strong>Record</strong> the call, arguments, result size, latency and cost in the trace.</li>
+</ol>
+
+<h2>The agent loop</h2>
+<p>Put the contract in a loop and you have an agent. The loop itself is a dozen lines; the guards around it are the design.</p>
+<pre><code><span class="k">def run_agent</span>(task, tools, budget):
+    messages = [system_prompt(tools), user(task)]
+    for step in range(budget.max_steps):                  <span class="c"># hard cap #1</span>
+        if budget.tokens_used &gt; budget.max_tokens: return stop("token budget")
+        if clock() &gt; budget.deadline:               return stop("time budget")
+
+        reply = llm.call(messages, tools, max_tokens=4096)  <span class="c"># retried with backoff on 429/5xx</span>
+        messages.append(reply)
+        if reply.stop_reason == "end_turn":
+            return verify_and_finish(reply)               <span class="c"># code checks the result, not the model</span>
+
+        results = []
+        for call in reply.tool_calls:                     <span class="c"># run independent calls concurrently</span>
+            if loop_detector.repeated(call):              <span class="c"># same call + same args N times</span>
+                results.append(error(call, "You already tried this. Change approach."))
+                continue
+            if policy.needs_approval(call):
+                await approval(call)                      <span class="c"># durable wait, see below</span>
+            results.append(executor.run(call))            <span class="c"># validate, authorize, timeout, truncate</span>
+        messages.append(tool_results(results))
+        messages = compact_if_needed(messages)            <span class="c"># see Context Engineering</span>
+    return stop("step budget")</code></pre>
+
+<h3>Stop conditions</h3>
+<div class="tbl"><table>
+<thead><tr><th>Condition</th><th>Who decides</th><th>What happens</th></tr></thead>
+<tbody>
+<tr><td>Model returns a final answer</td><td>Model</td><td>Run a verifier (tests pass, schema valid, checklist met); if it fails, feed the failure back as a new turn</td></tr>
+<tr><td>Step, token, time or cost budget exhausted</td><td>Runtime</td><td>Stop, save state, report partial progress and what remains</td></tr>
+<tr><td>Loop detected (repeated call or error)</td><td>Runtime</td><td>Inject a "change strategy" message once, then escalate to a human</td></tr>
+<tr><td>Needs information only the user has</td><td>Model (via an <code>ask_user</code> tool)</td><td>Pause durably until the user replies</td></tr>
+<tr><td>Policy violation or blocked action</td><td>Runtime</td><td>Refuse the call, tell the model why, log for review</td></tr>
+<tr><td>User cancels</td><td>User</td><td>Cancel in-flight model and tool calls, persist state</td></tr>
+</tbody></table></div>
+<div class="callout"><span class="ci"></span><p>Say this in the interview: "The model decides when it <em>thinks</em> it's done; the platform decides whether it <em>is</em> done." A coding agent's run succeeds when the orchestrator's own test run passes, not when the model says "all tests pass."</p></div>
+
+<h2>Workflows first, agents second</h2>
+<p>Anthropic's <a href="https://www.anthropic.com/research/building-effective-agents">Building effective agents</a> separates <strong>workflows</strong> (LLM calls orchestrated by predefined code paths) from <strong>agents</strong> (the model chooses its own steps). Most production "agents" are mostly workflow with one agentic step inside. The five workflow patterns, covered with diagrams in <a href="#common-patterns">Common Patterns</a>:</p>
+<div class="tbl"><table>
+<thead><tr><th>Pattern</th><th>Shape</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td>Prompt chaining</td><td>Fixed sequence of calls with checks between them</td><td>Outline → check outline → write draft</td></tr>
+<tr><td>Routing</td><td>Classify, then send to a specialized prompt or model</td><td>Refund vs technical vs sales tickets</td></tr>
+<tr><td>Parallelization</td><td>Sectioning or voting across concurrent calls</td><td>Run three guardrail checks at once</td></tr>
+<tr><td>Orchestrator–workers</td><td>A model splits work dynamically and delegates</td><td>Multi-file code change, research fan-out</td></tr>
+<tr><td>Evaluator–optimizer</td><td>Generate, critique, revise until a bar is met</td><td>Translation with a critic, code with test feedback</td></tr>
+</tbody></table></div>
+<p>The rule of thumb: <strong>if you can draw the flowchart, write the flowchart in code.</strong> Use an agent only for the part where the number and order of steps truly depend on what the model discovers.</p>
+
+<h2>Agent architectures</h2>
+<figure class="dg" data-diagram="agents-tool-use-archs"></figure>
+<div class="tbl"><table>
+<thead><tr><th>Architecture</th><th>How it works</th><th>Wins when</th><th>Breaks when</th></tr></thead>
+<tbody>
+<tr><td>Single agent loop (ReAct-style)</td><td>One model interleaves reasoning, tool calls and observations in one growing context (<a href="https://arxiv.org/abs/2210.03629">Yao et al., ReAct</a>)</td><td>Most tasks; coherent, write-heavy work such as editing code</td><td>Context fills with tool output on long tasks; very broad search is slow and serial</td></tr>
+<tr><td>Plan-and-execute</td><td>A planner writes an explicit step list; an executor (often a cheaper model or plain code) runs it; replan on failure</td><td>Predictable tasks, auditability, cost control; plans can be shown to a human for approval</td><td>Plans go stale as soon as reality differs; replanning loops</td></tr>
+<tr><td>Orchestrator–workers (sub-agents)</td><td>A lead agent spawns workers with fresh contexts for subtasks; each returns a short summary</td><td>Breadth-first, read-heavy, parallelizable work (research, codebase exploration)</td><td>Subtasks that need shared evolving state; token cost multiplies</td></tr>
+<tr><td>Handoffs</td><td>A triage agent transfers control (and the conversation) to a specialist with its own prompt and tools</td><td>Distinct domains with different tools and policies (billing vs tech support)</td><td>Bouncing between agents; context lost at handoff</td></tr>
+<tr><td>Evaluator–optimizer</td><td>A generator and a critic iterate, ideally with an objective check (tests, a rubric, a validator)</td><td>Clear quality criteria and measurable feedback</td><td>Critic and generator agree on wrong answers when there's no external signal</td></tr>
+<tr><td>Code as action</td><td>The model writes a script that calls tools; only the script's final output returns to context</td><td>Many tool calls with data processing between them (filter 10K rows, join two APIs)</td><td>Needs a secure code sandbox; harder to approve individual actions</td></tr>
+</tbody></table></div>
+
+<h3>Single agent or multi-agent?</h3>
+<p>The honest answer is "single agent until you can show why not." Two well-known write-ups frame the trade-off:</p>
+<ul>
+<li>Anthropic's <a href="https://www.anthropic.com/research/multi-agent-research-system">multi-agent research system</a> found an orchestrator with parallel sub-agents outperformed a single agent by 90.2% on their internal research eval, and that token usage alone explained about 80% of performance variance on BrowseComp. The price: agents use about 4× the tokens of chat, and their multi-agent system about 15×. They note it fits breadth-first, parallelizable queries with high-value answers, and fits poorly where agents must share context or depend on each other, such as most coding.</li>
+<li>Cognition's <a href="https://cognition.com/blog/dont-build-multi-agents">Don't Build Multi-Agents</a> argues the opposite failure: sub-agents working from partial context make conflicting decisions (one builds a Mario-style background, another a mismatched bird), so for coherent long tasks they prefer one agent with good context compression.</li>
+</ul>
+<p>Both are right about different workloads. Use sub-agents as <strong>context isolation for read-heavy exploration</strong> ("find every call site of <code>parse_date</code> and report back in 200 words") and keep <strong>writes and final decisions in one agent</strong> that holds the full picture.</p>
+
+<h2>Designing tools agents can use</h2>
+<p>Tool design is the highest-leverage, most under-discussed part of agent systems. A tool is a contract between deterministic software and a non-deterministic caller that reads your descriptions literally. Anthropic's <a href="https://www.anthropic.com/research/writing-tools-for-agents">Writing effective tools for agents</a> distills what they learned building Claude Code and MCP integrations:</p>
+<ul>
+<li><strong>Fewer, higher-level tools.</strong> Don't mirror your REST API one endpoint per tool. Instead of <code>list_users</code>, <code>list_events</code> and <code>create_event</code>, offer <code>schedule_event</code> that finds availability and books it. Instead of <code>read_logs</code>, offer <code>search_logs</code> that returns the relevant lines with context.</li>
+<li><strong>Namespace</strong> related tools (<code>jira_search</code>, <code>jira_create_issue</code>) so the model can tell overlapping tools from different servers apart.</li>
+<li><strong>Return meaningful context, not internals.</strong> Names, titles and short summaries beat UUIDs and MIME types. Offer a <code>response_format</code> parameter (<code>concise</code> or <code>detailed</code>) so the agent can ask for IDs only when it needs them for a follow-up call.</li>
+<li><strong>Be token-efficient by default.</strong> Paginate, filter and truncate with sensible defaults, and say so in the result ("showing 20 of 312; refine with <code>status</code> or <code>since</code>"). The post notes that Claude Code caps tool responses at 25,000 tokens by default.</li>
+<li><strong>Write errors for the model.</strong> "Invalid date" is useless; "<code>start_date</code> must be ISO 8601 like 2026-11-19; you sent '19/11'" lets the agent self-correct in one step.</li>
+<li><strong>Prompt-engineer the descriptions.</strong> Describe tools the way you'd brief a new teammate: when to use it, when not to, what the parameters mean (<code>user_id</code>, not <code>user</code>), and what it returns. Small description changes produced large accuracy gains in Anthropic's evals.</li>
+<li><strong>Evaluate tools with agents.</strong> Build realistic multi-step tasks, run the agent, read the transcripts, and let the model itself suggest description and schema fixes.</li>
+</ul>
+<p>Platform engineers should add three properties the model can't see but your system depends on:</p>
+<ul>
+<li><strong>Idempotency</strong>: every write accepts an idempotency key (derive it from <code>run_id + step_id</code>) so a retried step doesn't refund twice.</li>
+<li><strong>Dry run / preview</strong>: risky tools expose a preview that returns the exact change ("will email 4,312 recipients") for approval before commit.</li>
+<li><strong>Risk metadata</strong>: tag each tool read-only, reversible or irreversible, and internal or external, so policy and approval rules are data, not prompt text.</li>
+</ul>
+<pre><code><span class="c">// weak: mirrors the API, ambiguous, returns everything</span>
+{ "name": "query", "description": "Runs a query",
+  "input_schema": { "properties": { "q": { "type": "string" } } } }
+
+<span class="c">// strong: task-shaped, constrained, cheap by default, explicit about side effects</span>
+{ "name": "crm_find_accounts",
+  "description": "Search customer accounts by name, domain or owner. Read-only. Returns up to `limit` matches with name, domain, plan and owner. Use before crm_update_account to get the account_id.",
+  "input_schema": { "type": "object",
+    "properties": {
+      "text":  { "type": "string", "description": "Name or domain fragment, e.g. 'acme' or 'acme.com'" },
+      "plan":  { "type": "string", "enum": ["free", "team", "enterprise"] },
+      "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 },
+      "response_format": { "type": "string", "enum": ["concise", "detailed"], "default": "concise" } },
+    "required": ["text"] } }</code></pre>
+
+<h3>Large tool sets: tool search and code execution</h3>
+<p>Accuracy and cost both degrade as you add tools: every definition is in context on every call, and similar tools get confused. Connecting a handful of MCP servers can mean a hundred tools. Three techniques scale past that:</p>
+<ul>
+<li><strong>Tool search with deferred loading.</strong> Mark most tools as deferred; the model initially sees a small search tool plus a few always-on tools, searches by keyword or description when it needs a capability, and only matching definitions are loaded. Anthropic exposes this as a tool search tool with <code>defer_loading</code> (regex and BM25 variants) and reports large token savings and accuracy gains on big tool libraries (<a href="https://www.anthropic.com/research/advanced-tool-use">Advanced tool use</a>). Keep the 3–5 most-used tools loaded, and keep deferred tools out of your cached prefix so loading one doesn't invalidate the cache.</li>
+<li><strong>Routing to sub-agents.</strong> Give each specialist sub-agent only its domain's tools.</li>
+<li><strong>Programmatic tool calling.</strong> Let the model write code that calls tools inside a sandbox and returns only the final result. Fetching 200 expense records to sum them then costs a few hundred tokens of output, not 200 tool results in context. Cloudflare's "Code Mode" for MCP applies the same idea.</li>
+</ul>
+
+<h2>The Model Context Protocol (MCP)</h2>
+<p>Before MCP, every AI application wrote its own integration for every data source: N apps × M tools. <a href="https://modelcontextprotocol.io/">MCP</a> standardizes the interface so any host can use any server, turning that into N + M. Anthropic open-sourced it in November 2024; OpenAI, Google, Microsoft and most agent tooling adopted it during 2025, and it is now governed under the Linux Foundation's Agentic AI Foundation.</p>
+<figure class="dg" data-diagram="agents-tool-use-mcp"></figure>
+
+<h3>Roles and primitives</h3>
+<ul>
+<li><strong>Host</strong>: the user-facing application (an IDE, a CLI agent, a chat app). It owns the model, the user's consent and the security policy.</li>
+<li><strong>Client</strong>: a connector inside the host, one per server connection.</li>
+<li><strong>Server</strong>: a program that exposes capabilities, either local (launched by the host) or remote (a web service).</li>
+</ul>
+<div class="tbl"><table>
+<thead><tr><th>Primitive</th><th>Offered by</th><th>Controlled by</th><th>What it is</th></tr></thead>
+<tbody>
+<tr><td>Tools</td><td>Server</td><td>Model</td><td>Functions the model can call (<code>create_issue</code>, <code>query_db</code>)</td></tr>
+<tr><td>Resources</td><td>Server</td><td>Application</td><td>Readable data addressed by URI (files, records, schemas) that the host chooses to put in context</td></tr>
+<tr><td>Prompts</td><td>Server</td><td>User</td><td>Templated workflows the user invokes, often as slash commands</td></tr>
+<tr><td>Sampling</td><td>Client</td><td>Host + user</td><td>Server asks the host's model to generate text, so servers don't need their own model keys (deprecated in the 2026-07-28 revision)</td></tr>
+<tr><td>Elicitation</td><td>Client</td><td>User</td><td>Server asks the user for structured input mid-operation</td></tr>
+<tr><td>Roots</td><td>Client</td><td>Host</td><td>Filesystem or URI boundaries the server should operate within (deprecated in the 2026-07-28 revision)</td></tr>
+</tbody></table></div>
+
+<h3>Transports</h3>
+<div class="tbl"><table>
+<thead><tr><th>Transport</th><th>How</th><th>Use for</th><th>Watch out</th></tr></thead>
+<tbody>
+<tr><td>stdio</td><td>Host launches the server as a subprocess and exchanges JSON-RPC over stdin/stdout</td><td>Local tools: filesystem, git, local databases, dev tooling</td><td>Runs with the user's local privileges; installing a server is installing code</td></tr>
+<tr><td>Streamable HTTP</td><td>JSON-RPC over HTTP POST; responses can stream as SSE</td><td>Remote, multi-tenant SaaS integrations</td><td>Needs real auth, rate limits, tenant isolation; the older HTTP+SSE transport is deprecated</td></tr>
+</tbody></table></div>
+
+<h3>The 2026-07-28 revision: stateless MCP</h3>
+<p>Early MCP was session-oriented: an <code>initialize</code> handshake, a session ID header, and per-connection state, which made remote servers awkward to run behind ordinary load balancers. The <a href="https://modelcontextprotocol.io/specification/2026-07-28/changelog">2026-07-28 specification</a> removed protocol-level sessions and the <code>Mcp-Session-Id</code> header, dropped the initialize handshake so each request stands alone, removed SSE stream resumability, required <code>Mcp-Method</code> and <code>Mcp-Name</code> headers on Streamable HTTP POSTs (so gateways and WAFs can route and meter without parsing JSON bodies), made list endpoints such as <code>tools/list</code> independent of the connection so they can be cached, added a <code>server/discover</code> call for version and capability discovery, and replaced the GET stream and resource subscriptions with a single <code>subscriptions/listen</code> stream. Long-running operations moved out of the core into a formal Tasks extension, alongside the MCP Apps extension for interactive UI. For system design this means a remote MCP server is now an ordinary stateless HTTP service: horizontally scalable, cacheable at the edge, and fronted by standard API gateway infrastructure. Any state you need lives in your own store, keyed by user or task, not in the connection.</p>
+
+<h3>Authorization</h3>
+<p>Remote MCP servers use <strong>OAuth 2.1</strong>. The MCP server is a resource server; a separate authorization server issues tokens. The essentials:</p>
+<ul>
+<li>The client discovers the authorization server from the server's <strong>Protected Resource Metadata</strong> (RFC 9728), runs an authorization-code flow with PKCE, and requests a token bound to that specific server with <strong>resource indicators</strong> (RFC 8707), so a token for server A is useless at server B.</li>
+<li>Clients identify themselves with <strong>Client ID Metadata Documents</strong> (a URL that hosts the client's metadata) where supported, with Dynamic Client Registration as a legacy fallback in the 2026 revision (<a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization">spec</a>, <a href="https://workos.com/blog/mcp-2026-spec-agent-authentication">WorkOS summary</a>).</li>
+<li><strong>No token passthrough.</strong> A server that calls a downstream API must obtain its own token for that API rather than forwarding the user's MCP token; otherwise you get a confused deputy.</li>
+<li>Scopes should be narrow and tool-shaped (<code>issues:read</code>, not <code>repo</code>), and tokens short-lived.</li>
+</ul>
+
+<h3>Running MCP in production</h3>
+<ul>
+<li><strong>An MCP gateway</strong> in front of approved servers: allowlist, version pinning, per-tool enable/disable, auth brokering, rate limits, logging of every call.</li>
+<li><strong>Review tool descriptions</strong> as code. They are instructions to your model, so a malicious or compromised server can inject through them (tool poisoning) or change them after approval (a rug pull). See <a href="#guardrails-security">Guardrails &amp; Security</a>.</li>
+<li><strong>Treat tool results as untrusted content</strong>, exactly like web pages.</li>
+<li><strong>Measure</strong> per-tool call counts, error rates, latency and result sizes; drop or merge tools the model never uses or misuses.</li>
+</ul>
+
+<h3>A2A: agent-to-agent</h3>
+<p>MCP connects an agent to tools; Google's <a href="https://a2a-protocol.org/">Agent2Agent (A2A)</a> protocol connects agents to other agents, possibly built by different vendors. An agent publishes an <strong>Agent Card</strong> (capabilities, endpoint, auth requirements); a client agent sends it <strong>tasks</strong> that can be long-running and stream updates and artifacts back. A2A became a Linux Foundation project in June 2025 with AWS, Cisco, Google, Microsoft, Salesforce, SAP and ServiceNow as launch partners (<a href="https://www.linuxfoundation.org/press/linux-foundation-launches-the-agent2agent-protocol-project-to-enable-secure-intelligent-communication-between-ai-agents">Linux Foundation</a>). In interviews, mention it when the prompt involves cross-organization agent collaboration; for a single product, internal sub-agents are just function calls.</p>
+
+<h2>Skills: packaged procedural knowledge</h2>
+<p>Tools give an agent abilities; <strong>skills</strong> give it know-how. A skill is a folder with a <code>SKILL.md</code> file (YAML frontmatter with a name and description, then Markdown instructions), optionally with scripts and reference files. Anthropic shipped the format in October 2025 and published it as an open standard at <a href="https://agentskills.io/">agentskills.io</a> in December 2025; many coding agents now load the same format.</p>
+<p>The design idea is <strong>progressive disclosure</strong>: only names and descriptions sit in the context at startup (a few dozen tokens each); the full instructions load when a task matches; bundled files and scripts load only if the instructions point to them. That lets an agent carry hundreds of procedures ("how we write migrations", "how to fill the quarterly tax form") without paying for them on every call. Related ideas: project instruction files such as <code>AGENTS.md</code> or <code>CLAUDE.md</code> that are always loaded, and slash-command prompts. A useful interview line: "MCP gives access, skills give procedure, the system prompt gives identity and policy."</p>
+
+<h2>State, durability and long-running agents</h2>
+<p>A chat turn lasts seconds. An agent run can last 30 minutes, wait two days for a human approval, and make 200 calls to flaky external services. If the process holding the loop crashes, what happens? "It restarts from the beginning" is wrong: you pay for the tokens twice and you may repeat side effects.</p>
+<figure class="dg" data-diagram="agents-tool-use-durable"></figure>
+
+<h3>Durable execution</h3>
+<p>Durable execution engines (<a href="https://temporal.io/">Temporal</a>, <a href="https://restate.dev/">Restate</a>, <a href="https://www.inngest.com/">Inngest</a>, AWS Step Functions, DBOS) let you write the loop as ordinary code while the engine records every step's result in an event history. Model calls and tool calls run as <strong>activities</strong> with timeouts and retry policies. If a worker dies, another worker replays the history, skipping completed activities by reusing their recorded results, and continues from the first incomplete step. Agent frameworks offer lighter versions: LangGraph persists graph state at each node with checkpointers; agent SDKs persist sessions. Choose by how much you need: a checkpoint table keyed by <code>run_id</code> is enough for short runs; multi-hour, multi-day or approval-heavy runs justify a workflow engine.</p>
+<div class="callout warn"><span class="ci w"></span><p>The model call itself is non-deterministic. In a replay-based engine it must run as an activity (whose recorded result is reused on replay), never inline in workflow code, or replays will diverge.</p></div>
+
+<h3>Side effects: idempotency and sagas</h3>
+<ul>
+<li><strong>At-least-once is the reality.</strong> A tool call can succeed and the acknowledgement can be lost. Every write needs an idempotency key so a retry is a no-op downstream.</li>
+<li><strong>Outbox</strong>: when a step must update your DB and notify another system, write both to your DB in one transaction and publish from the outbox.</li>
+<li><strong>Sagas</strong>: multi-step business actions (book flight, book hotel, charge card) record a compensating action for each completed step, so a failure halfway can undo what was done rather than leave a half-booked trip.</li>
+</ul>
+
+<h3>Human in the loop</h3>
+<ul>
+<li>Model the approval as a <strong>durable wait</strong> (a workflow signal or a row the run polls), with a timeout and a default (usually cancel). The worker shouldn't hold memory or a sandbox while waiting.</li>
+<li>Show the <strong>exact action</strong>: tool, arguments, preview of effects, and why the agent wants it. Bind the approval to a hash of those arguments, so the agent can't change them after approval.</li>
+<li>Tier by risk to avoid approval fatigue: auto-approve reads, approve-once-per-session for routine writes, always approve irreversible or external actions (payments, emails to customers, production deploys).</li>
+<li>Let the human <strong>steer</strong>, not just approve: messages sent during a run are injected at the next step.</li>
+</ul>
+
+<h3>Budgets and loop detection</h3>
+<div class="tbl"><table>
+<thead><tr><th>Guard</th><th>Mechanism</th><th>Enforced where</th></tr></thead>
+<tbody>
+<tr><td>Step cap</td><td>Max model calls per run (e.g. 50–200 for coding agents)</td><td>Orchestrator</td></tr>
+<tr><td>Token / cost cap</td><td>Running total per run and per tenant; refuse calls past the cap</td><td>LLM gateway, so a buggy agent can't bypass it</td></tr>
+<tr><td>Wall-clock cap</td><td>Workflow timeout; sandbox lease expiry</td><td>Orchestrator, sandbox scheduler</td></tr>
+<tr><td>Repetition</td><td>Hash of (tool, normalized args) seen N times, or the same error repeated</td><td>Runtime; inject a strategy-change message, then escalate</td></tr>
+<tr><td>No progress</td><td>No new files changed or facts found in K steps</td><td>Runtime heuristic or a cheap judge model</td></tr>
+<tr><td>Output size</td><td><code>max_tokens</code> per call; truncated tool results</td><td>Gateway and executor</td></tr>
+</tbody></table></div>
+
+<h2>Cost, latency and concurrency</h2>
+<h3>Agent token math</h3>
+<p>Agent cost grows faster than linearly with steps, because every step re-sends the whole growing context. A worked example, using $2 per million input tokens and $10 per million output tokens (Sonnet 5.5 list prices):</p>
+<pre><code>Run: 30 steps. Fixed prefix (system + tools + task) = 8,000 tokens.
+Each step adds ~1,500 tokens (300 model output + 1,200 tool result).
+
+Input at step i = 8,000 + 1,500 × i              (i = 0..29)
+Total input     = 30 × 8,000 + 1,500 × (0+1+…+29)
+                = 240,000 + 652,500 = <span class="k">892,500 tokens</span>   <span class="c"># quadratic in steps</span>
+Output          = 30 × 300 = 9,000 tokens
+
+Without caching: 892,500 × $2/M + 9,000 × $10/M = $1.79 + $0.09 ≈ <span class="k">$1.88 per run</span>
+
+With prompt caching (write 1.25×, read 0.05×; only new tokens are written each step):
+  writes = 8,000 + 29 × 1,500 = 51,500  × $2.50/M = $0.13
+  reads  = 892,500 − 51,500   = 841,000 × $0.10/M = $0.08
+  output                                         = $0.09
+  total ≈ <span class="k">$0.30 per run</span>  (≈ 6× cheaper)</code></pre>
+<p>Three levers follow directly: <strong>cache the prefix</strong> (keep it stable and append-only), <strong>shrink tool results</strong> (they're 80% of the growth here), and <strong>compact</strong> old steps into summaries when context passes a threshold. Multiply by run volume and you get the business case: 100K runs a day is $188K a day uncached versus $30K cached.</p>
+
+<h3>Latency</h3>
+<p>A step costs roughly TTFT + output tokens × TPOT + tool time. At ~1 s TTFT, 300 output tokens at 60 tok/s (5 s), and 1 s of tool time, a 30-step run takes about 3.5 minutes. Levers: parallel tool calls, smaller and faster models for sub-steps (summarizing logs, naming branches), lower reasoning effort on easy steps, speculative prefetching of likely reads, and streaming progress to the user so a long run feels alive. For interactive agents, show the plan and each tool call as it happens.</p>
+
+<h3>Running agent fleets</h3>
+<p>Provider rate limits are per minute on requests, input tokens and output tokens. Size them with Little's law: 2,000 concurrent runs × one model call every 8 s = 250 calls/s; at 40K input tokens per call that's 10M input tokens per second, or 600M per minute. Most of those tokens are cache reads, and some providers don't count cached reads against input-token limits, so check how your provider meters before you buy capacity. Operationally:</p>
+<ul>
+<li>A <strong>token-aware admission controller</strong> in the LLM gateway (reserve estimated tokens, reconcile on completion) with per-tenant concurrency caps and priority classes (interactive above background).</li>
+<li>Back off with jitter on 429s and pause runs during provider outages rather than failing them; durable execution makes pausing free.</li>
+<li><strong>Cache-aware routing</strong> for self-hosted models: keep a run on the replica that holds its prefix.</li>
+<li>Separate quotas for sandboxes (CPU minutes) and model tokens; either can be the bottleneck.</li>
+</ul>
+<p>The <a href="#design-llm-gateway">LLM Gateway breakdown</a> designs this layer end to end.</p>
+
+<h2>Memory for agents</h2>
+<p>Agents need three kinds of state beyond the transcript: a <strong>scratchpad</strong> for the current task (a to-do list the agent rewrites, which also keeps it on track), <strong>notes files</strong> that survive compaction or a new session (progress logs, decisions), and <strong>long-term memory</strong> about the user or project retrieved by relevance. Mechanisms (compaction thresholds, memory tools, what to keep verbatim) are covered in <a href="#context-engineering">Context Engineering &amp; Memory</a>.</p>
+
+<h2>Computer-use and browser agents</h2>
+<p>When no API exists, an agent can operate a GUI: the model receives screenshots (and sometimes an accessibility tree), returns actions such as click, type and scroll, and the loop repeats. Anthropic's computer use (October 2024) and OpenAI's Operator / computer-using agent (January 2025) popularized the pattern. Design implications: each step is slow (a screenshot is image tokens, and a task can take hundreds of steps), so prefer APIs, DOM-level browser tools or recorded scripts when available; run the browser or desktop in an isolated VM with no saved credentials; treat every page as hostile input (web pages are the classic indirect injection vector); and require confirmation before purchases, form submissions and logins.</p>
+
+<h2>Frameworks landscape</h2>
+<p>You don't need a framework, and interviewers don't want framework trivia. Know what each optimizes for so you can justify a choice or explain why plain code is enough:</p>
+<div class="tbl"><table>
+<thead><tr><th>Framework</th><th>Center of gravity</th></tr></thead>
+<tbody>
+<tr><td><a href="https://code.claude.com/docs/en/agent-sdk/overview">Claude Agent SDK</a></td><td>The harness behind Claude Code as a library: agent loop, file and shell tools, permissions, hooks, sub-agents, MCP, skills, automatic context compaction</td></tr>
+<tr><td><a href="https://openai.github.io/openai-agents-python/">OpenAI Agents SDK</a></td><td>Lightweight primitives: agents, tools, handoffs, guardrails, sessions, built-in tracing</td></tr>
+<tr><td><a href="https://langchain-ai.github.io/langgraph/">LangGraph</a></td><td>Agents as explicit state graphs with checkpointing, interrupts for human review, and durable execution</td></tr>
+<tr><td><a href="https://adk.dev/">Google ADK</a></td><td>Code-first multi-agent hierarchies (sequential, parallel, loop agents), Vertex AI deployment, A2A support</td></tr>
+<tr><td><a href="https://docs.crewai.com/">CrewAI</a></td><td>Role-based "crews" of collaborating agents plus event-driven "flows"</td></tr>
+<tr><td><a href="https://pydantic.dev/docs/ai/overview/">Pydantic AI</a></td><td>Type-safe Python agents with validated structured outputs and dependency injection</td></tr>
+<tr><td><a href="https://ai-sdk.dev/">Vercel AI SDK</a></td><td>TypeScript, provider-agnostic model calls, tool loops and streaming UI for web apps</td></tr>
+</tbody></table></div>
+<p>A strong interview answer: "The loop is small, so I'd own it. I'd lean on a durable workflow engine for state and retries, the provider SDK for model calls, and MCP for integrations. A framework is fine if it doesn't hide the context, the retries or the cost."</p>
+
+<h2>Agents in System Design Interviews</h2>
+<h3>When to bring it up</h3>
+<ul>
+<li><strong>The task has an unknown number of steps.</strong> "Investigating a failed deployment could take two queries or twenty, so a fixed pipeline won't work. I'll use an agent loop with read-only tools and budgets."</li>
+<li><strong>The system must act, not just answer.</strong> "Issuing refunds is a write, so the model proposes a refund through a tool and the executor enforces limits and approvals."</li>
+<li><strong>Integrations are many and changing.</strong> "Customers bring their own tools, so I'd accept MCP servers behind a gateway rather than writing custom integrations."</li>
+<li><strong>And, just as important, when not to:</strong> "Ticket classification has a fixed shape, so a single structured-output call with routing is cheaper and more predictable than an agent."</li>
+</ul>
+
+<h3>How to introduce it</h3>
+<ol>
+<li><strong>Justify autonomy.</strong> State why a workflow isn't enough, and keep everything else as a workflow.</li>
+<li><strong>Define the tools.</strong> List 4–8 task-shaped tools with their side-effect class. This is your API design step for the agent.</li>
+<li><strong>Draw the loop and its owner.</strong> An orchestrator (durable workflow) that calls the model through a gateway and tools through an executor; state in the workflow history, not in memory.</li>
+<li><strong>Put guards on it.</strong> Budgets, loop detection, verification by code, approvals for irreversible actions.</li>
+<li><strong>Manage context.</strong> Stable cached prefix, truncated tool results, compaction, sub-agents for exploration.</li>
+<li><strong>Close with safety and evals.</strong> Least-privilege tools, untrusted-content handling, and a task-based eval suite with deterministic checks (see <a href="#evaluation">Evaluation</a>).</li>
+</ol>
+
+<h3>Common deep-dive questions</h3>
+<h4>"How do you stop the agent from doing something harmful and irreversible?"</h4>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Tell the model in the system prompt to be careful</h5><p><span class="lbl">Challenges:</span> prompts are suggestions; a confused model or an injected instruction ignores them. The model is not an authorization layer.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Executor-side checks and confirmation for writes</h5><p><span class="lbl">Approach:</span> the executor validates arguments, checks the end user's permissions, and requires user confirmation for any write.</p><p><span class="lbl">Challenges:</span> confirming everything causes approval fatigue, so users click through; limits live in ad hoc code.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Risk-tiered policy as data, scoped credentials, previews and durable approvals</h5><p><span class="lbl">Approach:</span> tag every tool by side-effect class; a policy engine maps (tool, arguments, user, tenant) to allow, deny or require approval with limits (refunds over $200 need a human). Credentials are scoped to the user and the task and live outside the model's reach. Risky tools offer a dry-run preview; approvals are durable waits bound to an argument hash, with timeouts. Irreversible actions get rate limits and anomaly alerts, and everything is audit-logged.</p><p><span class="lbl">Challenges:</span> policy maintenance; measure approval rates and tune tiers so humans only see decisions that matter.</p></div>
+
+<h4>"The agent sometimes loops forever or burns $40 on one task. Fix it."</h4>
+<p>Budgets enforced outside the model (steps, tokens, dollars, wall clock) at the gateway and orchestrator; repetition detection on (tool, args) hashes and repeated errors; a strategy-change message before escalation; better tool errors (most loops are the model retrying a call whose error message doesn't say what to change); and per-task cost dashboards with alerts on the p99. Then look at transcripts of the worst runs and fix the tools or prompt that caused them.</p>
+
+<h4>"Single agent or multi-agent?"</h4>
+<p>Default to one agent. Add sub-agents for parallel, read-heavy exploration where each worker can return a short summary, and accept roughly an order of magnitude more tokens for it. Keep writes and final synthesis in one agent with full context. Quote the trade-off: Anthropic's 90% quality gain on breadth-first research at ~15× tokens versus Cognition's coherence argument.</p>
+
+<h4>"How does the agent survive a crash at step 37 of 50?"</h4>
+<p>The loop runs as a durable workflow; each model and tool call is a recorded activity; on crash another worker replays the history and resumes at step 38 without re-calling the model for steps 1–37. Tool writes are idempotent by key, the sandbox is snapshotted or reconstructible from the recorded actions, and the user's event stream resumes from the last event ID.</p>
+
+<h4>"You have 300 internal APIs. How does the agent use them?"</h4>
+<p>Not as 300 tools. Group them into task-shaped tools per domain, expose them through MCP servers behind a gateway, use tool search with deferred loading so only relevant definitions enter context, and route domain-specific work to sub-agents with narrow tool sets. Evaluate tool selection accuracy as its own metric.</p>
+
+<h4>"How do you evaluate an agent?"</h4>
+<p>Task suites with deterministic end-state checks (tests pass, the right record changed, the email draft contains the required fields), run in sandboxes, scored on success rate, cost per successful task, steps and time. Add trajectory checks (did it call a forbidden tool, did it ask for approval), run each task several times because agents are stochastic, and track pass@k and consistency. Details in <a href="#evaluation">Evaluation</a>.</p>
+
+<h2>Summary</h2>
+<ul>
+<li>Tool calling is a message protocol: schemas in, structured call out, result back as a message. The runtime validates, authorizes, executes, shapes and logs; the model only proposes.</li>
+<li>Prefer workflows; add agentic loops only where the steps are truly unknown. Default to one agent; use sub-agents for parallel read-heavy exploration and accept the token bill.</li>
+<li>Design tools for the model: few, task-shaped, namespaced, token-efficient, with instructive errors. Add idempotency keys, previews and risk metadata for the platform.</li>
+<li>MCP standardizes integrations; since the 2026-07-28 revision remote servers are stateless HTTP services secured with OAuth 2.1 and audience-bound tokens. Skills package procedure with progressive disclosure; A2A connects agents across vendors.</li>
+<li>Long runs need durable execution, idempotent side effects, durable approvals and budgets enforced outside the model. Agent cost is roughly quadratic in steps; prompt caching and smaller tool results are the biggest levers.</li>
+</ul>
+<p>Apply it: <a href="#design-claude-code">Design Claude Code</a>, <a href="#design-coding-agent">AI Coding Agent</a>, <a href="#design-deep-research">Deep Research Agent</a>. Secure it: <a href="#guardrails-security">Guardrails &amp; Security</a>. Measure it: <a href="#evaluation">Evaluation</a>.</p>
+</section>

@@ -2,7 +2,7 @@
 <div class="banner" style="--banner:#e8907a" data-bt="Inference Batching" data-bs="worked example · infrastructure"></div>
 <p class="eyebrow">Question Breakdown · Hard</p>
 <h1>Design an Inference Batching Service</h1>
-<p class="lead">Batch synchronous inference requests onto GPUs and route every result back to the right caller. Candidates report this as the most common Anthropic system design prompt, in several variants (<a href="https://www.aced.io/blog/anthropic-system-design-interview">Exponent</a>, <a href="https://prachub.com/interview-questions/design-a-batched-llm-inference-service-assuming-each-batch-takes-100-ms">PracHub</a>).</p>
+<p class="lead">Batch synchronous inference requests onto GPUs and route every result back to the right caller. Candidates report this as the most common Anthropic system design prompt, in several variants (<a href="https://www.aced.io/blog/anthropic-system-design-interview">Aced, formerly Exponent</a>; <a href="https://prachub.com/interview-questions/design-a-batched-llm-inference-service-assuming-each-batch-takes-100-ms">PracHub</a>).</p>
 <hr class="sep">
 
 <h2>Understanding the Problem</h2>
@@ -29,7 +29,7 @@
 <h3>Capacity estimation</h3>
 <pre><code>One GPU at full batches: 100 inputs / 100 ms = 1,000 req/s
 Peak 10K req/s → 10 GPUs at 100% utilization
-Target ~60–70% utilization + N+2 for failures → <span class="k">~16–18 GPUs</span>
+Target ~60–70% utilization + N+2 for failures → <span class="k">~17–19 GPUs</span>
 Latency floor: 100 ms compute + queue wait + network ≈ 120–200 ms</code></pre>
 
 <h2>The Set Up</h2>
@@ -83,12 +83,12 @@ Latency floor: 100 ms compute + queue wait + network ≈ 120–200 ms</code></pr
 <p>Interviewers often end with "now make it an LLM." Three things change:</p>
 <ol>
 <li><strong>Work is variable-length.</strong> One request generates 10 tokens, another 2,000. A fixed batch holds GPU slots until its longest member finishes, so you move to <strong>continuous batching</strong>: schedule per decode step, admit new sequences as others finish (see <a href="#core-concepts">Core Concepts</a>).</li>
-<li><strong>Memory, not batch size, becomes the limit.</strong> Each active sequence holds its KV cache. Admission control now asks "is there KV memory for this prompt plus its max output?" and the scheduler may preempt and recompute or swap sequences under pressure.</li>
+<li><strong>Memory, not batch size, becomes the limit.</strong> Each active sequence holds its KV cache. Admission control now asks "is there KV memory for this prompt (and, if reserving conservatively, its max output)?" and the scheduler may preempt and recompute or swap sequences under pressure.</li>
 <li><strong>Latency splits into TTFT and per-token speed,</strong> and batch size trades one user's speed for aggregate throughput:</li>
 </ol>
-<div class="chart" data-chart="batch-curve"><h5>Bigger decode batches: more tokens per GPU, slower tokens per user</h5><p class="sub">Illustrative roofline model for an 8B model at FP16 on one H100 (3.35 TB/s), ~2K tokens of context per sequence. Step time ≈ 4.8 ms to read weights + ~0.1 ms per sequence for its KV cache and compute.</p></div>
+<div class="chart" data-chart="batch-curve"><h5>Bigger decode batches: more tokens per GPU, slower tokens per user</h5><p class="sub">Illustrative roofline model for an 8B model at FP16 on one H100 SXM (80 GB, 3.35 TB/s), ~2K tokens of context per sequence. Step time ≈ 4.8 ms to read weights + ~0.1 ms per sequence for its KV cache and compute.</p></div>
 <details class="data"><summary>Show the numbers</summary><div class="tbl"><table><thead><tr><th class="num">Batch size</th><th class="num">Step time (ms)</th><th class="num">Aggregate tok/s</th><th class="num">Per-user tok/s</th></tr></thead><tbody>
-<tr><td class="num">1</td><td class="num">4.9</td><td class="num">205</td><td class="num">205</td></tr><tr><td class="num">16</td><td class="num">6.4</td><td class="num">2,491</td><td class="num">156</td></tr><tr><td class="num">64</td><td class="num">11.4</td><td class="num">5,630</td><td class="num">88</td></tr><tr><td class="num">128</td><td class="num">18.0</td><td class="num">7,128</td><td class="num">56</td></tr><tr><td class="num">256</td><td class="num">31.1</td><td class="num">8,221</td><td class="num">32</td></tr></tbody></table></div><p class="src">A simplified model for intuition; real engines add kernel overheads, attention scaling with context, and scheduling costs.</p></details>
+<tr><td class="num">1</td><td class="num">4.9</td><td class="num">205</td><td class="num">205</td></tr><tr><td class="num">16</td><td class="num">6.4</td><td class="num">2,491</td><td class="num">156</td></tr><tr><td class="num">64</td><td class="num">11.4</td><td class="num">5,630</td><td class="num">88</td></tr><tr><td class="num">128</td><td class="num">18.0</td><td class="num">7,128</td><td class="num">56</td></tr><tr><td class="num">256</td><td class="num">31.1</td><td class="num">8,221</td><td class="num">32</td></tr></tbody></table></div><p class="src">A simplified model for intuition; real engines add kernel overheads, attention scaling with context, and scheduling costs. The B=256 row ignores memory: its KV cache (~69 GB) plus 16 GB of weights would exceed 80 GB, so in practice memory caps this setup near ~200 sequences.</p></details>
 <p>The right operating point is set by your per-user speed SLO: if users need at least ~50 tokens/s, you cap the batch around 128 in this model. Prefill also competes with decode for the same GPU, which is why engines use chunked prefill and large deployments split prefill and decode onto separate pools.</p>
 
 <h2>What is Expected at Each Level?</h2>

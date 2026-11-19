@@ -1,0 +1,235 @@
+<section class="page" id="p-gateway-reliability" data-title="Gateways, Routing &amp; Reliability" data-kw="llm gateway ai gateway litellm portkey kong cloudflare envoy openrouter virtual keys token rate limiting token bucket reserve reconcile redis lua concurrency limit priority tiers fairness model routing cascade routellm learned router fallback failover multi-provider circuit breaker retries exponential backoff jitter retry budget hedged requests timeouts ttft load shedding graceful degradation 429 529 overloaded provisioned throughput slo error budget cost attribution pii redaction data residency">
+<div class="banner" style="--banner:#e8907a" data-bt="Gateways &amp; Reliability" data-bs="routing, limits and failover for model calls"></div>
+<p class="eyebrow">LLM System Design · Core Concepts</p>
+<h1>Gateways, Routing &amp; Reliability</h1>
+<p class="lead">The layer between your applications and the models they call: token-based rate limits and quotas, model routing, retries, circuit breakers and failover across providers, load shedding, and how to set SLOs for features whose most important dependency you don't control.</p>
+<hr class="sep">
+
+<p>An LLM feature depends on a model endpoint that is slow (seconds per call), variable (the same request can take 2 or 20 seconds), metered (every call costs money), shared (your rate limits are per organization, not per service) and, at times, unavailable. Provider status pages show incidents regularly, and during demand spikes even healthy providers return rate-limit (<code>429</code>) and overloaded (<code>503</code>, or <code>529</code> on Anthropic's API) errors. If each team calls providers directly, every team reinvents retries, nobody knows who spent what, and an outage takes every AI feature down at once.</p>
+<p>The standard answer is an <strong>LLM gateway</strong> (also called an AI gateway): a proxy that every model call goes through. This page covers what goes in it and the reliability techniques behind it. For the full interview walkthrough of building one, see the <a href="#design-llm-gateway">LLM Gateway</a> worked example; this page is the concepts toolbox you'd draw on there and in any other design.</p>
+
+<h2>What an LLM gateway does</h2>
+<figure class="dg" data-diagram="gateway-reliability-arch"></figure>
+<div class="tbl"><table>
+<thead><tr><th>Responsibility</th><th>What it means</th><th>Why centralize it</th></tr></thead>
+<tbody>
+<tr><td>Unified API</td><td>One request format (often OpenAI-compatible) translated to each provider</td><td>Apps switch models by config, not code</td></tr>
+<tr><td>Credentials</td><td>Provider keys live only in the gateway; teams get <em>virtual keys</em></td><td>No provider keys in app code or laptops; per-team revocation</td></tr>
+<tr><td>Quotas and rate limits</td><td>Tokens per minute, spend per day, concurrency per key/team/tenant</td><td>The provider limit is shared by the whole org; someone has to divide it</td></tr>
+<tr><td>Routing</td><td>Pick model and provider per request by rules, cost, latency or a learned policy</td><td>Cost and quality optimization in one place</td></tr>
+<tr><td>Reliability</td><td>Timeouts, retries, circuit breakers, fallbacks</td><td>Consistent, tested behavior during incidents</td></tr>
+<tr><td>Caching</td><td>Exact (sometimes semantic) response cache; cache-key hints for prompt caching</td><td>Shared savings (see <a href="#llm-caching">Caching for LLMs</a>)</td></tr>
+<tr><td>Guardrails and privacy</td><td>PII redaction, moderation, data-residency routing</td><td>Policy enforced once, audited once</td></tr>
+<tr><td>Observability and cost</td><td>Log tokens, cost, latency, errors, fallbacks per call with team and feature tags</td><td>Chargeback, budgets and debugging (see <a href="#observability">Observability &amp; LLMOps</a>)</td></tr>
+</tbody></table></div>
+
+<h3>Build vs buy</h3>
+<p>Most teams start with an existing gateway and extend it. Know the landscape well enough to name a couple and say what they're for; feature sets change quickly, so check current docs before relying on a specific capability.</p>
+<div class="cards">
+<div class="card2"><span class="tag">Open source proxy</span><h4>LiteLLM</h4><p>Python SDK and proxy server exposing an OpenAI-compatible API over many providers, with virtual keys, budgets, rate limits, fallbacks and spend tracking. A common self-hosted default.</p></div>
+<div class="card2"><span class="tag">Gateway + platform</span><h4>Portkey</h4><p>Gateway with configurable routing (fallbacks, load balancing, conditional routing), caching, guardrails and observability; open-source gateway core plus a hosted platform.</p></div>
+<div class="card2"><span class="tag">API gateway plugins</span><h4>Kong AI Gateway</h4><p>AI plugins for the Kong API gateway: multi-provider proxying, prompt guards, semantic caching and token-aware rate limiting (some features are enterprise-tier).</p></div>
+<div class="card2"><span class="tag">Edge service</span><h4>Cloudflare AI Gateway</h4><p>Hosted proxy at Cloudflare's edge with caching, rate limiting, analytics, logging and dynamic routing with fallbacks.</p></div>
+<div class="card2"><span class="tag">Kubernetes-native</span><h4>Envoy AI Gateway</h4><p>Open-source project built on Envoy Proxy and Envoy Gateway: unified access to providers, upstream auth, and token-based rate limiting, configured as Kubernetes resources.</p></div>
+<div class="card2"><span class="tag">Hosted router</span><h4>OpenRouter</h4><p>A hosted service with one API and one bill across many model providers, with provider routing and fallbacks. You trade control and data-path ownership for convenience.</p></div>
+</div>
+<p>Build your own (or fork) when you need tight integration with internal auth and billing, custom routing logic, strict data-residency guarantees, or extreme throughput where an extra hop's overhead matters. Even then, keep the gateway thin: a slow or unavailable gateway is now a single point of failure for every AI feature, so run it stateless, replicated across zones, with state in Redis and config in a versioned store.</p>
+
+<h2>Token-based rate limiting</h2>
+<p>Limiting requests per minute is nearly meaningless for LLMs: one request can be 200 tokens, another 200,000. Providers limit you on several dimensions at once, typically requests per minute, input tokens per minute and output tokens per minute, and your gateway should do the same for its clients, plus concurrency (in-flight requests) and spend (dollars per day or month).</p>
+
+<h3>Token bucket, counted in tokens</h3>
+<p>A token bucket holds up to <em>capacity</em> units and refills at a steady rate. Each request withdraws its cost; if there isn't enough, it's rejected (or queued). For LLMs the unit is model tokens, so a 50K-token request withdraws 50K. Buckets allow short bursts up to capacity while enforcing the long-run rate.</p>
+
+<h3>The output problem: reserve, then reconcile</h3>
+<p>You know input tokens before the call (count them with the tokenizer or the provider's token-counting endpoint), but output tokens only after it finishes. Charging nothing up front lets one client launch 500 parallel long generations and blow through the limit; charging after the fact makes limits unenforceable. The standard pattern:</p>
+<figure class="dg" data-diagram="gateway-reliability-ratelimit"></figure>
+<ol>
+<li><strong>Estimate</strong> cost = input tokens + <code>max_tokens</code> (conservative), or input + the p95 output length for this route (tighter, occasionally overruns).</li>
+<li><strong>Reserve</strong> that amount atomically. If the bucket is short, reject with <code>429</code> and a <code>Retry-After</code> computed from the refill rate.</li>
+<li><strong>Forward</strong> and stream.</li>
+<li><strong>Reconcile</strong> when the call ends (including on cancel or error): refund <code>reserved − actual</code>, or debit the overrun.</li>
+</ol>
+<p>Mirror the provider's own accounting where it matters: Anthropic, for example, doesn't count cache-read tokens toward its input-token limit, so a bucket that counts them will throttle earlier than the provider does (<a href="https://platform.claude.com/docs/en/api/rate-limits">Claude rate limits</a>).</p>
+<pre><code><span class="c">-- reserve.lua: atomic token-bucket reservation in Redis
+-- KEYS[1] = bucket key, e.g. "tpm:{tenant}:{key}"
+-- ARGV = capacity, refill_per_sec, now_ms, cost</span>
+local cap, rate, now, cost = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4])
+local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(b[1]) or cap
+local ts = tonumber(b[2]) or now
+tokens = math.min(cap, tokens + math.max(0, now - ts) / 1000 * rate)   <span class="c">-- refill</span>
+if cost &gt; cap then return {-1, 0} end                                  <span class="c">-- can never fit: 413 / lower max_tokens</span>
+if tokens &lt; cost then
+  redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+  return {0, math.ceil((cost - tokens) / rate)}                         <span class="c">-- reject, Retry-After seconds</span>
+end
+redis.call('HSET', KEYS[1], 'tokens', tokens - cost, 'ts', now)
+redis.call('PEXPIRE', KEYS[1], math.ceil(cap / rate * 1000) + 60000)
+return {1, 0}                                                           <span class="c">-- reserved</span>
+
+<span class="c">-- reconcile.lua: refund (delta &gt; 0) or charge an overrun (delta &lt; 0); may go negative briefly</span>
+<span class="c">-- tokens = min(cap, tokens + (reserved - actual))</span></code></pre>
+<p>Running the check and debit in one Lua script avoids the race where two gateway instances both read "enough tokens" and both proceed. At very high request rates, shard buckets by key and keep hot keys' buckets local with periodic sync, accepting slight over-admission.</p>
+
+<h3>Concurrency limits</h3>
+<p>Token rates don't stop a client from holding 1,000 streams open for minutes each, which ties up your provider concurrency and, on self-hosted models, GPU KV memory. Add an in-flight limit per key: a counter (or Redis sorted set of request IDs with lease timestamps) incremented on start and decremented on completion, with leases that expire so crashed requests don't leak slots forever.</p>
+
+<h3>Hierarchical quotas and priority</h3>
+<ul>
+<li><strong>Hierarchy:</strong> the organization's provider limit is divided into team budgets, team budgets into keys, and keys optionally into end users. A request must fit at every level. Unused budget can be lent (borrowable quotas) with the owner able to reclaim it.</li>
+<li><strong>Priority tiers:</strong> when the shared upstream limit is tight, interactive traffic should be admitted before batch jobs, and paid before free. Implement with separate buckets per tier and a scheduler that drains higher tiers first, or weighted fair queuing so low tiers still make progress.</li>
+<li><strong>Adapt to the upstream:</strong> the gateway also has to stay inside <em>your</em> provider limits. Read the provider's rate-limit headers (remaining tokens and reset times), and when 429s appear, reduce concurrency multiplicatively and increase it additively when they stop (AIMD, like TCP congestion control).</li>
+</ul>
+
+<h2>Model routing</h2>
+<p>Routing decides which model and which provider serve each request. It's the biggest cost lever after caching, and the riskiest for quality, so every routing change should go through an eval gate (see <a href="#evaluation">Evaluation</a>).</p>
+<div class="tbl"><table>
+<thead><tr><th>Strategy</th><th>How it decides</th><th>Strength</th><th>Weakness</th></tr></thead>
+<tbody>
+<tr><td>Static rules</td><td>By feature/route, tenant plan, input length (long inputs → long-context model), language, data residency</td><td>Predictable, easy to audit</td><td>Coarse; leaves savings on the table</td></tr>
+<tr><td>Classifier router</td><td>A small model or classifier predicts difficulty or task type</td><td>Per-request choice at low cost</td><td>Needs labeled data; misroutes hard requests to weak models</td></tr>
+<tr><td>Cascade</td><td>Try the cheap model; validate (schema, confidence, verifier); escalate on failure</td><td>Cheap model handles most traffic; quality floor from the validator</td><td>Escalated requests pay twice and take longer</td></tr>
+<tr><td>Learned router</td><td>Trained on preference data to predict when the strong model's answer is meaningfully better</td><td>Best cost/quality frontier when trained on your traffic</td><td>Training data, drift, harder to explain</td></tr>
+<tr><td>Latency/cost-aware</td><td>Choose among equivalent deployments by current latency, error rate and price</td><td>Absorbs regional slowdowns</td><td>Requires equivalence; can oscillate without damping</td></tr>
+</tbody></table></div>
+<p>RouteLLM is the standard reference for learned routing: routers trained on human preference data reduced cost by more than 2× without substantially compromising quality on benchmarks like MT Bench (<a href="https://arxiv.org/abs/2406.18665">Ong et al., 2024</a>); the LMSYS team reported cost reductions of up to 85% on MT Bench while keeping 95% of GPT-4's quality (<a href="https://github.com/lm-sys/RouteLLM">RouteLLM repo</a>). Treat such numbers as benchmark-specific; your traffic decides your savings.</p>
+<p>New models enter through <strong>shadow traffic</strong> (send a copy of real requests, compare offline, don't show users) and then a <strong>canary</strong> (a small percentage of real traffic, watching quality, latency and cost) before the routing table changes.</p>
+
+<h3>Prompt portability</h3>
+<p>Failover to another provider is only real if the request works there. Models differ in tool-call formats, structured-output support, context limits, tokenizers (the same text is a different number of tokens), system-prompt handling and refusal behavior. Make portability concrete:</p>
+<ul>
+<li>Keep a canonical internal request format and per-provider adapters in the gateway.</li>
+<li>Maintain per-model prompt variants where needed, versioned together.</li>
+<li>Run each route's eval suite against every model in its fallback chain, on every prompt change, so you know the fallback's quality before the outage, not during it.</li>
+</ul>
+
+<h2>Handling failures</h2>
+<h3>Classify errors first</h3>
+<div class="tbl"><table>
+<thead><tr><th>Error</th><th>Meaning</th><th>Gateway action</th></tr></thead>
+<tbody>
+<tr><td><code>400</code> invalid request, context too long</td><td>The request is wrong</td><td>Don't retry or fail over; return to caller (maybe trigger compaction)</td></tr>
+<tr><td><code>401</code> / <code>403</code></td><td>Credential or permission problem</td><td>Don't retry; alert; possibly fail over if one key is revoked</td></tr>
+<tr><td><code>429</code> rate limit</td><td>Your org exceeded its limit with this provider</td><td>Honor <code>Retry-After</code>; shift load to another key, region or provider; slow down (AIMD)</td></tr>
+<tr><td><code>500</code> / <code>502</code> / <code>503</code></td><td>Transient provider failure</td><td>Retry with backoff and jitter, within a retry budget</td></tr>
+<tr><td>Overloaded (<code>529</code> on Anthropic, <code>503</code> elsewhere)</td><td>Provider-wide capacity shortage</td><td>Brief backoff, then fail over; open the breaker if it persists</td></tr>
+<tr><td>Timeout (connect, TTFT or idle)</td><td>Slow or stuck</td><td>Retry once elsewhere if no tokens were streamed to the user</td></tr>
+<tr><td>Safety refusal / content filter</td><td>Policy outcome, not a failure</td><td>Don't retry on another provider to get around it</td></tr>
+</tbody></table></div>
+
+<h3>Retries with backoff, jitter and budgets</h3>
+<ul>
+<li><strong>Exponential backoff with full jitter:</strong> wait a random time between 0 and <code>min(cap, base × 2<sup>attempt</sup>)</code>. Jitter prevents synchronized retry waves from many clients (<a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">AWS Architecture Blog: Exponential Backoff and Jitter</a>).</li>
+<li><strong>Retry budgets:</strong> cap retries at a fraction of traffic (for example, retries may add at most 10% to request volume over a minute). Without a budget, an overloaded provider receives 3× the traffic exactly when it can least handle it.</li>
+<li><strong>Retry at one layer only.</strong> If the SDK, the gateway and the app each make up to three attempts, one failure becomes 27 calls.</li>
+<li><strong>Never retry a stream after tokens reached the user</strong>; mark the message incomplete instead (see <a href="#api-streaming">API Design &amp; Streaming</a>). The gateway can retry transparently only before the first byte is forwarded.</li>
+</ul>
+
+<h3>Timeouts for streaming calls</h3>
+<p>A single total timeout doesn't work for LLMs: a legitimate long answer takes 60 seconds, while a stuck connection also takes 60 seconds. Use separate timeouts:</p>
+<pre><code>connect timeout          2 s     <span class="c">// can't reach the provider</span>
+time-to-first-token     10 s     <span class="c">// chat; much longer for reasoning models that think before emitting</span>
+inter-token (idle)      15–30 s  <span class="c">// stream stalled mid-answer</span>
+total                   by route <span class="c">// e.g. 120 s chat, 15 min agent step, none for batch</span></code></pre>
+<p>Set them per route and per model from observed latency distributions (p99.9 plus margin), not globally.</p>
+
+<h3>Circuit breakers</h3>
+<figure class="dg" data-diagram="gateway-reliability-breaker"></figure>
+<p>A circuit breaker per (provider, model, region) stops sending traffic to a failing backend. When its error rate (or p99 latency) over a rolling window crosses a threshold, it <strong>opens</strong>: requests fail fast and go straight to the fallback, so users don't each wait out a timeout. After a cooldown it goes <strong>half-open</strong> and lets a few probe requests through; success closes it, failure reopens it. Breakers also protect the provider: a struggling backend gets breathing room instead of a retry storm.</p>
+
+<h3>Fallback chains</h3>
+<p>A typical chain, from least to most degraded:</p>
+<ol>
+<li><strong>Same model, another region or cloud.</strong> Many frontier models are served by the model maker and by major clouds (for example, Claude via Anthropic's API, Amazon Bedrock, Google Cloud and Microsoft Foundry). Same weights, so the same prompts and quality.</li>
+<li><strong>Equivalent model from another provider.</strong> Needs portable prompts and a tested eval score.</li>
+<li><strong>Smaller or self-hosted model.</strong> Lower quality; only for routes where that's acceptable.</li>
+<li><strong>Cached or canned response.</strong> A semantic-cache hit, a "we're busy" message with a retry button, or a non-AI fallback path (show search results instead of a generated answer).</li>
+</ol>
+<p>Log every fallback with the reason, and alert when fallback traffic exceeds a threshold: a silent fallback to a weaker model is a quality incident even if availability looks perfect.</p>
+
+<h3>Hedged requests</h3>
+<p>For tail latency, send a second, duplicate request if the first hasn't responded by roughly its p95 latency, and use whichever answers first, cancelling the other. In Google's measurements, hedging after 10 ms cut the 99.9th-percentile latency of a Bigtable benchmark from 1,800 ms to 74 ms while adding only about 2% more requests (<a href="https://research.google/pubs/the-tail-at-scale/">Dean &amp; Barroso, The Tail at Scale</a>). For LLMs, hedging is expensive, because each duplicate pays for prefill and decode, so reserve it for short, cheap, latency-critical calls (classification, routing, guardrail checks, embeddings) and cancel losers immediately.</p>
+
+<h2>Load shedding and graceful degradation</h2>
+<p>When demand exceeds capacity, whether your own GPUs or your provider allowance, something has to give. Decide what in advance:</p>
+<ul>
+<li><strong>Admission control:</strong> reject early (fast <code>429</code>/<code>503</code> with <code>Retry-After</code>) when queue depth or, for self-hosted models, KV-cache utilization crosses a threshold. A fast rejection beats a 90-second timeout.</li>
+<li><strong>Shed by priority:</strong> batch and free-tier traffic first, then lower-value features, protecting the core interactive path.</li>
+<li><strong>Degrade instead of failing:</strong> lower <code>max_tokens</code>, reduce reasoning effort, disable expensive tools (web search), retrieve fewer chunks, or route to a smaller model with a banner. Each degradation is a feature flag you can flip during an incident.</li>
+<li><strong>Queue with honesty:</strong> for non-interactive work, accept into a durable queue and show an estimated completion time.</li>
+</ul>
+
+<h2>Capacity: on-demand vs provisioned</h2>
+<p>On-demand API capacity is shared, so it's subject to rate limits and overload errors when the provider is busy. Major providers and clouds also sell <strong>provisioned or reserved throughput</strong> (dedicated capacity at a fixed price per unit of time), and some offer priority tiers. The decision is a utilization calculation:</p>
+<pre><code>reserved cost per hour  = R
+on-demand cost per hour at the same peak throughput = D   (if fully used)
+break-even utilization  = R / D
+
+if R / D = 0.6: reserve capacity for the baseline you're confident runs above 60% utilization,
+                and spill bursts over to on-demand (with fallbacks for 429s)</code></pre>
+<p>Reserved capacity also buys predictability: guaranteed throughput and steadier latency for your most important route. A common pattern is reserved capacity for the interactive baseline, on-demand for bursts, and the batch API for offline work.</p>
+
+<h2>SLOs and error budgets for LLM features</h2>
+<p>Define service-level indicators that match what users feel, including quality, since an LLM feature can be "up" and still wrong:</p>
+<div class="tbl"><table>
+<thead><tr><th>SLI</th><th>Example SLO</th></tr></thead>
+<tbody>
+<tr><td>Availability: completed responses ÷ attempts (excluding client errors)</td><td>99.9% monthly</td></tr>
+<tr><td>Time to first token, p95</td><td>&lt; 1.5 s for chat</td></tr>
+<tr><td>Inter-token latency, p95</td><td>&lt; 80 ms (≈ 12+ tokens/s, faster than reading)</td></tr>
+<tr><td>End-to-end latency, p95, for synchronous calls</td><td>&lt; 3 s for classification</td></tr>
+<tr><td>Quality: sampled LLM-judge pass rate, schema-valid rate, refusal rate</td><td>≥ 95% pass on sampled traffic; &lt; 1% invalid JSON</td></tr>
+<tr><td>Fallback rate</td><td>&lt; 2% of requests served by a fallback model</td></tr>
+</tbody></table></div>
+<p>A 99.9% monthly availability SLO allows about 43 minutes of failure per 30 days. If your single provider's track record is worse than your target, no amount of retrying fixes it; you need a second independent path. Two providers each available 99.5% of the time give 1 − 0.005² ≈ 99.997% combined, but only if failures are independent (they often share cloud regions or traffic surges), failover is fast, and the fallback is good enough to count as "available." Be honest about those caveats in an interview.</p>
+
+<h2>Security and governance at the gateway</h2>
+<ul>
+<li><strong>Keys:</strong> provider keys in a secret manager, readable only by the gateway; teams get scoped, revocable virtual keys; block direct egress to provider APIs from application networks so the gateway can't be bypassed.</li>
+<li><strong>PII redaction:</strong> detect and mask personal data before it leaves your network when policy requires, and restore placeholders in responses where needed.</li>
+<li><strong>Data residency:</strong> route EU tenants to EU endpoints; enforce it in the router, not in app code.</li>
+<li><strong>Retention:</strong> log metadata always; log prompt and response bodies only where policy allows, with redaction and access controls.</li>
+<li><strong>Budgets:</strong> hard spend caps per key, alerts at 50/80/100%, and anomaly detection on sudden spend spikes (a leaked key or a runaway agent loop).</li>
+</ul>
+
+<h2>Gateways and Reliability in System Design Interviews</h2>
+<h3>When to bring it up</h3>
+<ul>
+<li><strong>Whenever the design calls an external model.</strong> "All model calls go through a gateway that handles keys, token quotas, retries and fallbacks, so the app code stays simple."</li>
+<li><strong>Multi-tenant products.</strong> "Rate limits are per tenant in tokens, with reserve-then-reconcile, because request counts don't reflect cost."</li>
+<li><strong>Availability requirements.</strong> "Our 99.9% target is higher than a single provider's history, so the chain is: same model in a second cloud, then an evaluated alternative model."</li>
+<li><strong>Cost questions.</strong> "The router sends easy requests to a small model, gated by evals."</li>
+</ul>
+<h3>How to introduce it</h3>
+<ol>
+<li>Place the gateway in the high-level diagram between services and providers.</li>
+<li>State the limit dimensions (TPM, concurrency, spend) and the reserve-then-reconcile mechanism.</li>
+<li>Describe the routing policy and how new models are evaluated before routing to them.</li>
+<li>Walk through a failure: error classification, retry budget, breaker, fallback chain, user-visible behavior.</li>
+<li>Close with SLOs, including quality and fallback rate.</li>
+</ol>
+
+<h3>Common deep-dive questions</h3>
+<h4>"Your primary model provider has a regional outage. What happens?"</h4>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Retry until it works</h5><p><span class="lbl">Challenges:</span> users wait for timeouts on every request; retries multiply load on a failing provider; nothing serves users for the length of the outage.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Retry with backoff, then fall back to another provider</h5><p><span class="lbl">Approach:</span> on 5xx, retry twice with jittered backoff; if it still fails, send the request to a second provider's comparable model.</p><p><span class="lbl">Challenges:</span> every request still pays the retry delay before falling back; the fallback's prompt behavior and quality are unknown until the outage.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Breakers, a tested fallback chain, and honest degradation</h5><p><span class="lbl">Approach:</span> per-(provider, model, region) circuit breakers open within seconds based on rolling error rates, so requests skip straight to the fallback with no added latency. The chain prefers the same model hosted in another cloud (same prompts, same quality), then an alternative model whose eval scores on this route are tracked continuously. Retries happen only at the gateway, under a retry budget, and never after tokens reach the user. Capacity for the fallback is pre-arranged (quota on the second provider is requested in advance). Dashboards show fallback rate and quality on fallback traffic; lower-priority features degrade or shed first.</p><p><span class="lbl">Challenges:</span> paying for idle fallback quota; keeping prompt variants and evals current for every model in the chain; cross-provider data agreements.</p></div>
+
+<h4>"Design token-based rate limiting for our public API."</h4>
+<p>Cover: dimensions (input TPM, output TPM, concurrency, daily spend) per key with tier-based limits; a Redis token bucket with an atomic Lua reserve; estimating output from <code>max_tokens</code> and reconciling on completion or cancel; <code>429</code> with <code>Retry-After</code> and rate-limit headers on every response; hierarchical limits (org → key); priority between interactive and batch; how you stay within your own upstream provider limits (AIMD on 429s); and what happens if Redis is unavailable (fail open with local per-instance limits for a short time, or fail closed for free tiers).</p>
+
+<h4>"Users complain that p99 latency is 40 seconds."</h4>
+<p>Break latency down first: queueing at the gateway, TTFT, decode time (output length), tool calls and retries. Typical fixes: per-route timeouts so stuck streams fail fast; breakers so a slow region is skipped; hedging for short calls; capping <code>max_tokens</code> and asking for concise output; routing long-input requests to deployments with prompt caching; and checking whether retries are compounding across layers.</p>
+
+<h2>Summary</h2>
+<ul>
+<li>Put every model call behind a gateway: one place for keys, quotas, routing, reliability, caching, policy and cost tracking.</li>
+<li>Rate-limit in tokens and concurrency, not just requests; reserve input + <code>max_tokens</code> atomically and reconcile on completion.</li>
+<li>Route by rules first, then cascades or learned routers, always behind eval gates; test every fallback model before you need it.</li>
+<li>Classify errors; retry only transient ones, with jittered backoff, a retry budget and at one layer; never after tokens are shown.</li>
+<li>Use separate connect, TTFT, idle and total timeouts; circuit breakers per provider, model and region; hedging only for cheap calls.</li>
+<li>Plan load shedding and degradation in advance, and set SLOs that include quality and fallback rate, not just uptime.</li>
+</ul>
+<p>Related: <a href="#design-llm-gateway">LLM Gateway</a> (full worked example), <a href="#llm-caching">Caching for LLMs</a>, <a href="#api-streaming">API Design &amp; Streaming</a>, <a href="#observability">Observability &amp; LLMOps</a>, and <a href="#design-inference-batching">Inference Batching</a> for admission control on self-hosted GPUs.</p>
+</section>

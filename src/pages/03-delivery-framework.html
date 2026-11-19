@@ -45,9 +45,9 @@
 Prompt per call: 1.5K system + 3K retrieved + 1K history  ≈ 5.5K input tokens
 Output per call                         ≈ 300 tokens
 Daily tokens: 8M × 5.5K = 44B input, 8M × 300 = 2.4B output
-<span class="c"># At $3 / M input and $15 / M output (frontier mid-tier list prices):</span>
-44,000 × $3 + 2,400 × $15 = $132K + $36K ≈ <span class="k">$168K/day</span>  → caching and routing are mandatory
-<span class="c"># Caching the shared system prompt (0.1× reads) and routing easy turns to a small model cut this sharply.</span></code></pre>
+<span class="c"># At $2 / M input and $10 / M output (Sonnet 5.5 list prices, November 2026):</span>
+44,000 × $2 + 2,400 × $10 = $88K + $24K ≈ <span class="k">$112K/day</span> ≈ $0.056 per conversation, ~3× the $0.02 target  → caching and routing are mandatory
+<span class="c"># Caching the shared system prompt (0.05× reads) and routing easy turns to a small model cut this sharply.</span></code></pre>
 <p>That one calculation justifies two deep dives (prompt caching and model routing) and tells you whether self-hosting is worth discussing. For infrastructure prompts, estimate GPU memory instead: weights plus KV cache per token times concurrent tokens (see <a href="#core-concepts">Core Concepts</a>).</p>
 
 <h3>Clarifying questions worth asking</h3>

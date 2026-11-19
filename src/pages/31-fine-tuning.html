@@ -1,0 +1,196 @@
+<section class="page" id="p-fine-tuning" data-title="Fine-tuning &amp; Adaptation" data-kw="fine-tuning fine tune sft supervised lora qlora peft adapters rank preference tuning rlhf ppo dpo grpo rlvr reinforcement fine-tuning distillation synthetic data teacher student embedding fine-tuning reranker hard negatives data pipeline dedup pii contamination fsdp zero adam memory multi-lora s-lora punica catastrophic forgetting model registry rollout continued pretraining">
+<div class="banner" style="--banner:#c79ad6" data-bt="Fine-tuning" data-bs="changing the model, not the prompt"></div>
+<p class="eyebrow">LLM System Design · Core Concepts</p>
+<h1>Fine-tuning &amp; Adaptation</h1>
+<p class="lead">When to change a model's weights instead of its prompt, how SFT, LoRA, preference tuning and distillation work, what the data and training infrastructure look like, and how to serve and roll out many fine-tuned variants safely.</p>
+<hr class="sep">
+
+<p>"Should we fine-tune?" comes up in almost every applied LLM interview, usually as a trap. Candidates who jump to fine-tuning for a knowledge problem, or who can't say what data they'd train on and how they'd know it worked, lose points. Candidates who climb a ladder of cheaper options first, then fine-tune for a specific measurable reason with a real data and eval plan, do well.</p>
+<p>This page covers the decision, the main techniques at the depth an engineer needs, the data pipeline, training memory math, multi-adapter serving, and rollout. It assumes the summary table in the <a href="#core-concepts">Fast Track</a>.</p>
+
+<h2>The adaptation ladder</h2>
+<figure class="dg" data-diagram="fine-tuning-ladder"></figure>
+<div class="tbl"><table>
+<thead><tr><th>Rung</th><th>Changes</th><th>Good for</th><th>Not for</th></tr></thead>
+<tbody>
+<tr><td>Prompting</td><td>Instructions</td><td>Everything, first</td><td>Behavior the model can't follow reliably however you phrase it</td></tr>
+<tr><td>Few-shot / examples</td><td>Demonstrations in context</td><td>Format, tone, edge cases</td><td>Hundreds of examples (context cost every call)</td></tr>
+<tr><td>RAG</td><td>What the model sees</td><td>Private, fresh, large or permissioned <strong>knowledge</strong>; citations</td><td>Style, format, reasoning skill</td></tr>
+<tr><td>SFT (often LoRA)</td><td>Weights, via input→output examples</td><td>Consistent <strong>behavior</strong>: format, tone, domain jargon, tool-call schemas; making a small model do one task well; latency and cost</td><td>Facts that change; tasks without good examples</td></tr>
+<tr><td>Preference / RL tuning</td><td>Weights, via comparisons or rewards</td><td>Subjective quality (helpfulness, style), or tasks with automatic checks (code passes tests, math is correct)</td><td>Teams without solid evals and reward signals</td></tr>
+<tr><td>Continued pre-training</td><td>Weights, via large unlabeled corpora</td><td>New languages, very specialized domains with billions of tokens</td><td>Almost every product team</td></tr>
+</tbody></table></div>
+<div class="callout"><span class="ci"></span><p><strong>Retrieval for knowledge, fine-tuning for behavior.</strong> Fine-tuning is a poor way to teach facts: the model memorizes them unreliably, can't cite them, and goes stale. It's an excellent way to make behavior consistent and to make a small, cheap model do one job as well as a big one.</p></div>
+<p>Valid reasons to fine-tune, in interview language:</p>
+<ul>
+<li><strong>Cost and latency:</strong> "We classify 50M tickets a month; a fine-tuned 8B model matches the frontier model's accuracy on our eval at a small fraction of the cost and a quarter of the latency."</li>
+<li><strong>Consistency:</strong> "The prompt has grown to 6K tokens of rules and examples and still fails 8% of format checks."</li>
+<li><strong>Capability on a narrow task</strong> that prompting can't reach: domain-specific extraction, a proprietary DSL, a tool schema the model keeps getting wrong.</li>
+<li><strong>Deployment constraints:</strong> on-device or air-gapped deployment needs a small open model that must be specialized to be good enough.</li>
+</ul>
+
+<h2>Supervised fine-tuning (SFT)</h2>
+<p>SFT continues training on (input, desired output) pairs with the usual next-token loss, usually computed only on the output tokens. It's the workhorse: instruction tuning, format adherence, style, tool use, and distillation are all SFT underneath.</p>
+<ul>
+<li><strong>Data size:</strong> quality beats quantity. Behavior and format changes often need a few hundred to a few thousand carefully curated examples; the LIMA study got strong instruction following from 1,000 curated examples (<a href="https://arxiv.org/abs/2305.11206">Zhou et al., 2023</a>). Narrow classification or extraction tasks benefit from thousands to tens of thousands.</li>
+<li><strong>Format:</strong> use the model's chat template exactly as it will be used in production, including the system prompt and tool definitions. Training-serving skew in templates is a common silent bug.</li>
+<li><strong>Hyperparameters to name:</strong> learning rate (full fine-tune ~1e-5; LoRA ~1e-4 to 2e-4), 1–3 epochs, sequence packing for efficiency, early stopping on validation loss and task metrics.</li>
+<li><strong>Overfitting signals:</strong> validation loss rising, outputs copying training phrasing verbatim, regression on general benchmarks.</li>
+</ul>
+
+<h2>Parameter-efficient fine-tuning (LoRA and friends)</h2>
+<p>Full fine-tuning updates every weight, which needs a lot of memory and produces a full model copy per variant. <strong>LoRA</strong> freezes the base weights and learns a low-rank update for selected matrices (<a href="https://arxiv.org/abs/2106.09685">Hu et al., 2021</a>):</p>
+<figure class="dg" data-diagram="fine-tuning-lora"></figure>
+<pre><code>W' = W + (α / r) · B · A        W: d × k (frozen)   B: d × r   A: r × k
+trainable parameters per matrix = r × (d + k)</code></pre>
+<p>Worked example, Llama 3 8B (hidden size 4,096, MLP size 14,336, 8 KV heads × 128 = 1,024-dim K and V), rank r = 16 on all seven linear layers in each of 32 blocks:</p>
+<pre><code>q_proj, o_proj   4,096 × 4,096   → 16 × 8,192  = 131,072 each
+k_proj, v_proj   4,096 × 1,024   → 16 × 5,120  =  81,920 each
+gate, up, down   4,096 × 14,336  → 16 × 18,432 = 294,912 each
+per block = 2×131,072 + 2×81,920 + 3×294,912 = 1,310,720
+× 32 blocks ≈ <span class="k">42M trainable parameters</span> (~0.5% of 8B) → ~84 MB adapter in BF16
+same rank on q_proj and v_proj only ≈ 6.8M parameters</code></pre>
+<ul>
+<li><strong>Rank and targets:</strong> r = 8–64 is typical. Targeting all linear layers usually beats attention-only at the same parameter budget.</li>
+<li><strong>Merge or keep separate:</strong> merge B·A into W for zero inference overhead, or keep adapters separate so one base model serves many variants (below).</li>
+<li><strong>Trade-off:</strong> LoRA can underperform full fine-tuning on large knowledge-heavy changes, but it also tends to forget less of the base model's abilities (<a href="https://arxiv.org/abs/2405.09673">Biderman et al., "LoRA Learns Less and Forgets Less", 2024</a>). For most product tasks it is the right default.</li>
+<li><strong>QLoRA</strong> stores the frozen base in 4-bit (NF4) and trains LoRA adapters on top, making it possible to fine-tune a 65B model on a single 48 GB GPU (<a href="https://arxiv.org/abs/2305.14314">Dettmers et al., 2023</a>).</li>
+<li>Other PEFT methods (prefix tuning, prompt tuning, IA³, DoRA) exist; LoRA and QLoRA are what you'll see in practice and are enough to name.</li>
+</ul>
+
+<h2>Preference and reinforcement tuning</h2>
+<p>SFT teaches "produce this output." Preference and RL methods teach "produce outputs that score better," which suits goals that are easier to judge than to demonstrate.</p>
+<div class="tbl"><table>
+<thead><tr><th>Method</th><th>Signal</th><th>How it works</th><th>Practical notes</th></tr></thead>
+<tbody>
+<tr><td>RLHF with PPO</td><td>Human preference pairs</td><td>Train a reward model on comparisons, then optimize the policy against it with PPO and a KL penalty to stay near the SFT model (<a href="https://arxiv.org/abs/2203.02155">Ouyang et al., InstructGPT, 2022</a>)</td><td>Powerful but complex: four models in memory, unstable, reward hacking</td></tr>
+<tr><td>DPO</td><td>Preference pairs (chosen, rejected)</td><td>A closed-form loss that raises the likelihood of chosen over rejected relative to a frozen reference; no reward model, no RL loop (<a href="https://arxiv.org/abs/2305.18290">Rafailov et al., 2023</a>)</td><td>The practical default for product teams; variants relax its requirements: KTO learns from unpaired thumbs up/down, ORPO and SimPO drop the reference model</td></tr>
+<tr><td>RL with verifiable rewards (e.g. GRPO)</td><td>Programmatic checks: tests pass, answer matches, schema validates</td><td>Sample several outputs per prompt, score them, push probability toward above-average ones; GRPO uses the group's mean score as the baseline instead of a value model (<a href="https://arxiv.org/abs/2402.03300">Shao et al., DeepSeekMath, 2024</a>); used at scale for reasoning models (<a href="https://arxiv.org/abs/2501.12948">DeepSeek-R1, 2025</a>)</td><td>Excellent when you can grade automatically; watch for reward hacking (passing tests by special-casing them)</td></tr>
+<tr><td>Hosted "reinforcement fine-tuning"</td><td>Your grader function</td><td>Provider runs the RL loop on their model with your prompts and grader</td><td>Lets product teams use RL without RL infrastructure</td></tr>
+</tbody></table></div>
+<p>Where preference pairs come from in a product: thumbs up/down, users choosing between two drafts, edits (the edited version is "chosen," the original "rejected"), expert reviewers, or an LLM judge calibrated against humans (see <a href="#evaluation">Evaluation</a>).</p>
+
+<h2>Distillation: big model to small model</h2>
+<p>The most common fine-tuning project in industry: a large model does the task well but is too slow or expensive at volume, so you train a small model to imitate it.</p>
+<ol>
+<li><strong>Collect real inputs</strong> from production (with consent and PII handling) or generate realistic synthetic ones.</li>
+<li><strong>Generate teacher outputs</strong> with the large model, using your best prompt, possibly with reasoning, retrieval and self-checks that would be too slow at serving time.</li>
+<li><strong>Filter:</strong> keep outputs that pass validators, tests or a judge; drop low-confidence ones; balance classes and edge cases.</li>
+<li><strong>SFT the student</strong> (often with LoRA); if you control both models, you can also train on the teacher's token probabilities (logit distillation) for a richer signal.</li>
+<li><strong>Evaluate head to head</strong> on a held-out set labeled by humans, not by the teacher, so you measure real quality rather than imitation.</li>
+<li><strong>Route:</strong> serve the student by default and escalate uncertain cases to the teacher (a <a href="#gateway-reliability">cascade</a>).</li>
+</ol>
+<div class="callout warn"><span class="ci w"></span><p>Check the teacher's terms of service before training on its outputs; several providers restrict using outputs to build competing models. Distilling your own or open-weight models avoids the issue.</p></div>
+
+<h2>Fine-tuning retrieval models</h2>
+<p>Often the highest-leverage fine-tune in a RAG system isn't the LLM at all.</p>
+<ul>
+<li><strong>Embedding models:</strong> train contrastively on (query, relevant passage) pairs with in-batch negatives and <em>hard negatives</em> mined from your current retriever (passages that look similar but are wrong). Generate synthetic queries per chunk with an LLM when you lack real ones. Gains on domain jargon and internal acronyms can be large.</li>
+<li><strong>Cost to remember:</strong> a new embedding model means re-embedding the entire corpus and rebuilding the index (see <a href="#numbers-to-know">the 50M-document estimate</a>), plus a dual-index migration.</li>
+<li><strong>Rerankers:</strong> fine-tuning a cross-encoder reranker on (query, passage, label) improves precision <em>without</em> re-indexing, so it's often the cheaper first move.</li>
+<li>Measure with retrieval metrics (recall@k, nDCG) on a frozen labeled set before and after (see <a href="#rag-deep-dive">RAG in Depth</a>).</li>
+</ul>
+
+<h2>The data pipeline</h2>
+<figure class="dg" data-diagram="fine-tuning-pipeline"></figure>
+<ul>
+<li><strong>Collection:</strong> production logs (with user consent and retention policies), expert-written examples, and teacher-generated synthetic data. Log the inputs <em>and</em> the context the model saw, or you can't reproduce examples.</li>
+<li><strong>Labeling:</strong> written guidelines, multiple annotators on a sample to measure agreement, adjudication of disagreements. Low agreement means the task is ambiguous, and no model will fix that.</li>
+<li><strong>Cleaning:</strong> exact and near-duplicate removal (hashing, MinHash), PII detection and scrubbing, toxic or low-quality filtering, license checks.</li>
+<li><strong>Splitting:</strong> a frozen eval set the training pipeline never touches, split by user or document (not by row) to avoid leakage; check n-gram overlap between training data and eval to catch <strong>contamination</strong>.</li>
+<li><strong>Coverage:</strong> include hard and adversarial cases, refusals the model should still make, and negative examples (inputs where the right answer is "none" or "escalate").</li>
+<li><strong>Lineage:</strong> version datasets with content hashes so every model can be traced to the exact data it saw, and so you can honor deletion requests.</li>
+</ul>
+
+<h2>Training infrastructure basics</h2>
+<pre><code>full fine-tune, mixed precision with Adam ≈ 16 bytes per parameter (before activations)
+  2 (BF16 weights) + 2 (BF16 grads) + 4 (FP32 master weights) + 8 (Adam m and v)
+
+7B  → ~112 GB   → a multi-GPU node with sharding
+70B → ~1.1 TB   → multiple nodes with FSDP / ZeRO-3
+LoRA on 8B:   16 GB frozen base + adapter states (~42M × 16 B ≈ 0.7 GB) + activations → one GPU
+QLoRA on 70B: ~35–40 GB 4-bit base + adapters + activations → one 80 GB GPU</code></pre>
+<ul>
+<li><strong>Sharding:</strong> ZeRO stage 1/2/3 (<a href="https://arxiv.org/abs/1910.02054">Rajbhandari et al., 2019</a>) and PyTorch FSDP shard optimizer states, gradients and finally parameters across GPUs, trading communication for memory.</li>
+<li><strong>Activation memory:</strong> grows with batch × sequence length; gradient checkpointing recomputes activations to save memory at ~30% extra compute.</li>
+<li><strong>Tooling:</strong> Hugging Face TRL and PEFT, Axolotl, Unsloth, torchtune for open models; hosted fine-tuning from model providers and clouds for closed models (supported models and methods change often, so check each provider's docs).</li>
+<li><strong>Compute cost:</strong> training FLOPs ≈ 6 × params × training tokens. A LoRA run on 8B with 20M tokens is at most 6 × 8e9 × 2e7 ≈ 1e18 FLOPs (LoRA skips weight gradients for the frozen layers, so closer to ~4×), about an hour on one H100 at ~30% utilization. Fine-tuning compute is rarely the expensive part; data and evals are.</li>
+</ul>
+
+<h2>Serving fine-tuned models</h2>
+<h3>One merged model per variant</h3>
+<p>Simple and fastest per request, but each variant needs its own GPUs. Fine for one or two variants; wasteful for per-customer models.</p>
+<h3>Multi-LoRA serving</h3>
+<figure class="dg" data-diagram="fine-tuning-multilora"></figure>
+<p>Keep one copy of the base model and load small adapters on demand. Requests for different adapters can share a batch using specialized kernels: <strong>Punica</strong> introduced batched multi-adapter kernels (<a href="https://arxiv.org/abs/2310.18547">Chen et al., 2023</a>), and <strong>S-LoRA</strong> showed thousands of adapters served from one GPU with unified paging of adapter weights and KV cache (<a href="https://arxiv.org/abs/2311.03285">Sheng et al., 2023</a>). vLLM and SGLang support multi-LoRA with a configurable number of resident adapters and LRU eviction.</p>
+<ul>
+<li>This makes <strong>per-tenant fine-tunes</strong> economically realistic: a ~100 MB adapter per customer instead of a GPU per customer.</li>
+<li>Route with adapter affinity so hot adapters stay resident, and set a cold-load latency budget (loading a ~100 MB adapter from host memory takes milliseconds; from object storage longer).</li>
+<li>Higher ranks and many distinct adapters per batch add some overhead; measure.</li>
+</ul>
+
+<h2>Evaluation, forgetting and safety</h2>
+<ul>
+<li><strong>Task evals:</strong> the metric you fine-tuned for, on the frozen eval set, compared with the prompted baseline and the teacher.</li>
+<li><strong>Regression evals:</strong> general capability, instruction following, and other tasks the model must still do. Narrow fine-tunes cause <strong>catastrophic forgetting</strong>; mitigate with LoRA, lower learning rates, fewer epochs, and mixing some general data into training.</li>
+<li><strong>Safety evals:</strong> fine-tuning can erode a model's safety behavior, even with benign data (<a href="https://arxiv.org/abs/2310.03693">Qi et al., 2023</a>). Re-run refusal and policy tests on every fine-tuned model.</li>
+<li><strong>Calibration and abstention:</strong> check that the model still says "I don't know" or escalates where it should.</li>
+</ul>
+
+<h2>Versioning and rollout</h2>
+<ul>
+<li><strong>Registry entry per model:</strong> base model and version, adapter, dataset hashes, hyperparameters, training code commit, eval report. Treat it like a build artifact.</li>
+<li><strong>Rollout:</strong> shadow traffic (score without serving), then a small canary, then A/B against the incumbent on online metrics, with instant rollback by routing.</li>
+<li><strong>Base model churn:</strong> hosted base models get deprecated and open models get better every few months. Keep the data pipeline and eval suite reproducible so re-tuning on a new base is a routine job, not a project.</li>
+<li><strong>Continuous improvement:</strong> production failures flow back into the dataset (the <a href="#common-patterns">eval flywheel</a>); retrain on a schedule or when the failure backlog justifies it.</li>
+</ul>
+
+<h2>Fine-tuning in System Design Interviews</h2>
+<h3>When to bring it up</h3>
+<ul>
+<li>When cost or latency of a frontier model is the problem at high volume: "Once we have a few months of labeled traffic, I'd distill this classifier into a small model."</li>
+<li>When behavior is inconsistent despite prompt work: "If the format failure rate stays above our threshold, a LoRA fine-tune on a few thousand corrected examples is the next step."</li>
+<li>When a multi-tenant product needs per-customer behavior: "Per-tenant LoRA adapters on a shared base, served with multi-LoRA batching."</li>
+<li>When retrieval quality is the bottleneck: "Fine-tune the reranker on click and feedback data before touching the generator."</li>
+</ul>
+<h3>When not to</h3>
+<ul>
+<li>The problem is missing or changing knowledge (use RAG).</li>
+<li>There's no eval set to prove improvement.</li>
+<li>You can't get a few hundred high-quality examples.</li>
+<li>Requirements change weekly (prompts iterate in minutes; fine-tunes in days).</li>
+</ul>
+<h3>How to introduce it</h3>
+<ol>
+<li>State the measured gap: which metric, current value, target.</li>
+<li>Show that cheaper rungs were tried or why they can't work.</li>
+<li>Describe the data: source, volume, labeling, cleaning, frozen eval split.</li>
+<li>Pick the method (SFT with LoRA by default; DPO for preferences; RL with verifiable rewards when outputs can be checked automatically) and the base model size.</li>
+<li>Explain serving (merged vs multi-LoRA) and the cost and latency gain.</li>
+<li>Close with evals, regression and safety checks, rollout and the retraining loop.</li>
+</ol>
+
+<h3>Common deep-dive questions</h3>
+<h4>"Our support bot gives outdated policy answers. Should we fine-tune on the policy docs?"</h4>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Fine-tune the model on the policy documents</h5><p><span class="lbl">Challenges:</span> facts are memorized unreliably, can't be cited, and are stale again the next time the policy changes; every update means retraining and re-evaluating.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>RAG over versioned policy documents</h5><p><span class="lbl">Approach:</span> index the policies with version and effective-date metadata, retrieve the current version, require citations.</p><p><span class="lbl">Challenges:</span> answers can still drift in tone or format, and retrieval may miss the right section.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>RAG for knowledge, optional fine-tunes for behavior and retrieval</h5><p><span class="lbl">Approach:</span> RAG with freshness via change events and effective-date filters; fine-tune the reranker on feedback to fix retrieval misses; only if tone or format stays inconsistent, LoRA-tune the generator on approved answers; gate everything on a golden set of policy questions.</p><p><span class="lbl">Challenges:</span> more moving parts; needs ownership of the eval set as policies change.</p></div>
+<h4>How would you serve custom models for 2,000 enterprise customers?</h4>
+<p>Per-customer LoRA adapters on a shared base, multi-LoRA serving with an adapter cache, adapter-affinity routing, per-tenant eval gates before activation, and a fallback to the base model if an adapter fails to load or regresses.</p>
+<h4>How much data do you need?</h4>
+<p>It depends on the task: hundreds to low thousands of curated examples for format and style; thousands to tens of thousands for narrow classification and extraction; far more for new capabilities. Then say how you'd find out: train on increasing subsets and plot the eval metric; stop when it plateaus.</p>
+<h4>How do you know the fine-tune didn't break something else?</h4>
+<p>Regression suite on general capability and other product tasks, safety and refusal tests, shadow traffic comparison, canary with online metrics, and rollback by routing.</p>
+<h4>DPO or RL?</h4>
+<p>DPO when you have preference pairs and subjective goals; RL with verifiable rewards when a program can grade outputs (tests, exact answers, schema checks). Both need SFT first in most pipelines and a strong eval suite to catch reward hacking.</p>
+
+<h2>Summary</h2>
+<ul>
+<li>Climb the ladder: prompting, examples and RAG first; fine-tune when evals show a behavior, cost or latency gap they can't close.</li>
+<li>LoRA is the default: ~0.5% of parameters at r = 16, cheap to train, hot-swappable at serving time.</li>
+<li>Distillation from a big model into a small one is the most common business case.</li>
+<li>Data quality, frozen eval sets and lineage matter more than training tricks.</li>
+<li>Multi-LoRA serving makes per-tenant models practical; registries, regression and safety evals, and canaries make them safe.</li>
+</ul>
+<p>Related: <a href="#evaluation">Evaluation</a> for building the eval sets, <a href="#inference-serving">Inference &amp; Serving</a> for serving engines, and <a href="#rag-deep-dive">RAG in Depth</a> for when retrieval is the better answer.</p>
+</section>

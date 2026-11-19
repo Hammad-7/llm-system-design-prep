@@ -1,0 +1,139 @@
+<section class="page" id="p-design-llm-gateway" data-title="LLM Gateway" data-kw="llm gateway ai gateway proxy litellm portkey envoy virtual keys token budgets rate limiting reserve reconcile routing fallback circuit breaker prompt caching response cache streaming proxy pii redaction audit cost attribution chargeback kafka warehouse hot reload high availability multi-provider">
+<div class="banner" style="--banner:#86c5a8" data-bt="LLM Gateway" data-bs="worked example · AI platform"></div>
+<p class="eyebrow">Question Breakdown · Medium</p>
+<h1>Design an LLM Gateway</h1>
+<p class="lead">An internal platform that every team's LLM traffic flows through: one API across providers, per-team keys and budgets, routing and failover, and a complete record of who spent what. Representative of "design an AI gateway", "design a multi-provider LLM proxy" and "how would you control LLM spend across a company" prompts.</p>
+<hr class="sep">
+
+<h2>Understanding the Problem</h2>
+<p>A company has dozens of teams shipping LLM features. Each one signed up for providers separately, provider API keys live in a dozen repos, nobody knows which team caused last month's bill, one team's batch job hit the shared rate limit and took down another team's chat feature, and when a provider had an outage every feature broke at once. The platform team is asked to build a gateway: a service in the path of every model call that standardizes access, enforces limits, survives provider failures and attributes cost.</p>
+<p>This prompt is popular for founding-engineer and platform roles because it mixes classic distributed-systems problems (rate limiting, high availability, config distribution, event pipelines) with LLM-specific ones: limits measured in tokens rather than requests, responses that stream for a minute, output length you don't know in advance, and provider features such as prompt caching that a careless proxy silently breaks.</p>
+<div class="callout"><span class="ci"></span><p>Open-source and commercial gateways exist (LiteLLM, Portkey, Envoy AI Gateway, Kong AI Gateway, Cloudflare AI Gateway, and the cloud providers' own). Say so, and say what would make you build rather than buy: scale, latency overhead, data-residency rules, or deep integration with internal identity and billing. Then design it, because that's the interview.</p></div>
+
+<h3>Functional Requirements</h3>
+<ol>
+<li>Teams should be able to call any approved model (hosted providers and self-hosted) through one API using a gateway-issued virtual key.</li>
+<li>The platform should enforce per-team token rate limits and spend budgets, and route requests with automatic failover across deployments and providers.</li>
+<li>Every request should be attributed (team, app, model, tokens, cost) and auditable, and admins should be able to change keys, routes and policies without a deploy.</li>
+</ol>
+<p><strong>Below the line:</strong> a prompt registry, an evaluation platform, fine-tuning, and running the model servers themselves (see <a href="#design-inference-batching">Inference Batching Service</a>).</p>
+
+<h3>Non-Functional Requirements</h3>
+<ol>
+<li><strong>Low overhead:</strong> p99 added latency under ~10–20 ms excluding the provider; streaming is never buffered, so time to first token is unchanged.</li>
+<li><strong>Availability:</strong> 99.99%, higher than any single provider. The gateway must not become the single point of failure for every AI feature in the company.</li>
+<li><strong>Scale:</strong> 5K requests/s at peak; at ~10 s average duration, Little's law gives <code>5,000 × 10 s = 50K</code> concurrent connections.</li>
+<li><strong>Accurate accounting:</strong> budgets enforced within a small overrun; usage records complete and deduplicated.</li>
+<li><strong>Security and compliance:</strong> provider credentials never leave the gateway; PII handling, logging and data residency set by policy per team.</li>
+</ol>
+
+<h2>The Set Up</h2>
+<h3>Core Entities</h3>
+<ul>
+<li><strong>Team / App</strong>: owner, cost center, default policies.</li>
+<li><strong>VirtualKey</strong>: hashed secret, team, allowed model aliases, limits, expiry, tags.</li>
+<li><strong>ModelAlias</strong>: a stable name such as <code>chat-default</code> that maps to an ordered, weighted list of deployments.</li>
+<li><strong>Deployment</strong>: provider, region, concrete model ID, credential reference, provider limits, data-retention terms.</li>
+<li><strong>Limit / Budget</strong>: scope (key, app, team), metric (input tokens, output tokens, dollars, concurrency), window.</li>
+<li><strong>UsageRecord</strong>: request ID, key, alias, deployment, input / cached / output tokens, cost, latency, status.</li>
+<li><strong>Policy</strong>: redaction mode, prompt logging level, allowed regions, response caching rules.</li>
+</ul>
+
+<h3>API</h3>
+<pre><code><span class="c">// Data plane: provider-compatible endpoints, so existing SDKs work by changing base URL and key</span>
+POST /v1/chat/completions      <span class="c">// OpenAI-compatible; model = alias or concrete model</span>
+POST /v1/messages              <span class="c">// Anthropic-native passthrough (keeps cache_control, thinking, etc.)</span>
+POST /v1/embeddings
+  Authorization: Bearer vk_live_...
+  X-Request-Id: 7f3c...        <span class="c">// idempotency and tracing</span>
+  X-Gateway-Tags: app=search,env=prod
+  → response headers: x-gateway-deployment, x-ratelimit-remaining-tokens, retry-after
+
+<span class="c">// Control plane</span>
+POST /admin/keys               { team, aliases[], limits }
+PUT  /admin/aliases/{name}     { deployments: [{ id, weight, priority }] }
+PUT  /admin/budgets/{scope}    { metric, limit, window }
+GET  /usage?team=&amp;from=&amp;to=&amp;groupBy=model</code></pre>
+<p>A key design decision hides in the first two lines: <strong>unified schema or native passthrough?</strong> A single OpenAI-style schema makes switching providers easy but forces a lowest common denominator: provider-specific features (Anthropic's <code>cache_control</code> breakpoints, extended thinking, citations; provider-specific structured output options) get lost in translation. The practical answer is both: native passthrough endpoints per provider for teams that need those features, plus a unified endpoint for portable workloads, with translation only where semantics truly match.</p>
+
+<h2>High-Level Design</h2>
+<h3>1) One API across providers with virtual keys</h3>
+<p>The data plane is a fleet of <strong>stateless gateway pods</strong> behind a regional load balancer. On each request a pod hashes the virtual key and looks it up in an in-memory snapshot of configuration (keys, aliases, deployments, policies), so authentication costs microseconds, not a database round trip. Provider credentials come from a secrets manager into pod memory; teams only ever hold virtual keys, which can be rotated, scoped to specific aliases and revoked instantly. The pod resolves the alias to a deployment, translates if needed, and forwards the request over a pooled, warm HTTP/2 connection to the provider.</p>
+
+<h3>2) Budgets, rate limits and routing</h3>
+<p>Every request passes through the same pipeline inside the pod:</p>
+<figure class="dg" data-diagram="design-llm-gateway-pipeline"></figure>
+<ul>
+<li><strong>Reserve, then reconcile.</strong> Output length is unknown up front, so the pod reserves <code>input_tokens + max_tokens</code> against the key's token limits atomically in Redis before forwarding, and refunds the unused part when the response ends. The algorithms (token buckets, sliding windows, reservation) are covered in <a href="#gateway-reliability">Gateways, Routing &amp; Reliability</a>.</li>
+<li><strong>Routing:</strong> pick a deployment for the alias by priority and weight among healthy deployments, steering away from ones near their provider rate limit or with rising latency.</li>
+<li><strong>Fallback:</strong> on a retryable error before any bytes have reached the client, try the next deployment in the alias (deep dive 3).</li>
+</ul>
+
+<h3>3) Attribution, audit and hot-reloaded config</h3>
+<ul>
+<li>When a response finishes, the pod emits a <strong>usage event</strong> (request ID, key, team, alias, deployment, input, cache-write, cache-read and output tokens, latency, status) to Kafka asynchronously. A stream processor prices it with a versioned price table and loads it into the warehouse for dashboards, chargeback and anomaly alerts. Prompt and response bodies, when a policy allows logging them, go to encrypted object storage with retention rules, referenced by request ID.</li>
+<li>Admins change configuration through a <strong>control plane</strong> (admin UI and API backed by a database). It publishes versioned config snapshots that pods pull or receive by watch and swap in atomically, without restarts.</li>
+</ul>
+<figure class="dg" data-diagram="design-llm-gateway-final"></figure>
+
+<h2>Potential Deep Dives</h2>
+<h3>1) How do we enforce token budgets across hundreds of pods?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Count requests per pod in local memory</h5><p><span class="lbl">Challenges:</span> requests are the wrong unit (one request can be 100× another in tokens), and each pod sees only its share of traffic, so the effective limit scales with the number of pods and changes every time the fleet autoscales.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>A central Redis counter, incremented after each response</h5><p><span class="lbl">Approach:</span> after the response completes, add actual tokens to a per-key counter in Redis; reject new requests when the window's total exceeds the limit.</p><p><span class="lbl">Challenges:</span> admission is based on the past. A burst of 200 concurrent long requests all pass the check before any of them finishes, then overshoot the budget together.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Atomic reservation, reconciliation and local leases for hot keys</h5><p><span class="lbl">Approach:</span> a Redis Lua script atomically checks and reserves <code>input + max_tokens</code> per limit in one round trip; the pod reconciles with actual usage on completion and refunds the difference. Reservations carry a TTL so a crashed pod's holds expire. Encourage realistic <code>max_tokens</code> values, since over-reserving throttles a team early. For very hot keys, a pod leases a block of tokens (say 50K) from Redis and spends it locally, returning the remainder, which cuts Redis round trips at the cost of slight imprecision. Dollar budgets (daily, monthly) are enforced separately from per-minute limits, from the priced usage stream, with alerts at 50/80/100%.</p><p>Mirror provider semantics where they matter: Anthropic, for example, doesn't count cache-read input tokens toward its input-tokens-per-minute limit (<a href="https://platform.claude.com/docs/en/api/rate-limits">Claude rate limits</a>), so a gateway that counts them would throttle well-cached workloads for no reason.</p><p><span class="lbl">Challenges:</span> Redis is now on the hot path; decide per limit what happens if it's unavailable (deep dive 6).</p></div>
+
+<h3>2) How do we proxy streams without adding latency?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Buffer the full response, then count, scan and return it</h5><p><span class="lbl">Challenges:</span> destroys streaming: the user waits for the whole generation (often 5–30 s) instead of ~1 s to first token. Also holds every response in memory.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Pass chunks through as they arrive</h5><p><span class="lbl">Approach:</span> an async proxy reads each SSE chunk from the provider and writes it to the client immediately; token counts come from the provider's final usage event.</p><p><span class="lbl">Challenges:</span> intermediate proxies and load balancers often buffer by default; broken streams never deliver the final usage event; client disconnects keep paying for tokens nobody reads.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>A purpose-built streaming data plane</h5><p><span class="lbl">Approach:</span></p><ul><li>An event-loop runtime (Go, Rust, or Envoy with filters) handles 50K mostly idle concurrent streams per region with modest memory; disable response buffering at every hop and flush per chunk.</li><li>Read usage from the provider's final usage event; if the stream breaks, estimate with the model's tokenizer and mark the record estimated.</li><li>Propagate client disconnects as upstream cancellation.</li><li>Keep warm connection pools to each provider so TLS handshakes aren't on the critical path.</li><li>For deploys, drain pods gracefully: stop accepting new requests, let in-flight streams finish (with a cap of a few minutes).</li><li>Any output guardrail scans in sliding windows of the stream rather than blocking on the full response (see <a href="#guardrails-security">Guardrails &amp; Security</a>).</li></ul><p><span class="lbl">Challenges:</span> long-lived connections make load balancing uneven; use least-connections balancing and cap streams per pod.</p></div>
+
+<h3>3) How do retries and fallbacks work?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Retry every failure three times</h5><p><span class="lbl">Challenges:</span> during a provider incident, retries triple the load on a struggling backend and on your own rate limits (a retry storm), and retrying after tokens have streamed sends the client duplicated, contradictory text.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Retry 429 and 5xx with backoff, then a secondary deployment</h5><p><span class="lbl">Approach:</span> exponential backoff with jitter, honoring <code>Retry-After</code>, then fall back to the next deployment in the alias.</p><p><span class="lbl">Challenges:</span> no global cap on retries; no memory of which deployments are unhealthy, so every request rediscovers the outage.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Retry budgets, circuit breakers and eval-gated fallback chains</h5><p><span class="lbl">Approach:</span></p><ul><li>Retry only before the first byte reaches the client; after that, end the stream with an error event and let the application offer "regenerate".</li><li>Cap retries with a <strong>retry budget</strong> (for example, retries may add at most 10% to traffic).</li><li>Track error rates and latency per deployment with <strong>circuit breakers</strong> shared across pods, so traffic shifts away from an unhealthy region within seconds and probes test recovery.</li><li>Prefer the same model in another region or account first (same behavior, same prompt format), then a different provider.</li><li>Allow cross-provider fallback only for aliases whose prompts have been evaluated on both models, because a prompt tuned for one model can degrade quietly on another.</li></ul><p><span class="lbl">Challenges:</span> cross-provider fallback changes cost, behavior and data-processing terms; make it an explicit, per-alias opt-in that the owning team signs off.</p></div>
+
+<h3>4) How do we avoid breaking prompt caching, and when do we cache responses?</h3>
+<p>Provider <a href="#llm-caching">prompt caching</a> is often the largest cost lever a team has, and a gateway can silently destroy it:</p>
+<ul>
+<li><strong>Don't mutate the prefix.</strong> Injecting a timestamp or request ID into the system prompt, reordering tool definitions, or applying non-deterministic redaction changes the bytes and turns every request into a cache miss.</li>
+<li><strong>Preserve provider controls.</strong> Anthropic caching is opt-in through <code>cache_control</code> (a top-level field or per-block breakpoints), which a unified schema must carry through; OpenAI caches automatically for prompts of 1,024 tokens or more and offers a <code>prompt_cache_key</code> to improve hit rates (<a href="https://developers.openai.com/api/docs/guides/prompt-caching">OpenAI prompt caching</a>).</li>
+<li><strong>Route with affinity.</strong> Caches are scoped to an account or organization and often to a region, so spreading one app's traffic across many accounts for rate-limit headroom lowers hit rates. Route by a hash of the stable prefix or a session key so related requests land on the same account and region.</li>
+<li><strong>Record cache tokens separately</strong> (cache writes, cache reads, uncached input) in usage events; otherwise cost attribution is wrong by up to an order of magnitude for heavily cached apps.</li>
+</ul>
+<p><strong>Response caching</strong> at the gateway (returning a stored completion) is a different thing and should be opt-in per alias: exact-match on a hash of tenant plus the full request, only for deterministic workloads such as classification, extraction and embeddings. Semantic caching is riskier and belongs in the application, which knows when two questions really mean the same thing.</p>
+
+<h3>5) How do we handle PII, logging and data residency?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Log every prompt and response in plain text for debugging</h5><p><span class="lbl">Challenges:</span> the gateway becomes the company's largest store of customer PII and secrets, outside any team's data controls.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Redact all traffic inline before it reaches providers</h5><p><span class="lbl">Approach:</span> regex and NER detectors (for example Microsoft Presidio) replace emails, phone numbers and IDs before forwarding.</p><p><span class="lbl">Challenges:</span> adds latency to every call, breaks prompt caching when redaction varies, and degrades quality for tasks that legitimately need the data (a support bot needs the order number).</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Policy tiers per team and route</h5><p><span class="lbl">Approach:</span> each key or app gets a policy: <em>metadata only</em> (default: log usage, not content), <em>redacted logging</em> (content logged after redaction, asynchronously, off the hot path), or <em>redact before provider</em> (for regulated data, using consistent placeholders like <code>&lt;EMAIL_1&gt;</code> that are restored in the output so the prompt stays deterministic). Deployments carry data-processing attributes (region, zero-data-retention agreement), and policies restrict which deployments a request may use, so EU-only data is never routed to a US region, even during fallback.</p><p><span class="lbl">Challenges:</span> detectors miss things; treat redaction as risk reduction, and combine it with retention limits and access controls on stored logs.</p></div>
+
+<h3>6) How do we keep the gateway from becoming a single point of failure?</h3>
+<p>Once every AI feature depends on it, the gateway's availability caps the company's. Design each dependency to degrade rather than fail:</p>
+<div class="tbl"><table>
+<thead><tr><th>Component down</th><th>Behavior</th></tr></thead>
+<tbody>
+<tr><td>A gateway pod or AZ</td><td>Stateless pods across ≥3 AZs per region; the LB health-checks and drains. Clients retry idempotently with the same <code>X-Request-Id</code>.</td></tr>
+<tr><td>A whole region</td><td>Clients use regional endpoints with DNS or anycast failover; each region has its own pods, Redis and Kafka.</td></tr>
+<tr><td>Control plane / config DB</td><td>Pods keep serving from the last-known-good snapshot cached in memory and on local disk. Config changes pause; traffic doesn't.</td></tr>
+<tr><td>Redis (limits)</td><td>Per-limit choice: rate limits <em>fail open</em> to conservative per-pod local limits (degraded accuracy beats an outage); hard dollar caps for risky keys <em>fail closed</em>.</td></tr>
+<tr><td>Kafka (usage)</td><td>Pods buffer usage events to local disk and replay later; consumers dedupe by request ID so replays don't double-count.</td></tr>
+<tr><td>A provider</td><td>Circuit breakers and fallback chains (deep dive 3).</td></tr>
+</tbody></table></div>
+<p><strong>Config hot reload</strong> deserves its own care because a bad config push is the most likely way to take everything down at once. Validate configs against a schema and dry-run route resolution before publishing; publish immutable, versioned snapshots; roll out to canary pods first and watch error rates; swap atomically in each pod; roll back by pointing at the previous version. A bad push then breaks a canary, not the company.</p>
+
+<h3>7) How do we make cost attribution trustworthy?</h3>
+<ul>
+<li><strong>Usage events are the source of truth.</strong> Request-time cost estimates drive budgets; the authoritative cost is computed in the pipeline with a price table that has effective dates, so a price change mid-month is applied correctly and history can be recomputed.</li>
+<li><strong>Exactly-once in effect:</strong> at-least-once delivery from pods plus deduplication by request ID in the warehouse load.</li>
+<li><strong>Tags for chargeback:</strong> team, app, environment and feature tags on keys and headers let finance allocate spend, and let teams see cost per feature, per user or per successful task.</li>
+<li><strong>Reconcile against invoices</strong> monthly; drift reveals missing records or pricing bugs.</li>
+<li><strong>Anomaly alerts:</strong> spend 3× baseline, sudden drop in cache-hit rate, a key used from a new network. Leaked virtual keys are a real risk; short expiries and per-key limits contain the damage. More in <a href="#observability">Observability &amp; LLMOps</a>.</li>
+</ul>
+
+<h2>What is Expected at Each Level?</h2>
+<div class="levels">
+<div><h4>Mid-level</h4>A stateless proxy with virtual keys, provider credentials held centrally, token-based rate limits in Redis, simple retries and fallback, streaming passthrough, and usage logging for cost reports.</div>
+<div><h4>Senior</h4>Reserve-then-reconcile limits, retries only before first byte with circuit breakers, no-buffering streaming, prompt-cache-safe proxying, a Kafka-to-warehouse usage pipeline with dedupe, policy-driven PII handling, and explicit degradation when Redis, config or Kafka fail.</div>
+<div><h4>Staff+</h4>Treats the gateway as company infrastructure: build-vs-buy reasoning, availability higher than any provider, safe config rollout, eval-gated cross-provider fallback, data-residency guarantees through failover, and chargeback that drives teams toward cheaper designs.</div>
+</div>
+</section>

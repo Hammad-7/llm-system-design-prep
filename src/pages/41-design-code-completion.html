@@ -1,0 +1,157 @@
+<section class="page" id="p-design-code-completion" data-title="Copilot-style Autocomplete" data-kw="github copilot cursor tab inline code completion autocomplete ghost text fill in the middle fim neighboring tabs jaccard debounce cancellation latency next edit suggestions acceptance rate prefix cache session affinity">
+<div class="banner" style="--banner:#7fb3d5" data-bt="Code Autocomplete" data-bs="worked example · latency-critical"></div>
+<p class="eyebrow">Question Breakdown · Hard</p>
+<h1>Design Copilot-style Code Autocomplete</h1>
+<p class="lead">Inline "ghost text" code suggestions that appear as a developer types, like GitHub Copilot completions or Cursor Tab. The LLM system design question where the latency budget is measured in hundreds of milliseconds.</p>
+<hr class="sep">
+
+<h2>Understanding the Problem</h2>
+<p>As a developer types in their editor, the tool predicts what comes next (the rest of the line, or the next few lines) and shows it as faint inline text. Tab accepts it; typing anything else dismisses it. Unlike chat or agents, nobody asked for this suggestion: it competes with the developer's own typing, so a suggestion that arrives late or is wrong is worse than none. That inverts the usual LLM trade-offs: <strong>small, fast models beat big, smart ones; latency is a correctness requirement; and the most important decision is often whether to show anything at all.</strong></p>
+<p>It is also a serving problem at enormous request volume. Cursor reports its Tab model handles over 400 million requests per day (<a href="https://cursor.com/blog/tab-rl">Cursor, Improving Cursor Tab with online RL</a>). Each request is small, but there are a lot of them, and most are thrown away before the user sees them.</p>
+
+<h3>Functional Requirements</h3>
+<ol>
+<li>As a developer types, the editor should show inline suggestions (single-line or multi-line) at the cursor, which they can accept fully, accept word by word, or ignore by continuing to type.</li>
+<li>Suggestions should use context from the current file (code before <em>and</em> after the cursor) and from related files in the project.</li>
+<li>The system should be able to suggest the <em>next edit</em> elsewhere in the file, based on the edits the developer just made.</li>
+<li>Organization admins should be able to set policy: enable per org or repo, exclude files from ever being sent, and block suggestions that match public code.</li>
+</ol>
+<p><strong>Below the line:</strong> chat and agent modes (see <a href="#design-claude-code">Design Claude Code</a>), pre-training the model, billing.</p>
+
+<h3>Non-Functional Requirements</h3>
+<ol>
+<li><strong>Latency:</strong> a suggestion visible within ~300 ms (p50) and ~600 ms (p95) of the developer pausing; after that the developer has usually typed on and the suggestion is stale. These are targets, not published figures; quantify them in your interview.</li>
+<li><strong>Never block the editor:</strong> typing must stay fluid; under failure the system shows nothing rather than freezing or showing errors.</li>
+<li><strong>Scale:</strong> ~2M daily active developers, ~1B requests/day, peaks around 3× average during working hours in each region.</li>
+<li><strong>Quality:</strong> measured by acceptance rate and by characters accepted <em>and retained</em> in the code; showing fewer, better suggestions beats showing more.</li>
+<li><strong>Privacy:</strong> code sent only as needed for the request; for business customers, prompts and suggestions are not retained or used for training; excluded files and secrets never leave the machine.</li>
+<li><strong>Cost:</strong> completions are bundled into a per-seat price, so each request must cost a small fraction of a cent.</li>
+</ol>
+
+<h2>The Set Up</h2>
+<h3>Core Entities</h3>
+<ul>
+<li><strong>CompletionRequest</strong>: request id, document URI and language, cursor position, prefix, suffix, context snippets, editor state (single-line vs block position), client settings.</li>
+<li><strong>Suggestion</strong>: text, range to replace, model version, a confidence score, shown and accepted flags.</li>
+<li><strong>ContextSnippet</strong>: source (open tab, recent edit, symbol definition), file path, text, relevance score.</li>
+<li><strong>TelemetryEvent</strong>: shown, accepted (full or partial), rejected, and retained-after-N-seconds, keyed by request id, with no code by default.</li>
+<li><strong>OrgPolicy</strong>: enabled scopes, content exclusions, public-code filter, data retention setting.</li>
+</ul>
+<h3>API</h3>
+<pre><code>POST /v1/completions     <span class="c">// HTTP/2, streamed; one in flight per editor</span>
+{ requestId, language, path,
+  prefix, suffix,                       <span class="c">// code around the cursor (trimmed to budget)</span>
+  snippets: [{ path, text, source }],   <span class="c">// from open tabs, recent edits, symbols</span>
+  mode: "line" | "block", maxTokens }
+→ stream of { textDelta } ... { done, finishReason, suggestionId }
+
+<span class="c">// client cancels by resetting the HTTP/2 stream; the server must free the GPU slot</span>
+POST /v1/telemetry       { suggestionId, event: shown | accepted | partial | rejected | retained, chars }</code></pre>
+
+<h3>Capacity estimate</h3>
+<pre><code>2M developers × 500 requests/day      = 1B requests/day ≈ <span class="k">11.6K req/s avg, ~35K peak</span>
+prompt ≈ 2K tokens, output ≈ 30 tokens (single line ~10, a block ~80)
+
+prefill: 1B × 2K  = 2T tokens/day   ≈ <span class="k">23M tokens/s</span>
+decode:  1B × 30  = 30B tokens/day  ≈ 350K tokens/s
+→ input outweighs output ~70:1. This is a <span class="k">prefill-bound</span> workload.
+
+prefill compute for an assumed 7B-parameter model: 2 × 7e9 FLOP/token
+  23M tok/s × 14 GFLOP = 3.2e17 FLOP/s
+  H100 ≈ 989 TFLOP/s dense BF16; at ~50% utilization ≈ 0.5e15 FLOP/s
+  → ~650 GPUs of prefill at average load with no caching (~3× at peak); ~130 if 80% of prompt tokens hit a prefix cache</code></pre>
+<p>The model size is an assumption for the math; the point is the shape. Consecutive requests from one developer share almost the whole prompt (the file changed by a few characters), so <strong>prefix caching with session-affine routing</strong> is the biggest cost lever, the same idea as in <a href="#llm-caching">Caching for LLMs</a> but at keystroke granularity.</p>
+
+<h2>High-Level Design</h2>
+<h3>1) Showing suggestions as the developer types</h3>
+<p>Most of the latency budget is won or lost in the editor extension, before any network call:</p>
+<figure class="dg" data-diagram="design-code-completion-client"></figure>
+<ul>
+<li><strong>Trigger rules:</strong> request after a short pause in typing, not on every keystroke; skip positions where completions are rarely accepted (middle of an identifier, inside a string literal in some languages) and decide <em>line</em> vs <em>block</em> mode from the cursor position (a block is only worth generating at the start of an empty function body or after a comment).</li>
+<li><strong>Debounce and cancel:</strong> each keystroke resets a timer of a few tens of milliseconds and cancels any in-flight request. Only one request per editor is ever live.</li>
+<li><strong>Typed-through cache:</strong> if the ghost text is <code>return a + b</code> and the developer types <code>ret</code>, keep showing <code>urn a + b</code> without a new request. A small LRU of recent (prompt hash → suggestion) entries also covers backspacing and undo.</li>
+<li><strong>Streaming render:</strong> show the first line as soon as it is complete; extend with later lines as they stream.</li>
+</ul>
+
+<h3>2) Gathering context</h3>
+<p>The model sees a <strong>fill-in-the-middle (FIM)</strong> prompt: the code before the cursor (prefix), the code after it (suffix), and sentinel tokens telling it to generate the middle (<a href="https://arxiv.org/abs/2207.14255">Bavarian et al., Efficient Training of Language Models to Fill in the Middle</a>). Before FIM, Copilot only sent the prefix; GitHub reports FIM gave a 10% relative increase in accepted completions in A/B tests (<a href="https://github.blog/ai-and-ml/github-copilot/how-github-copilot-is-getting-better-at-understanding-your-code/">GitHub blog</a>).</p>
+<figure class="dg" data-diagram="design-code-completion-prompt"></figure>
+<p>Context from other files is added as commented snippets ahead of the prefix. GitHub's "neighboring tabs" technique uses files open in the editor and reported a 5% relative increase in acceptance (same post). A reverse-engineering analysis of an earlier Copilot client found it sliced each open file into fixed-size windows and picked the window with the highest <strong>Jaccard similarity</strong> (set overlap of tokens) to the code near the cursor (<a href="https://thakkarparth007.github.io/copilot-explorer/posts/copilot-internals">copilot-explorer</a>; based on an older build, so treat the details as illustrative). The assembler fills a fixed token budget in priority order: prefix nearest the cursor, suffix, then retrieved snippets, dropping the lowest-value pieces first.</p>
+
+<h3>3) Serving the model</h3>
+<p>Requests go to the nearest region. An edge proxy authenticates, rate limits per user and applies org policy; a router sends each developer's requests to the same GPU replica so their prompt prefix is already in that replica's KV cache; the replica runs a small FIM model with continuous batching. Generation stops early on stop sequences and on structural signals (end of line in line mode; a dedent or closing bracket that ends the block in block mode). A post-processor trims text that duplicates the suffix (the model re-writing the closing brace that already exists) and balances brackets.</p>
+
+<h3>4) Org policy and next-edit suggestions</h3>
+<p>Policy is enforced twice: on the client (excluded paths are never read into a prompt) and at the edge (the server rejects requests for disabled repos). Before tokens leave the server, filters check for secrets and, if the org enabled it, for long matches against an index of public code. Next-edit suggestions reuse the same pipeline with a different prompt (recent edit history) and model, covered in deep dive 4.</p>
+<figure class="dg" data-diagram="design-code-completion-final"></figure>
+
+<h2>Potential Deep Dives</h2>
+<h3>1) How do we hit a ~300 ms budget?</h3>
+<p>One reasonable budget for a single-line suggestion after the developer pauses:</p>
+<div class="tbl"><table>
+<thead><tr><th>Stage</th><th class="num">Budget</th><th>How</th></tr></thead>
+<tbody>
+<tr><td>Debounce</td><td class="num">~50 ms</td><td>Short timer; long enough to skip mid-burst keystrokes</td></tr>
+<tr><td>Context gathering (client)</td><td class="num">≤ 20 ms</td><td>Incremental: snippet windows precomputed per open file, updated on edit</td></tr>
+<tr><td>Network to regional edge</td><td class="num">20–60 ms</td><td>Regional serving; persistent HTTP/2 connection, no TLS handshake per request</td></tr>
+<tr><td>Queue + prefill</td><td class="num">20–50 ms</td><td>Small model; most of the prompt hits the prefix cache</td></tr>
+<tr><td>Decode first line (~15 tokens)</td><td class="num">75–150 ms</td><td>~100–200 tokens/s per stream on a small model</td></tr>
+<tr><td>Post-process + render</td><td class="num">&lt; 10 ms</td><td>Show the first line as soon as it's complete</td></tr>
+<tr><td><strong>Total</strong></td><td class="num"><strong>≈ 200–340 ms</strong></td><td></td></tr>
+</tbody></table></div>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>A frontier chat model, called on every keystroke</h5><p><span class="lbl">Challenges:</span> TTFT alone is often over a second; per-stream decode is slower; cost per request is orders of magnitude too high; and most requests are obsolete before they return.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Small FIM model, debounced requests, streaming, regional serving</h5><p><span class="lbl">Approach:</span> a model trained for FIM on code, served close to users, with client-side debounce and streaming. GitHub reports its custom completions model delivered a 35% latency reduction and 3× token throughput over the previous one (<a href="https://github.blog/ai-and-ml/github-copilot/the-road-to-better-completions-building-a-faster-smarter-github-copilot-with-a-new-custom-model/">GitHub blog</a>).</p><p><span class="lbl">Challenges:</span> cancelled requests still burn GPU time if the server keeps generating; every request re-processes a 2K-token prompt from scratch.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Make cancellation real, make prefill nearly free, make decode speculative</h5><p><span class="lbl">Approach:</span></p>
+<ul>
+<li><strong>End-to-end cancellation:</strong> an HTTP/2 stream reset propagates through the proxy to the inference server, which evicts the sequence from the running batch at the next step. Requests whose deadline has passed are dropped from the queue instead of served.</li>
+<li><strong>Session-affine prefix caching:</strong> consistent hashing on user + file routes consecutive requests to the replica holding their KV cache. Prompt ordering matters: in the usual prefix-suffix-middle order, an edit at the cursor invalidates the cached suffix. The FIM paper's suffix-prefix-middle (SPM) variant puts the suffix first, so as the developer types, the prompt grows by appending and the cache keeps hitting.</li>
+<li><strong>Speculative decoding:</strong> code is repetitive, so drafting tokens by copying from the prompt (n-gram or "prompt lookup" drafting) or from a tiny draft model lets the main model verify several tokens per step. See <a href="#inference-serving">Inference &amp; Serving</a>.</li>
+<li><strong>Load shedding, not queueing:</strong> under overload, return "no suggestion" immediately. A late suggestion has zero value, so a deep queue only wastes GPU time.</li>
+</ul><p><span class="lbl">Challenges:</span> affinity fights load balancing (a hot replica must spill users to others and accept cache misses); speculative decoding gains shrink at high batch sizes.</p></div>
+
+<h3>2) Which context goes into a 2K-token prompt?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Only the text above the cursor in the current file</h5><p><span class="lbl">Challenges:</span> the model can't see the code below (it duplicates closing braces or the next function) or the types and helpers defined in other files, so it invents names.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>FIM prefix and suffix plus similar windows from open tabs</h5><p><span class="lbl">Approach:</span> the setup in the high-level design: Jaccard-ranked windows from open files, added as comments above the prefix.</p><p><span class="lbl">Challenges:</span> open tabs are a weak proxy for relevance; the definition of the function being called is often in a file that isn't open.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Multi-source retrieval with per-source budgets, tuned by acceptance A/B tests</h5><p><span class="lbl">Approach:</span> combine several cheap, local sources: definitions of symbols near the cursor from the language server (signatures of the functions and types being used), recently edited regions (the developer is probably continuing that work), similar windows from open and recently viewed files, and imports. Each source gets a share of the budget, and the assembler drops lowest-scored snippets first. Everything is computed incrementally on the client so it fits in ~20 ms; no repo-wide index is required, though one can be added. The budget split and ranking are tuned by online experiments on acceptance and retained characters, not by intuition.</p><p><span class="lbl">Challenges:</span> more context means more prefill cost per request and more data leaving the machine; each source must respect content exclusions.</p></div>
+
+<h3>3) When should we show nothing?</h3>
+<p>A wrong suggestion costs the developer attention. Cursor's team frames it as an expected-value problem: if a suggestion is accepted with probability <em>p</em>, showing it is only worth it above a threshold, and they trained their model with online reinforcement learning so it makes 21% fewer suggestions with a 28% higher accept rate (<a href="https://cursor.com/blog/tab-rl">Cursor</a>).</p>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Always show whatever the model returns</h5><p><span class="lbl">Challenges:</span> noisy suggestions train developers to ignore the feature; acceptance falls and so does trust.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Heuristics plus a confidence threshold</h5><p><span class="lbl">Approach:</span> suppress in low-value positions; drop suggestions whose mean token log-probability is below a tuned cutoff; drop empty or whitespace-only and suffix-duplicating outputs.</p><p><span class="lbl">Challenges:</span> log-probability is poorly calibrated across languages and contexts.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Learn the show/no-show decision from acceptance data</h5><p><span class="lbl">Approach:</span> either a lightweight classifier on request features (position, language, recent accept history, model confidence) predicting acceptance, or, as Cursor did, train the generator itself with a reward that penalizes shown-and-rejected suggestions so it learns to abstain. Retrain frequently from fresh telemetry.</p><p><span class="lbl">Challenges:</span> training on your own model's shown suggestions is a feedback loop (you only learn about suggestions you showed); keep an exploration slice and evaluate offline before shipping.</p></div>
+
+<h3>4) How do we predict the next edit, not just the next characters?</h3>
+<p>Much of coding is editing: rename a parameter and the call sites need the same change. GitHub's next edit suggestions and Cursor Tab predict both <em>where</em> the next edit is and <em>what</em> it is, using the developer's recent edits as input. GitHub found general-purpose models didn't meet its quality and latency bar and trained a custom model for it (<a href="https://github.blog/ai-and-ml/github-copilot/evolving-github-copilots-next-edit-suggestions-through-custom-model-training/">GitHub blog</a>).</p>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Run the completion model at every candidate location</h5><p><span class="lbl">Challenges:</span> N requests per keystroke, and a completion model has no idea what you just changed.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>A separate edit model fed with recent diffs</h5><p><span class="lbl">Approach:</span> the prompt holds the last few edits as diffs plus a window of the file; the model outputs a rewritten region; the client diffs it against the file and renders the change with a "Tab to jump" affordance.</p><p><span class="lbl">Challenges:</span> two models and two serving stacks to maintain; the edit model's outputs are longer, so latency is higher.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>One model trained on real edit sequences, served on the same stack</h5><p><span class="lbl">Approach:</span> train on (edit history → next edit) pairs mined from real editing sessions with consent, then refine with RL on acceptance. Serve it on the same affinity-routed, prefix-cached fleet; the edit history is append-only, so it caches well. Only show edits within a window around the cursor, and require the region to still match before applying.</p><p><span class="lbl">Challenges:</span> collecting edit data raises privacy questions; edits that jump far away are disorienting, so UX limits matter as much as model quality.</p></div>
+
+<h3>5) How do we serve 35K requests/s cheaply?</h3>
+<ul>
+<li><strong>Regional pools</strong> sized to each region's working-hours peak; follow-the-sun autoscaling, with a floor of warm capacity because model load time is minutes.</li>
+<li><strong>Continuous batching</strong> with short max-token limits keeps per-step latency stable; separate pools for line and block modes keep long block generations from slowing single-line ones.</li>
+<li><strong>Cache hit rate is the cost metric:</strong> track prefix-cache hit rate per replica alongside utilization; rebalance users when a replica's cache thrashes.</li>
+<li><strong>Admission control:</strong> per-user rate limits (a runaway client or script must not consume a replica) and priority for paid tiers.</li>
+<li><strong>Graceful degradation:</strong> on regional failure, fail over to the next region only if its latency is within budget; otherwise show nothing. See <a href="#gateway-reliability">Gateways, Routing &amp; Reliability</a>.</li>
+</ul>
+
+<h3>6) How do we measure quality?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Acceptance rate alone</h5><p><span class="lbl">Challenges:</span> easy to game by showing only trivial suggestions; says nothing about whether accepted code survived.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Acceptance plus retained characters and latency</h5><p><span class="lbl">Approach:</span> track the share of shown suggestions accepted, and characters accepted <em>and still present</em> after some time (GitHub's custom model post reports 20% more accepted-and-retained characters and a 12% higher acceptance rate), alongside p50/p95 latency and cancellation rate.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Offline FIM evals, online A/B with guardrails, and per-segment views</h5><p><span class="lbl">Approach:</span> an offline harness masks spans in held-out repositories (ideally your customers' languages and frameworks, never training data) and scores exact match, whether the result compiles, and whether tests pass, in the style of public infilling and repository-level benchmarks. Every model, prompt or context change then runs as an online A/B with guardrail metrics (latency p95, error rate, cost per request) and is sliced by language, IDE and request type, because an average can hide a regression in one language. See <a href="#evaluation">Evaluation</a>.</p><p><span class="lbl">Challenges:</span> telemetry must not contain code; measure retention with hashes and lengths, not content.</p></div>
+
+<h3>7) How do we meet enterprise privacy requirements?</h3>
+<ul>
+<li><strong>Minimize what leaves the machine:</strong> content exclusions applied client-side; a local secret scanner strips keys and tokens from prompts.</li>
+<li><strong>Zero retention for business tiers:</strong> prompts and suggestions are processed in memory and discarded; logs carry ids, sizes and timings, not code; no training on customer code without opt-in.</li>
+<li><strong>Data residency:</strong> route to in-region pools for customers who require it, which constrains failover options.</li>
+<li><strong>Public-code filter and audit:</strong> optional blocking of suggestions that match public code, and admin-visible usage audit logs. See <a href="#guardrails-security">Guardrails &amp; Security</a>.</li>
+</ul>
+
+<h2>What is Expected at Each Level?</h2>
+<div class="levels">
+<div><h4>Mid-level</h4>Debounced client requests to a hosted model, prefix + suffix prompt, streaming ghost text, a basic latency target. Mentions cancelling stale requests and that a smaller model is needed.</div>
+<div><h4>Senior</h4>A quantified latency budget; FIM and multi-source context with a token budget; real cancellation through to the GPU; capacity math showing the workload is prefill-bound and that session-affine prefix caching is the main lever; acceptance and retained-characters metrics.</div>
+<div><h4>Staff+</h4>Learned show/no-show decisions and the feedback-loop risk; next-edit prediction as a product and model strategy; SPM ordering and speculative decoding; regional capacity planning with load shedding; enterprise privacy and residency trade-offs; an eval program that gates every model and context change.</div>
+</div>
+</section>

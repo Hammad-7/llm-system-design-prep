@@ -4,7 +4,7 @@
 
 I really loved Hello Interview's [system design prep](https://www.hellointerview.com/learn/system-design/in-a-hurry/introduction), and I wanted the same thing for the new kind of interview: designing AI and LLM systems. The thinking is mostly the same (requirements, high-level design, deep dives), but the technical details are different: tokens, KV caches, batching, RAG, agents, evals.
 
-So I put this together (claude did 🤫). It has core concepts, common patterns, four worked designs (ChatGPT, a support assistant, an inference batching service and a coding agent), 55 reported interview questions and a reading list. Feel free to add more if you would like to help others.
+So I put this together (claude did 🤫). It has a fast track (core concepts, key technologies, common patterns), 13 in-depth concept pages (inference and serving, context and memory, vector search, RAG, caching, agents and MCP, evaluation, security, streaming APIs, gateways, observability, fine-tuning, numbers to know), eleven worked designs (ChatGPT, a support assistant, inference batching, a cloud coding agent, Claude Code, Copilot-style autocomplete, a Perplexity-style answer engine, a deep research agent, an LLM gateway, a real-time voice agent and a document extraction pipeline), 58 reported interview questions and a reading list. Feel free to add more if you would like to help others.
 
 Not affiliated with Hello Interview, just a fan.
 
