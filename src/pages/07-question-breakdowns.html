@@ -1,5 +1,5 @@
 <section class="page" id="p-question-breakdowns" data-title="Question Breakdowns" data-kw="worked examples breakdowns how to read solutions">
-<div class="banner" style="--banner:#c79ad6" data-bt="Question Breakdowns" data-bs="eleven interviews, worked end to end"></div>
+<div class="banner" style="--banner:#c79ad6" data-bt="Question Breakdowns" data-bs="twelve interviews, worked end to end"></div>
 <p class="eyebrow">LLM System Design · Fast Track</p>
 <h1>Question Breakdowns</h1>
 <p class="lead">Complete walkthroughs of the most common LLM system design prompts, following the delivery framework from requirements to deep dives, with what's expected at each level.</p>
@@ -25,6 +25,7 @@
 <a class="card2" href="#design-llm-gateway"><span class="tag">Platform · Medium</span><h4>LLM Gateway</h4><p>One front door for every team's model traffic: quotas, routing, fallbacks, streaming proxy, cost attribution.</p></a>
 <a class="card2" href="#design-voice-agent"><span class="tag">Real-time · Hard</span><h4>Real-time Voice Agent</h4><p>Sub-second voice-to-voice: STT, LLM and TTS streaming, turn detection, barge-in, telephony and evals.</p></a>
 <a class="card2" href="#design-doc-extraction"><span class="tag">Pipeline · Medium</span><h4>Document Extraction Pipeline</h4><p>Payslips, IDs and invoices in, validated structured data out: OCR vs vision models, review queues, cost per document.</p></a>
+<a class="card2" href="#design-repo-discovery"><span class="tag">Internal search · Medium</span><h4>Internal Repo Discovery</h4><p>Natural-language search over every company repo with owners and contact: GitHub App sync, webhooks, AI enrichment, cache invalidation.</p></a>
 </div>
 
 <h2>Other prompts you can solve with the same building blocks</h2>
@@ -32,7 +33,8 @@
 <thead><tr><th>Prompt</th><th>Closest breakdown</th><th>What's different</th></tr></thead>
 <tbody>
 <tr><td>Design the OpenAI Playground / a prompt playground</td><td>ChatGPT</td><td>Parameter controls, saved and shared presets, versioned prompts, side-by-side model comparison.</td></tr>
-<tr><td>Design LLM-powered enterprise search</td><td>Support Assistant</td><td>Many connectors (Drive, Slack, Jira), per-document ACL sync, ranking across sources.</td></tr>
+<tr><td>Design an internal developer portal (a Backstage-style service catalog)</td><td>Repo Discovery</td><td>Services, APIs and docs as catalog entities, scorecards, software templates; same sync and ownership problems.</td></tr>
+<tr><td>Design LLM-powered enterprise search</td><td>Support Assistant + Repo Discovery</td><td>Many connectors (Drive, Slack, Jira), per-document ACL sync, ranking across sources.</td></tr>
 <tr><td>Design a high-concurrency LLM inference API</td><td>Inference Batching</td><td>Multi-model routing, per-key token rate limits, streaming, KV-aware load balancing.</td></tr>
 <tr><td>Design ChatGPT's memory feature</td><td>ChatGPT + <a href="#context-engineering">Context Engineering</a></td><td>Extraction pipeline, user-visible memory store, relevance retrieval, deletion and privacy.</td></tr>
 <tr><td>Design Cursor / Windsurf (an AI IDE)</td><td>Claude Code + Autocomplete</td><td>Both latency regimes in one product: tab completions plus an agent mode; codebase indexing on the server, privacy modes.</td></tr>

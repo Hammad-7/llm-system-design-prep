@@ -1,7 +1,7 @@
 (function(){
 "use strict";
 var NS="http://www.w3.org/2000/svg";
-var ORDER=["introduction","how-to-prepare","delivery-framework","core-concepts","key-technologies","common-patterns","question-breakdowns","inference-serving","context-engineering","vector-search","rag-deep-dive","llm-caching","agents-tool-use","evaluation","guardrails-security","api-streaming","gateway-reliability","observability","fine-tuning","numbers-to-know","design-chatgpt","design-support-assistant","design-inference-batching","design-coding-agent","design-claude-code","design-code-completion","design-answer-engine","design-deep-research","design-llm-gateway","design-voice-agent","design-doc-extraction","question-bank","resources"];
+var ORDER=["introduction","how-to-prepare","delivery-framework","core-concepts","key-technologies","common-patterns","question-breakdowns","inference-serving","context-engineering","vector-search","rag-deep-dive","llm-caching","agents-tool-use","evaluation","guardrails-security","api-streaming","gateway-reliability","observability","fine-tuning","numbers-to-know","design-chatgpt","design-support-assistant","design-inference-batching","design-coding-agent","design-claude-code","design-code-completion","design-answer-engine","design-deep-research","design-llm-gateway","design-voice-agent","design-doc-extraction","design-repo-discovery","question-bank","resources"];
 function $(s,r){return (r||document).querySelector(s)}
 function $$(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s))}
 function el(tag,attrs,parent){var e=document.createElementNS(NS,tag);for(var k in attrs){if(attrs[k]!==undefined&&attrs[k]!==null)e.setAttribute(k,attrs[k])}if(parent)parent.appendChild(e);return e}

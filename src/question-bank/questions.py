@@ -26,6 +26,7 @@ Q=[
 ("Design a multi-tenant ChatGPT-like service with reusable presets","product","h","OpenAI","ph","Tenant isolation, quotas, preset storage, auditability",None),
 ("Design a RAG system for a customer-support chatbot","rag","m","Common","kd","Hybrid retrieval, citations, actions, escalation, eval","#design-support-assistant"),
 ("Design an LLM-powered enterprise search system","rag","h","OpenAI","dg","Connectors, permission-aware indexing, ranking, freshness",None),
+("Make every repo in the company searchable in natural language, with owners people can contact","rag","m","Common",None,"GitHub sync via webhooks, AI enrichment, hybrid search, ownership, cache invalidation","#design-repo-discovery"),
 ("Design a RAG system with evaluation over a private corpus","rag","m","OpenAI","ph","Chunking, retrieval metrics, faithfulness, regression gates",None),
 ("Design a document Q&A assistant","rag","e","Common","fg","Ingestion, chunking, embeddings, citations",None),
 ("Design a Perplexity-style real-time answer engine","rag","h","Common","fg","Web search, crawling, freshness, source ranking, latency","#design-answer-engine"),

@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LLM System Design Prep</title>
-<meta name="description" content="A free study guide for system design interviews about LLM-powered applications: concepts, patterns, in-depth concept pages, eleven worked examples and a 58-question bank.">
+<meta name="description" content="A free study guide for system design interviews about LLM-powered applications: concepts, patterns, in-depth concept pages, twelve worked examples and a 59-question bank.">
 <meta property="og:type" content="website">
 <meta property="og:title" content="LLM System Design Prep">
-<meta property="og:description" content="A free study guide for system design interviews about LLM-powered applications: concepts, patterns, in-depth concept pages, eleven worked examples and a 58-question bank.">
+<meta property="og:description" content="A free study guide for system design interviews about LLM-powered applications: concepts, patterns, in-depth concept pages, twelve worked examples and a 59-question bank.">
 <meta name="twitter:card" content="summary">
 <meta name="google-site-verification" content="QjppQVr9rlSMkX013JvLey2Cv8x0jQ9dMCxetO4wtEo">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -351,6 +351,7 @@ a.card2:hover{border-color:var(--accent);background:var(--accent-soft)}
         <li><a href="#design-llm-gateway"><span class="dot"></span>LLM Gateway</a></li>
         <li><a href="#design-voice-agent"><span class="dot"></span>Real-time Voice Agent</a></li>
         <li><a href="#design-doc-extraction"><span class="dot"></span>Document Extraction Pipeline</a></li>
+        <li><a href="#design-repo-discovery"><span class="dot"></span>Internal Repo Discovery</a></li>
       </ul>
     </div>
     <div class="grp" data-grp="practice">
@@ -373,7 +374,7 @@ a.card2:hover{border-color:var(--accent);background:var(--accent-soft)}
 <p>A few years ago the canonical system design prompt was "Design YouTube." Today a growing share of loops open with "Design ChatGPT," "Design a support bot over our knowledge base," or "Design an inference batching service." Prep companies now report that LLM infrastructure prompts have spread beyond ML roles into general software engineering loops (<a href="https://www.aced.io/blog/system-design-interview-guide">Aced (formerly Exponent), 2026</a>), and practitioner guides describe "design an LLM-based system for X" as the most common ML system design question of 2026 (<a href="https://www.techinterview.org/post/3233474925/ml-engineer-interview-post-llm-era/">techinterview.org</a>).</p>
 <p>This guide works backwards from those interviews. It keeps the bones of a classic system design interview (requirements, APIs, data, scale) and adds the parts that are new when one of your components is a probabilistic, expensive, GPU-bound text generator. It's useful for two reasons:</p>
 <ol>
-<li>If your interview is soon, you get the highest-leverage material first: a delivery framework, the concepts that come up every time, and eleven fully worked examples.</li>
+<li>If your interview is soon, you get the highest-leverage material first: a delivery framework, the concepts that come up every time, and twelve fully worked examples.</li>
 <li>If you build LLM features at work, everything here maps to real production decisions. Nothing is interview theater.</li>
 </ol>
 
@@ -456,13 +457,13 @@ a.card2:hover{border-color:var(--accent);background:var(--accent-soft)}
 <li><a href="#delivery-framework">Delivery Framework</a> is the step-by-step structure you'll use in the room, adapted for LLM systems.</li>
 <li><a href="#core-concepts">Core Concepts</a>, <a href="#key-technologies">Key Technologies</a> and <a href="#common-patterns">Common Patterns</a> are the building blocks every answer reuses.</li>
 <li>The <strong>Core Concepts</strong> group in the sidebar goes deep where the Fast Track stays brief: one page each on <a href="#inference-serving">inference and serving</a>, <a href="#context-engineering">context and memory</a>, <a href="#vector-search">vector search</a>, <a href="#rag-deep-dive">RAG</a>, <a href="#llm-caching">caching</a>, <a href="#agents-tool-use">agents and MCP</a>, <a href="#evaluation">evaluation</a>, <a href="#guardrails-security">security</a>, <a href="#api-streaming">streaming APIs</a>, <a href="#gateway-reliability">gateways and reliability</a>, <a href="#observability">observability</a>, <a href="#fine-tuning">fine-tuning</a> and the <a href="#numbers-to-know">numbers to know</a>. Use them when an interview leans on a topic, or when a breakdown mentions something you can't yet explain.</li>
-<li><a href="#question-breakdowns">Question Breakdowns</a> walks through eleven complete interviews, from ChatGPT to <a href="#design-claude-code">Claude Code</a>, with Bad / Good / Great options for each deep dive.</li>
+<li><a href="#question-breakdowns">Question Breakdowns</a> walks through twelve complete interviews, from ChatGPT to <a href="#design-claude-code">Claude Code</a>, with Bad / Good / Great options for each deep dive.</li>
 <li>The <a href="#question-bank">Question Bank</a> has 55+ prompts to practice cold, filterable by type and difficulty.</li>
 </ul>
 <p>Short on time? Read the Delivery Framework, the Core Concepts sections on inference, RAG and evaluation, and the ChatGPT and Support Assistant breakdowns. That covers the majority of what gets asked.</p>
 <div class="callout info"><span class="ci"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-3.6 10.8c.6.5 1 1.2 1 2V16h5.2v-.2c0-.8.4-1.5 1-2A6 6 0 0 0 12 3z"/></svg></span><span class="ct">Which deep dives for which role?</span><ul>
 <li><strong>AI / full-stack AI developer:</strong> <a href="#rag-deep-dive">RAG in Depth</a>, <a href="#api-streaming">API Design &amp; Streaming</a>, <a href="#context-engineering">Context Engineering</a>, <a href="#evaluation">Evaluation</a>; breakdowns: ChatGPT, Support Assistant, Answer Engine.</li>
-<li><strong>Founding engineer:</strong> <a href="#numbers-to-know">Numbers to Know</a> (cost math), <a href="#gateway-reliability">Gateways &amp; Reliability</a>, <a href="#agents-tool-use">Agents</a>, <a href="#observability">Observability</a>; breakdowns: Claude Code, Document Extraction, LLM Gateway.</li>
+<li><strong>Founding engineer:</strong> <a href="#numbers-to-know">Numbers to Know</a> (cost math), <a href="#gateway-reliability">Gateways &amp; Reliability</a>, <a href="#agents-tool-use">Agents</a>, <a href="#observability">Observability</a>; breakdowns: Claude Code, Document Extraction, LLM Gateway, Repo Discovery.</li>
 <li><strong>AI solutions engineer:</strong> <a href="#rag-deep-dive">RAG</a>, <a href="#guardrails-security">Guardrails &amp; Security</a>, <a href="#fine-tuning">Fine-tuning</a> (when not to), <a href="#evaluation">Evaluation</a>; breakdowns: Support Assistant, Voice Agent, Document Extraction.</li>
 <li><strong>Frontier-lab or infra roles:</strong> <a href="#inference-serving">Inference &amp; Serving</a>, <a href="#llm-caching">Caching</a>, <a href="#numbers-to-know">Numbers to Know</a>; breakdowns: Inference Batching, LLM Gateway, Deep Research.</li>
 </ul></div>
@@ -1230,7 +1231,7 @@ Llama 3 8B (32 layers): ≈ <span class="k">128 KB per token</span></code></pre>
 <p class="src">Deep dive: <a href="#guardrails-security">Guardrails &amp; Security</a> · <a href="#gateway-reliability">Gateways, Routing &amp; Reliability</a></p>
 </section>
 <section class="page" id="p-question-breakdowns" data-title="Question Breakdowns" data-kw="worked examples breakdowns how to read solutions">
-<div class="banner" style="--banner:#c79ad6" data-bt="Question Breakdowns" data-bs="eleven interviews, worked end to end"></div>
+<div class="banner" style="--banner:#c79ad6" data-bt="Question Breakdowns" data-bs="twelve interviews, worked end to end"></div>
 <p class="eyebrow">LLM System Design · Fast Track</p>
 <h1>Question Breakdowns</h1>
 <p class="lead">Complete walkthroughs of the most common LLM system design prompts, following the delivery framework from requirements to deep dives, with what's expected at each level.</p>
@@ -1256,6 +1257,7 @@ Llama 3 8B (32 layers): ≈ <span class="k">128 KB per token</span></code></pre>
 <a class="card2" href="#design-llm-gateway"><span class="tag">Platform · Medium</span><h4>LLM Gateway</h4><p>One front door for every team's model traffic: quotas, routing, fallbacks, streaming proxy, cost attribution.</p></a>
 <a class="card2" href="#design-voice-agent"><span class="tag">Real-time · Hard</span><h4>Real-time Voice Agent</h4><p>Sub-second voice-to-voice: STT, LLM and TTS streaming, turn detection, barge-in, telephony and evals.</p></a>
 <a class="card2" href="#design-doc-extraction"><span class="tag">Pipeline · Medium</span><h4>Document Extraction Pipeline</h4><p>Payslips, IDs and invoices in, validated structured data out: OCR vs vision models, review queues, cost per document.</p></a>
+<a class="card2" href="#design-repo-discovery"><span class="tag">Internal search · Medium</span><h4>Internal Repo Discovery</h4><p>Natural-language search over every company repo with owners and contact: GitHub App sync, webhooks, AI enrichment, cache invalidation.</p></a>
 </div>
 
 <h2>Other prompts you can solve with the same building blocks</h2>
@@ -1263,7 +1265,8 @@ Llama 3 8B (32 layers): ≈ <span class="k">128 KB per token</span></code></pre>
 <thead><tr><th>Prompt</th><th>Closest breakdown</th><th>What's different</th></tr></thead>
 <tbody>
 <tr><td>Design the OpenAI Playground / a prompt playground</td><td>ChatGPT</td><td>Parameter controls, saved and shared presets, versioned prompts, side-by-side model comparison.</td></tr>
-<tr><td>Design LLM-powered enterprise search</td><td>Support Assistant</td><td>Many connectors (Drive, Slack, Jira), per-document ACL sync, ranking across sources.</td></tr>
+<tr><td>Design an internal developer portal (a Backstage-style service catalog)</td><td>Repo Discovery</td><td>Services, APIs and docs as catalog entities, scorecards, software templates; same sync and ownership problems.</td></tr>
+<tr><td>Design LLM-powered enterprise search</td><td>Support Assistant + Repo Discovery</td><td>Many connectors (Drive, Slack, Jira), per-document ACL sync, ranking across sources.</td></tr>
 <tr><td>Design a high-concurrency LLM inference API</td><td>Inference Batching</td><td>Multi-model routing, per-key token rate limits, streaming, KV-aware load balancing.</td></tr>
 <tr><td>Design ChatGPT's memory feature</td><td>ChatGPT + <a href="#context-engineering">Context Engineering</a></td><td>Extraction pipeline, user-visible memory store, relevance retrieval, deletion and privacy.</td></tr>
 <tr><td>Design Cursor / Windsurf (an AI IDE)</td><td>Claude Code + Autocomplete</td><td>Both latency regimes in one product: tab completions plus an agent mode; codebase indexing on the server, privacy modes.</td></tr>
@@ -1738,7 +1741,7 @@ POST /runs/{id}/cancel</code></pre>
 </div>
 </section>
 <section class="page" id="p-question-bank" data-title="Question Bank" data-kw="practice questions list prompts openai anthropic google xai salesforce cohere">
-<div class="banner" style="--banner:#86c5a8" data-bt="Question Bank" data-bs="58 prompts to practice cold"></div>
+<div class="banner" style="--banner:#86c5a8" data-bt="Question Bank" data-bs="59 prompts to practice cold"></div>
 <p class="eyebrow">Practice</p>
 <h1>Question Bank</h1>
 <p class="lead">LLM system design prompts reported by candidates at AI labs, big tech and AI startups, plus the common prompts practitioner guides see most. Filter by type and difficulty, set a 45-minute timer, and go.</p>
@@ -1772,6 +1775,7 @@ POST /runs/{id}/cancel</code></pre>
 <tr data-cat="product" data-lvl="h"><td>Design a multi-tenant ChatGPT-like service with reusable presets</td><td>LLM product</td><td><span class="lvl h">Hard</span></td><td>OpenAI <a href="https://prachub.com/companies/openai/categories/system-design" title="source">(PracHub)</a></td><td>Tenant isolation, quotas, preset storage, auditability</td></tr>
 <tr data-cat="rag" data-lvl="m"><td><a href="#design-support-assistant">Design a RAG system for a customer-support chatbot</a></td><td>Retrieval</td><td><span class="lvl m">Medium</span></td><td>Common <a href="https://www.kdnuggets.com/how-to-answer-ai-system-design-interview-questions" title="source">(KDnuggets)</a></td><td>Hybrid retrieval, citations, actions, escalation, eval</td></tr>
 <tr data-cat="rag" data-lvl="h"><td>Design an LLM-powered enterprise search system</td><td>Retrieval</td><td><span class="lvl h">Hard</span></td><td>OpenAI <a href="https://www.designgurus.io/answers/detail/what-to-expect-in-the-openai-system-design-interview" title="source">(DesignGurus)</a></td><td>Connectors, permission-aware indexing, ranking, freshness</td></tr>
+<tr data-cat="rag" data-lvl="m"><td><a href="#design-repo-discovery">Make every repo in the company searchable in natural language, with owners people can contact</a></td><td>Retrieval</td><td><span class="lvl m">Medium</span></td><td>Common</td><td>GitHub sync via webhooks, AI enrichment, hybrid search, ownership, cache invalidation</td></tr>
 <tr data-cat="rag" data-lvl="m"><td>Design a RAG system with evaluation over a private corpus</td><td>Retrieval</td><td><span class="lvl m">Medium</span></td><td>OpenAI <a href="https://prachub.com/companies/openai/categories/system-design" title="source">(PracHub)</a></td><td>Chunking, retrieval metrics, faithfulness, regression gates</td></tr>
 <tr data-cat="rag" data-lvl="e"><td>Design a document Q&amp;A assistant</td><td>Retrieval</td><td><span class="lvl e">Easy</span></td><td>Common <a href="https://github.com/alexeygrigorev/ai-engineering-field-guide/blob/main/interview/questions/04-ai-system-design.md" title="source">(AI Eng. Field Guide)</a></td><td>Ingestion, chunking, embeddings, citations</td></tr>
 <tr data-cat="rag" data-lvl="h"><td><a href="#design-answer-engine">Design a Perplexity-style real-time answer engine</a></td><td>Retrieval</td><td><span class="lvl h">Hard</span></td><td>Common <a href="https://github.com/alexeygrigorev/ai-engineering-field-guide/blob/main/interview/questions/04-ai-system-design.md" title="source">(AI Eng. Field Guide)</a></td><td>Web search, crawling, freshness, source ranking, latency</td></tr>
@@ -6243,6 +6247,250 @@ storage: 1M docs × ~1 MB ≈ 1 TB / month → lifecycle to cold storage, delete
 <div><h4>Staff+</h4>Frames auto-accept rate at a fixed precision as the business metric and designs the system around moving it safely; audit sampling of auto-accepted cases, per-model thresholds and gated rollouts, data residency and deletion across eval sets, review workforce capacity planning, and fraud detection as a separate signal pipeline.</div>
 </div>
 </section>
+<section class="page" id="p-design-repo-discovery" data-title="Internal Repo Discovery" data-kw="internal repo discovery repository catalog developer portal backstage github app webhooks service account installation token rate limit graphql etag reconciliation natural language search hybrid search bm25 embeddings query parsing rerank llm summaries enrichment codeowners catalog-info custom properties ownership owners contact slack sso identity-aware proxy remote cache invalidation outbox authorization acl">
+<div class="banner" style="--banner:#86c5a8" data-bt="Repo Discovery" data-bs="worked example · internal search"></div>
+<p class="eyebrow">Question Breakdown · Medium</p>
+<h1>Design an Internal Repo Discovery Service</h1>
+<p class="lead">A company-wide portal where any employee, remote or on site, can search the company's GitHub repositories in natural language, read what each one does, see who owns it, and contact the owners to use or contribute to it. Representative of "design an internal developer portal", "make our repos discoverable" and "LLM-powered enterprise search" prompts.</p>
+<hr class="sep">
+
+<h2>Understanding the Problem</h2>
+<p>A company has a few GitHub organizations with tens of thousands of repositories. Nobody knows what exists. An engineer who needs to send SMS from a new service either builds it again or asks around in Slack until someone remembers that <code>notify-gateway</code> does exactly that, and that the person who wrote it left last year. The company wants one place where you type "is there something that sends text messages to customers?", get the right repo with a short explanation of what it does and how to use it, see the owning team and the people to talk to, and send them a message in one click.</p>
+<p>It looks like the <a href="#design-support-assistant">support RAG assistant</a>, but the corpus is small and the read traffic is tiny. Three things make it a real design problem:</p>
+<ul>
+<li><strong>The data lives in a system you don't own.</strong> GitHub is the source of truth. You keep a derived copy in sync through webhooks and API calls, within GitHub's rate limits, and webhooks can be missed, duplicated or arrive out of order.</li>
+<li><strong>Ownership is the most valuable field and the least reliable one.</strong> CODEOWNERS files are missing or stale, teams get reorganized, people leave. Showing a departed engineer as the owner is worse than showing nothing.</li>
+<li><strong>Most repos describe themselves badly.</strong> Empty READMEs, names like <code>svc-2</code>, no topics. Natural-language search only works if something reads the code and writes the description the author never did. That's where the LLM earns its place.</li>
+</ul>
+<div class="callout"><span class="ci"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-3.6 10.8c.6.5 1 1.2 1 2V16h5.2v-.2c0-.8.4-1.5 1-2A6 6 0 0 0 12 3z"/></svg></span><p>The interviewer is usually testing whether you <strong>put the LLM on the write path, not the read path</strong>. Summarizing 50K repos once (and again only when they change) is cheap and makes search fast and good. Calling a big model on every search is slow, expensive, and doesn't fix the underlying problem: the index has nothing useful to match against.</p></div>
+
+<h3>Functional Requirements</h3>
+<ol>
+<li>Employees should be able to search repositories with natural-language questions or keywords, and narrow results by language, team, status (active, deprecated, archived) and recency.</li>
+<li>Employees should be able to open a repo page showing what it does, its tech stack, how to use it, recent activity, docs links and related repos.</li>
+<li>Employees should see each repo's owners (team and people) and be able to contact them with an intent: "I want to use this", "I want to contribute", or a question.</li>
+<li>The catalog should stay in sync with GitHub: new, renamed, transferred, archived and deleted repos, and changes to READMEs and ownership files, appear within minutes.</li>
+</ol>
+<p><strong>Below the line:</strong> full-text code search across every file (integrate GitHub code search or Sourcegraph rather than rebuilding it), per-user repository authorization (designed for now, added later in deep dive 7), a "chat with this repo" assistant, and dependency graphs between services.</p>
+
+<h3>Non-Functional Requirements</h3>
+<ol>
+<li><strong>Scale:</strong> 20K employees, 50K repos across several GitHub orgs (about 15K active), growing 20% a year.</li>
+<li><strong>Latency:</strong> search p95 under ~800 ms including natural-language parsing; repo pages under ~300 ms.</li>
+<li><strong>Freshness:</strong> metadata changes (new, renamed, archived, deleted) searchable within 2 minutes at p95; regenerated AI summaries within 15 minutes of a README or manifest change; a departed employee removed from owner cards within an hour.</li>
+<li><strong>Availability:</strong> 99.9% for search and repo pages; reads keep working, with a staleness banner, when GitHub or the model provider is down.</li>
+<li><strong>Access:</strong> every employee, from the office, home or a hotel, through company SSO, with no VPN requirement. Nobody outside the company.</li>
+<li><strong>Cost and limits:</strong> stay well inside GitHub API rate limits, including during the initial backfill and org-wide change storms.</li>
+</ol>
+
+<h3>Back-of-the-envelope</h3>
+<pre><code><span class="c">// Reads</span>
+20K employees × ~40% weekly active × ~5 searches/week ≈ 40K searches/week
+  ≈ 8K/day on busy days, peak ~<span class="k">5 QPS</span>; repo page views about the same
+
+<span class="c">// Writes (from GitHub)</span>
+50K repos; ~30K pushes/day to default branches ≈ 0.35/s avg, bursts of 10+/s
+only pushes touching watched files (README, CODEOWNERS, manifests) matter: ~5%
+
+<span class="c">// Index size</span>
+50K repos × (1 profile + ~8 doc chunks)  ≈ 450K vectors
+450K vectors × 1,024 dims × 4 B          ≈ <span class="k">1.8 GB</span>
+plus a few GB of BM25 text: one search node, 2–3 replicas for availability</code></pre>
+<div class="callout"><span class="ci"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-3.6 10.8c.6.5 1 1.2 1 2V16h5.2v-.2c0-.8.4-1.5 1-2A6 6 0 0 0 12 3z"/></svg></span><p>Say this out loud: "Read QPS is tiny and the index fits on one machine. I won't spend time sharding search. The hard parts are keeping a derived copy of GitHub correct, getting ownership right, and making badly documented repos findable." Interviewers reward candidates who notice that the scaling problem here is <strong>correctness and freshness</strong>, not throughput.</p></div>
+
+<h2>The Set Up</h2>
+<h3>Core Entities</h3>
+<ul>
+<li><strong>Repo</strong>: keyed by GitHub's numeric repository ID (stable across renames and transfers), plus org, name, description, topics, visibility, archived flag, default branch, languages, last push time, custom properties, and the content hashes of the files we index.</li>
+<li><strong>Repo profile</strong>: the AI-generated card: one-line purpose, summary, tech stack, how to use it, inferred status, plus the hashes, model and prompt version it was generated from.</li>
+<li><strong>Ownership claim</strong>: (repo, principal, source, confidence, last verified). A repo has several claims from different sources; a resolver picks what to show.</li>
+<li><strong>Person</strong> and <strong>Team</strong>: employee ID, GitHub login, email, Slack ID, manager, active flag; team with members and a Slack channel. Synced from the identity provider and HR system, not from GitHub alone.</li>
+<li><strong>Contact request</strong>: requester, repo, intent, message, routed-to, status, response time.</li>
+</ul>
+<div class="callout warn"><span class="ci"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 2 20h20L12 3z"/><path d="M12 10v4M12 17.5v.5"/></svg></span><p>Key everything by the repository's numeric ID, never by <code>org/name</code>. Repos get renamed and transferred between orgs all the time; a name-keyed catalog ends up with duplicates, broken links and owner data attached to the wrong repo.</p></div>
+
+<h3>API</h3>
+<pre><code>GET  /search?q=…&amp;lang=&amp;team=&amp;status=&amp;cursor=
+     → { parsed: { filters, text },
+         results: [{ repoId, name, purpose, owners[], why, score }], nextCursor }
+GET  /repos/{id}           → { repo, profile, owners[], activity, related[] }
+GET  /repos/{id}/owners    → [{ principal, kind, source, confidence, contact }]
+POST /repos/{id}/contact   { intent: "use"|"contribute"|"question", message }
+                           → { requestId }
+PUT  /repos/{id}/ownership { team, people[] }   <span class="c">// override, audit-logged</span>
+
+POST /webhooks/github      <span class="c">// GitHub only; HMAC-verified, acked fast</span></code></pre>
+<p>Returning <code>parsed</code> is a deliberate product choice: the UI shows the filters the model inferred as editable chips ("Language: Python ×", "Team: Payments ×"), so a wrong guess is visible and one click away from being fixed.</p>
+
+<h2>High-Level Design</h2>
+<h3>1) Getting the data out of GitHub</h3>
+<p>The catalog authenticates as a <strong>GitHub App</strong> installed on each org with read-only permissions (metadata, contents, members). A <strong>backfill crawler</strong> lists every repo the installation can see and fetches, for each one: metadata, topics, languages, the README, CODEOWNERS, an optional <code>catalog-info.yaml</code>, dependency manifests (<code>package.json</code>, <code>go.mod</code>, <code>pyproject.toml</code>…), the top-level directory tree, and the authors of recent commits. It writes all of it to the <strong>Catalog DB</strong> (Postgres), which is the system of record for everything the portal shows. Deep dive 1 covers why an App and not a service-account token.</p>
+
+<h3>2) Keeping the catalog in sync</h3>
+<figure class="dg" data-diagram="design-repo-discovery-sync"></figure>
+<ol>
+<li>The App subscribes to webhooks. The <strong>webhook receiver</strong> verifies the <code>X-Hub-Signature-256</code> HMAC, records the <code>X-GitHub-Delivery</code> ID, puts the event on a queue and returns 2xx immediately. GitHub treats a delivery as failed if you don't respond within 10 seconds, so the receiver does nothing slow.</li>
+<li><strong>Sync workers</strong> treat each event as a hint that a repo changed. They re-fetch that repo's current state from GitHub and upsert it, instead of applying the event payload. Deep dive 2 explains why that one decision removes most ordering bugs.</li>
+<li>A <strong>reconciler</strong> sweeps all repos on a schedule using conditional requests, catching anything the webhooks missed.</li>
+</ol>
+
+<h3>3) Enriching repos with AI</h3>
+<p>When a sync changes the hash of a file we care about, the repo goes on an <strong>enrichment queue</strong>. An enrichment worker builds a compact input (README truncated to a few thousand tokens, the directory tree, manifests, the description and topics, a few representative source files for repos with no README) and asks an LLM for a structured profile:</p>
+<pre><code>RepoProfile {
+  purpose: string,       <span class="c">// "Sends SMS and push notifications via Twilio"</span>
+  summary: string,       <span class="c">// 3–5 sentences for someone outside the team</span>
+  kind: service | library | cli | infra | pipeline | docs | experiment,
+  stack: string[],       <span class="c">// ["Go", "gRPC", "Postgres", "Twilio"]</span>
+  how_to_use: string,    <span class="c">// install / call / deploy, if the repo says</span>
+  status_hint: active | maintenance | deprecated | unknown,
+  keywords: string[]     <span class="c">// what people will type: "texts", "OTP", "notify"</span>
+}</code></pre>
+<p>The worker then embeds the profile and the README chunks and writes the vectors next to the repo. Profiles are keyed by <code>(repoId, inputHash, promptVersion, model)</code>, so an unchanged repo is never summarized twice and a prompt change regenerates everything predictably.</p>
+
+<h3>4) Searching in natural language</h3>
+<figure class="dg" data-diagram="design-repo-discovery-search"></figure>
+<ol>
+<li>A <strong>query parser</strong> (a small, fast model with structured output) splits the question into filters and a semantic query. "python services the payments team touched this year" becomes <code>{ language: "Python", kind: "service", team: "payments", pushedAfter: "2026-01-01", text: "payments services" }</code>. In parallel, the raw query is embedded.</li>
+<li>The <strong>search index</strong> runs a hybrid query with the filters applied: BM25 over name, description, topics, profile and README; vector search over profile and chunk embeddings. Results are merged with reciprocal rank fusion.</li>
+<li>A <strong>reranker</strong> scores the top ~50 using the query plus signals: activity, archived or deprecated penalties, whether the repo has a verified owner, how many other repos depend on it.</li>
+<li>The API hydrates owners and profiles from the catalog cache and returns results with a one-line "why this matched".</li>
+</ol>
+
+<h3>5) Showing owners</h3>
+<p>An <strong>ownership resolver</strong> combines several sources (explicit catalog file, a required org property, CODEOWNERS, GitHub team permissions, commit history) into a ranked owner list with a source and confidence for each entry, then joins GitHub logins to the <strong>people directory</strong> to get names, Slack IDs, managers and whether the person still works here. Deep dive 5 covers the precedence rules.</p>
+
+<h3>6) Contacting owners</h3>
+<p>The <strong>contact service</strong> takes an intent and a message, routes it to the owning team's Slack channel (or a direct message to the primary owner if the team has no channel), threads replies back, and escalates to the next owner if nobody responds within a set time. An LLM can draft the message from the requester's search and the repo profile ("I'm building X and want to use your SMS client; is the gRPC API stable?"), which the requester edits before sending.</p>
+
+<h3>7) Access for everyone, remote or on site</h3>
+<p>The web app and API sit behind an <strong>identity-aware proxy</strong> that authenticates every request against the company IdP (OIDC/SAML SSO). Access depends on who you are, not which network you're on, so remote and office employees get the same experience with no VPN. The same API backs a Slack bot ("/repo sms gateway") and an MCP server, so coding agents can find internal libraries before writing new ones.</p>
+<figure class="dg" data-diagram="design-repo-discovery-final"></figure>
+
+<h2>Potential Deep Dives</h2>
+<h3>1) How should the service authenticate to GitHub?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>An engineer's personal access token</h5><p><span class="lbl">Challenges:</span> the catalog sees whatever that person can see (often too much), its API calls share their personal rate limit, and the integration breaks the day they change teams or leave. Audit logs attribute every call to a human who didn't make it.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>A dedicated machine user (service account) with a fine-grained token</h5><p><span class="lbl">Approach:</span> create a bot user, add it to the orgs with read access, give it a fine-grained token scoped to read-only permissions, store the token in a secrets manager.</p><p><span class="lbl">Challenges:</span> it consumes a paid seat, the token is long-lived (a leak is valuable to an attacker), rotation is manual, the rate limit is a single user's, and webhooks have to be configured separately on every org.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>A GitHub App with least-privilege permissions</h5><p><span class="lbl">Approach:</span> register an App with read-only Metadata, Contents and Members permissions and install it on each org. The service holds the App's private key in a KMS or secrets manager, signs a short JWT, and exchanges it for an <strong>installation access token</strong> that expires after one hour; a token cache refreshes it a few minutes early. Webhook subscriptions come with the App, so one configuration covers every installed org. Installation tokens get their own rate limit (5,000 requests/hour minimum, up to 12,500 as the org grows, 15,000 on GitHub Enterprise Cloud; see <a href="https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api">REST rate limits</a>), and calls are attributed to the App in audit logs. The same model works for GitHub Enterprise Server, with one App per instance.</p><p><span class="lbl">Challenges:</span> the private key is now the crown jewel: keep it in a KMS, never on disk, rotate it on a schedule, and alert on token creation from unexpected hosts. Org admins must approve installation and every permission increase, which is a feature.</p></div>
+
+<h3>2) How do we keep the catalog in sync without missing or misapplying changes?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Poll every repo every few minutes</h5><p><span class="lbl">Challenges:</span> 50K repos × ~5 calls each every 5 minutes is 3M calls an hour, hundreds of times the rate limit. Even polling once a day, the backfill-sized load lands on GitHub every day and freshness is a day.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Webhooks that apply payloads directly</h5><p><span class="lbl">Approach:</span> on a <code>repository</code> event with action <code>renamed</code>, update the name; on a <code>push</code>, read the changed files from the payload and update them.</p><p><span class="lbl">Challenges:</span> GitHub does not automatically redeliver failed webhook deliveries; a receiver outage silently loses events. Events can arrive out of order (a "renamed" can be processed after a later "edited"), duplicates happen (manual or API redeliveries), and payloads can be partial or capped at 25 MB. Applying payloads makes your catalog drift from GitHub in ways nobody notices.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Events as invalidation hints, fetch-latest workers, and a reconciler</h5><p><span class="lbl">Approach:</span></p><ul><li><strong>Fetch, don't apply.</strong> An event only means "repo 12345 changed". The worker re-reads that repo's current state from GitHub and upserts it. Order no longer matters: whichever worker runs last writes the latest truth. Writes are conditional on GitHub's <code>pushed_at</code>/<code>updated_at</code> being newer than what's stored, so a slow worker can't overwrite fresh data with stale data.</li><li><strong>Dedupe and debounce.</strong> Drop deliveries whose <code>X-GitHub-Delivery</code> ID you've already processed (redeliveries keep the same ID). Coalesce events per repo over a short window (say 30 s), so 40 pushes during a merge train become one sync.</li><li><strong>Filter early.</strong> For <code>push</code> events, ignore non-default branches and check the commits' added/modified/removed file lists; only pushes that touch watched files trigger a content fetch. That cuts content fetches by roughly 20×.</li><li><strong>Reconcile.</strong> A nightly job lists every repo and re-checks it with conditional requests (ETags). A <code>304 Not Modified</code> doesn't count against the primary rate limit when the request is authorized (<a href="https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api">GitHub best practices</a>), so the sweep is cheap. It also lists failed deliveries and redelivers them through the API (possible for the past 3 days, per <a href="https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries">handling failed deliveries</a>). Alert when the reconciler finds many changes the webhooks missed.</li><li><strong>Rate budget.</strong> All GitHub calls go through one client with a token bucket per installation and three priorities: webhook syncs, then reconciliation, then backfill. When an org-wide bot opens 5,000 dependency bumps in ten minutes, backfill pauses and freshness for humans is protected.</li></ul><p><span class="lbl">Challenges:</span> deleted and transferred repos can't be "fetched": a 404 means deleted, made private to the App, or moved to an org without the installation. Tombstone the repo, hide it from search, and keep its ownership history for a while in case it reappears under the same ID.</p></div>
+<div class="tbl"><table>
+<thead><tr><th>Webhook event</th><th>What we do</th></tr></thead>
+<tbody>
+<tr><td><code>repository</code> (created, renamed, transferred, archived, unarchived, edited, publicized, privatized, deleted)</td><td>Re-fetch metadata; tombstone on delete; re-check visibility and ACLs</td></tr>
+<tr><td><code>push</code> to the default branch</td><td>If watched files changed: re-fetch them, update hashes, enqueue enrichment</td></tr>
+<tr><td><code>custom_property_values</code></td><td>Re-read ownership and lifecycle properties</td></tr>
+<tr><td><code>team</code>, <code>membership</code>, <code>organization</code> (member removed)</td><td>Recompute ownership for affected repos</td></tr>
+<tr><td><code>installation_repositories</code></td><td>Start backfill for repos newly visible to the App; tombstone removed ones</td></tr>
+</tbody></table></div>
+
+<h3>3) What do we cache, and how do we invalidate it?</h3>
+<p>There are many caches here, and the trick is that most of them shouldn't need invalidation at all. Use three strategies and pick per layer: <strong>content-addressed keys</strong> (the key changes when the input changes, so stale entries are simply never read), <strong>TTLs shorter than the freshness SLO</strong> (staleness is bounded and acceptable), and <strong>explicit invalidation</strong> only where staleness is harmful.</p>
+<div class="tbl"><table>
+<thead><tr><th>Cache</th><th>Key</th><th>Invalidation</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>AI repo profile</td><td>repoId + hash of inputs + prompt version + model</td><td>None: content-addressed</td><td>The most expensive thing to compute; recomputed only when an input really changes</td></tr>
+<tr><td>Query embedding</td><td>normalized query + embedding model version</td><td>None; LRU eviction</td><td>Same text always embeds the same</td></tr>
+<tr><td>Query parse (LLM)</td><td>normalized query + parser prompt version + date</td><td>TTL 24 h</td><td>"this year" and "last month" depend on today's date</td></tr>
+<tr><td>Search results</td><td>query + filters + page</td><td>TTL 60 s</td><td>You can't know which queries a repo change affects; a 60 s TTL sits inside the 2-minute SLO</td></tr>
+<tr><td>Repo card / page (Redis)</td><td><code>repo:{id}</code>, value carries the catalog version</td><td>Delete on change via the outbox, plus 10-minute TTL as a safety net</td><td>Rename, archive and owner changes should show up right away</td></tr>
+<tr><td>People directory</td><td><code>person:{id}</code></td><td>Deprovision event deletes immediately; TTL 1 h otherwise</td><td>A departed owner on a card sends requests into a void</td></tr>
+<tr><td>GitHub responses</td><td>URL + ETag</td><td>Conditional request on every read</td><td>304s are free against the rate limit</td></tr>
+<tr><td>Search index itself</td><td>repoId document</td><td>Outbox → indexer upsert; full rebuild behind an alias swap</td><td>The index is a cache of Postgres, not a second source of truth</td></tr>
+</tbody></table></div>
+<p>Two details interviewers like to probe:</p>
+<ul>
+<li><strong>Keeping Postgres and the index consistent.</strong> Don't write to Postgres and then to the search index from the same worker; if the second write fails, they diverge forever. Use a <strong>transactional outbox</strong>: the catalog update and an outbox row commit in one transaction, and an indexer tails the outbox (or the database's change stream) to upsert the search document and delete the Redis key. Redelivery is safe because upserts are idempotent and carry the catalog version.</li>
+<li><strong>The stale-set race.</strong> Request A reads repo 12345 (old version) from a replica; the indexer then updates the row and deletes the cache key; request A writes the old value back into the cache. Now the stale value lives until TTL. Fix it by storing the catalog version in the cached value and only writing when it's newer (a small compare-and-set script in Redis), or by populating the cache only from the primary after invalidation. The 10-minute TTL bounds the damage if anything slips through.</li>
+</ul>
+<p>When the schema, the embedding model or the chunking changes, don't update the live index in place. Build a new index in the background from Postgres, run the search eval set against it, then flip the alias. Rollback is flipping it back.</p>
+<div class="callout"><span class="ci"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-3.6 10.8c.6.5 1 1.2 1 2V16h5.2v-.2c0-.8.4-1.5 1-2A6 6 0 0 0 12 3z"/></svg></span><p>Saying "we'll invalidate the search cache when a repo changes" is a trap: one repo change can affect the results of thousands of different queries, and you can't enumerate them. A short TTL that fits inside the freshness SLO is the honest answer, and it's cheap because search traffic is tiny.</p></div>
+
+<h3>4) How do we make natural-language search actually find the right repo?</h3>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Keyword search over names and descriptions</h5><p><span class="lbl">Challenges:</span> "something that sends text messages" doesn't match <code>notify-gateway</code>, whose description is empty and whose README says "Twilio wrapper". Keyword search only works for people who already know the name, which are exactly the people who don't need the portal.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Embed READMEs and do vector search</h5><p><span class="lbl">Approach:</span> chunk each README, embed the chunks, return repos whose chunks are nearest to the query embedding.</p><p><span class="lbl">Challenges:</span> many repos have no README or a template one, so they're invisible. Filters in the question ("Python", "owned by payments", "still maintained") get blurred into the embedding instead of applied. Exact names and acronyms ("PCI", "OTP") match poorly. Archived prototypes with nice READMEs outrank the maintained production service.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Write-time enrichment, structured query parsing, hybrid retrieval and signal-aware reranking</h5><p><span class="lbl">Approach:</span></p><ul><li><strong>Enrich at write time.</strong> The LLM profile gives every repo a purpose, a summary and synonyms, even when the README is empty, by reading the tree, manifests and a few source files. This is the single biggest quality win and costs a few hundred dollars once.</li><li><strong>Parse the query.</strong> A small model turns the question into filters plus search text with a strict JSON schema; the filter values are validated against known teams, languages and statuses, and anything unrecognized is dropped back into the text. Skip the model entirely for short queries that exactly match a repo name.</li><li><strong>Hybrid retrieval.</strong> BM25 for exact names, acronyms and error strings; vectors for paraphrases; merge with reciprocal rank fusion (see <a href="#vector-search">Vector Search</a> and <a href="#rag-deep-dive">RAG Deep Dive</a>).</li><li><strong>Rerank with signals.</strong> A cross-encoder (or a small LLM) scores query–profile relevance; a simple ranker combines it with activity, archived and deprecated penalties, verified ownership, number of dependents and an "officially supported" flag from the platform team. Collapse forks and template copies into their source.</li><li><strong>Explain.</strong> Show the inferred filters as chips and a one-line reason per result, generated from the matched fields, not by a model at query time.</li></ul><p><span class="lbl">Challenges:</span> LLM profiles can be confidently wrong about what a repo does. Generate them only from repo content, show "AI-generated from README and code" on the card with a link to the source, let owners edit or pin their own description (which then wins), and spot-check faithfulness with a judge against the inputs.</p></div>
+<p>A latency budget that meets the 800 ms p95 target:</p>
+<div class="tbl"><table>
+<thead><tr><th>Stage</th><th class="num">Budget</th><th>How</th></tr></thead>
+<tbody>
+<tr><td>Proxy auth, rate limit, cache lookup</td><td class="num">10–20 ms</td><td>Session cookie validated at the proxy; Redis</td></tr>
+<tr><td>Query parse (small model, ~80 output tokens)</td><td class="num">250–450 ms</td><td>Cached for repeated queries; skipped for exact names</td></tr>
+<tr><td>Query embedding</td><td class="num">30–80 ms</td><td>In parallel with the parse</td></tr>
+<tr><td>Hybrid search with filters</td><td class="num">20–60 ms</td><td>Single small index, in memory</td></tr>
+<tr><td>Rerank top 50</td><td class="num">60–150 ms</td><td>Cross-encoder on a small GPU or CPU-optimized model</td></tr>
+<tr><td>Hydrate owners and profiles</td><td class="num">5–15 ms</td><td>Redis, batched</td></tr>
+<tr><td><strong>Total</strong></td><td class="num"><strong>≈ 0.4–0.8 s</strong></td><td>Keyword results can render first while the parse finishes</td></tr>
+</tbody></table></div>
+
+<h3>5) Who owns this repo?</h3>
+<figure class="dg" data-diagram="design-repo-discovery-owners"></figure>
+<div class="sol bad"><span class="sl">Bad Solution</span><h5>Show the top committers</h5><p><span class="lbl">Challenges:</span> the top committer is often a dependency bot, someone who left, or the intern who wrote it three years ago. Activity is evidence about who knows the code, not who is responsible for it.</p></div>
+<div class="sol good"><span class="sl">Good Solution</span><h5>Parse CODEOWNERS</h5><p><span class="lbl">Approach:</span> read CODEOWNERS (GitHub looks in <code>.github/</code>, the root, then <code>docs/</code>, and uses the first one it finds) and take the owners of the catch-all pattern.</p><p><span class="lbl">Challenges:</span> many repos don't have one, CODEOWNERS describes who reviews which paths rather than who owns the service, and it lists GitHub handles and teams that may no longer exist.</p></div>
+<div class="sol great"><span class="sl">Great Solution</span><h5>Layered sources with precedence, a people-directory join, and ownership health</h5><p><span class="lbl">Approach:</span> collect claims from every source and resolve them in a fixed order:</p><ol><li><strong>Explicit catalog file</strong> (<code>catalog-info.yaml</code>, the <a href="https://backstage.io/docs/features/software-catalog/descriptor-format/">Backstage descriptor format</a>) with an owner team and lifecycle.</li><li><strong>An org custom property</strong> such as <code>owning-team</code>, which org admins can make required for all repositories, so every new repo has an owner from day one (<a href="https://docs.github.com/en/organizations/managing-organization-settings/managing-custom-properties-for-repositories-in-your-organization">custom properties</a>).</li><li><strong>Owner override</strong> set in the portal, audit-logged.</li><li><strong>CODEOWNERS</strong> catch-all owners.</li><li><strong>GitHub teams</strong> with admin or maintain permission on the repo.</li><li><strong>Inferred</strong> from recent human commit and review activity, excluding bots, shown separately as "people who know this code".</li></ol><p>Join every GitHub login to the people directory, which syncs from the IdP (SCIM) and the HR system: GitHub alone doesn't know someone's real name, manager or that they left yesterday. If a person is inactive, fall back to their team, then to the team's manager. Each owner on the card shows its source ("from catalog-info.yaml", "inferred from commits") and when it was last verified. Track <strong>ownership coverage</strong> (repos with an active, explicit owner) per org, send orphaned active repos to a triage queue, and ask owners to re-confirm once a quarter with one click in Slack.</p><p><span class="lbl">Challenges:</span> mapping GitHub logins to employees is the weak link when people use personal GitHub accounts. With SAML SSO on the org, linked identities give you the mapping; with Enterprise Managed Users, accounts come from the IdP directly. Without either, fall back to commit email matching and accept gaps.</p></div>
+<div class="callout warn"><span class="ci"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 2 20h20L12 3z"/><path d="M12 10v4M12 17.5v.5"/></svg></span><p>Don't ask an LLM who owns a repo. It will produce a confident, plausible name. Ownership is a fact that comes from configuration and the directory; the model's job is to describe the code, not to assign responsibility for it.</p></div>
+
+<h3>6) How do we route contact requests so owners don't drown?</h3>
+<ul>
+<li><strong>Team first:</strong> send to the owning team's channel rather than DMing the most visible engineer, so the load spreads and requests survive vacations. Fall back to the primary owner, then the manager.</li>
+<li><strong>Structured intents:</strong> "use", "contribute" and "question" render differently and can link to the repo's CONTRIBUTING file or support channel automatically; repos can declare "not accepting contributions" or "deprecated, use X instead", which the portal shows before a message is sent.</li>
+<li><strong>Dedupe and rate-limit:</strong> similar questions about the same repo within a day are grouped; each requester has a daily cap.</li>
+<li><strong>Escalation and metrics:</strong> no reply in two business days moves the request to the next owner. Median response time per team is an ownership-health signal on the repo page.</li>
+<li><strong>Delivery reliability:</strong> requests are stored first, then delivered by a worker with retries and idempotency keys, so a Slack outage delays messages instead of losing them.</li>
+</ul>
+
+<h3>7) How do we add authorization later without a rewrite?</h3>
+<p>Version one shows every employee the catalog of repos the App can see. Decide the policy explicitly: index only repos with <code>internal</code> or org-wide visibility, and let teams exclude sensitive repos (security tooling, acquisitions) with a <code>discoverable=false</code> property. To add per-user permissions later without a rewrite, build three things in now:</p>
+<ul>
+<li><strong>ACL on every document.</strong> Store the repo's visibility and the list of teams with read access on the search document from day one, even if nothing filters on it yet. The team and membership webhooks already keep it fresh.</li>
+<li><strong>Pre-filter, never post-filter.</strong> At query time, add a filter for the user's team IDs (resolved at login from their linked GitHub identity) to the search query itself. Filtering after retrieval breaks pagination, leaks counts ("3 hidden results") and can return empty pages.</li>
+<li><strong>Permission-aware caches.</strong> Once results depend on who's asking, a shared search-results cache leaks data. Add an ACL fingerprint (a hash of the user's sorted team IDs) to the result-cache key; per-repo cards stay shared but are only served after an access check.</li>
+</ul>
+<p>More on permission-aware retrieval in <a href="#guardrails-security">Guardrails &amp; Security</a>.</p>
+
+<h3>8) What happens when things break, and how big does the backfill get?</h3>
+<div class="tbl"><table>
+<thead><tr><th>Failure</th><th>Behavior</th></tr></thead>
+<tbody>
+<tr><td>GitHub API down or rate-limited</td><td>Reads served from the catalog with a "last synced" time; webhooks queue up and drain later</td></tr>
+<tr><td>Webhook receiver down</td><td>Deliveries fail; the reconciler redelivers them through the API and its sweep catches the rest</td></tr>
+<tr><td>LLM provider down</td><td>Search falls back to keyword + embeddings with UI filter chips; enrichment queue waits</td></tr>
+<tr><td>Embedding provider down</td><td>BM25-only search; existing vectors still serve</td></tr>
+<tr><td>Search index lost</td><td>Rebuild from Postgres (minutes for 50K docs); Postgres can serve basic name search meanwhile</td></tr>
+</tbody></table></div>
+<pre><code><span class="c">// Initial backfill with GraphQL batching (watch each query's rateLimit { cost })</span>
+metadata, README, CODEOWNERS, manifests, 50 repos/query:  50K / 50 = 1,000 queries
+recent commit authors, one query per active repo:              ≈ 15,000 queries
+5,000 points/hour (10,000 for Apps on Enterprise Cloud), a few points per query
+  → <span class="k">roughly a working day</span> per installation; run overnight, active repos first
+
+<span class="c">// LLM enrichment, one time (Sonnet 5.5 list: $2 / M in, $10 / M out; check pricing)</span>
+50K repos × ~5K input tokens  = 250M × $2/M  = $500
+50K repos × ~400 output       =  20M × $10/M = $200
+                    total ≈ $700, ≈ <span class="k">$350 via the Batch API</span> (~50% discount)
+
+<span class="c">// Ongoing</span>
+~1,000 repos/day with changed inputs × $0.014       ≈ <span class="k">$14/day</span>
+query parsing: 8K queries/day, small model, cached  ≈ a few dollars/day</code></pre>
+<p>Model cost is a rounding error next to the engineering time saved by one avoided rebuild. The binding constraints are GitHub rate limits during backfill and change storms, which is why the client has a priority-aware rate budget.</p>
+
+<h3>9) How do we know search is working?</h3>
+<ul>
+<li><strong>Golden set:</strong> a few hundred real queries (from Slack "does anyone know a repo that…" threads and search logs) with the repos that should rank first, labeled by the owning teams. Track recall@5 and MRR; rerun on every change to prompts, models, ranking or chunking (see <a href="#evaluation">Evaluation</a>).</li>
+<li><strong>Online:</strong> zero-result rate, query reformulation rate, click-through on the top 3, and the strongest success signal for this product: a contact request or a clone after a search.</li>
+<li><strong>Profile quality:</strong> owners can flag a wrong summary in one click; sample profiles weekly for an LLM judge to check every claim against the README and code it was generated from.</li>
+<li><strong>Freshness:</strong> time from GitHub event to searchable (p50, p95), webhook-miss rate found by the reconciler, and ownership coverage per org.</li>
+</ul>
+
+<h2>What is Expected at Each Level?</h2>
+<div class="levels">
+<div><h4>Mid-level</h4>A catalog DB filled by a crawler, webhooks for updates, embeddings plus keyword search, a repo page with CODEOWNERS-based owners, SSO in front, and a Slack contact button. Notices that READMEs are often empty.</div>
+<div><h4>Senior</h4>GitHub App over service accounts with rate-limit math; webhooks as hints with fetch-latest, dedupe, debounce and a reconciler; LLM enrichment on the write path with content-addressed profiles; query parsing into validated filters, hybrid retrieval and reranking; per-layer cache strategy including the outbox and the stale-set race; layered ownership joined to the directory.</div>
+<div><h4>Staff+</h4>Frames ownership coverage and search success (contact after search) as the metrics that matter and designs the org process around them: required custom properties, owner re-verification, orphan triage. Designs ACLs, permission-aware caches and pre-filtering in from day one so authorization is an add-on, plans index rebuilds behind alias swaps with eval gates, and exposes the catalog to agents through MCP so the next "rebuild it from scratch" is caught by a tool, not a person.</div>
+</div>
+</section>
 
   </main>
   <aside class="rail" aria-label="On this page">
@@ -7048,6 +7296,79 @@ D["design-llm-gateway-final"]={w:860,h:470,label:"Final LLM gateway design: team
   {a:"gw",b:"rd",t:"reserve /\nreconcile",lp:[230,322]},{a:"gw",b:"rc",d:1,t:"opt-in"},{a:"gw",b:"pv",t:"stream"},
   {a:"gw",b:"kf",t:"async",lp:[520,352]},{a:"kf",b:"wh"}]};
 
+D["design-repo-discovery-sync"]={w:840,h:400,label:"Sync path: GitHub sends webhooks to a receiver that verifies the signature and acknowledges within 10 seconds; events go on a queue that dedupes and debounces per repo; sync workers re-fetch the latest repo state from GitHub with the App token and upsert it into the Catalog DB if newer. A reconciler sweeps GitHub with ETags and enqueues missed changes. When a watched file's hash changes, enrichment workers call LLM and embedding models and write profiles back. The catalog feeds the search index through an outbox and invalidates Redis caches.",
+ nodes:[
+  {id:"gh",x:10,y:40,w:130,h:70,t:"GitHub\norg(s)",c:"gray",fs:15},
+  {id:"wr",x:185,y:40,w:170,h:70,t:"Webhook receiver",sub:"verify HMAC\nack < 10 s",c:"orange",fs:15},
+  {id:"q",x:400,y:40,w:170,h:70,t:"Event queue",sub:"dedupe by delivery ID\ndebounce per repo",c:"orange",fs:15},
+  {id:"sw",x:615,y:40,w:180,h:70,t:"Sync workers",sub:"fetch latest state",c:"blue",fs:15},
+  {id:"rc",x:185,y:180,w:170,h:70,t:"Reconciler",sub:"nightly · ETags\nredeliver failures",c:"purple",fs:15},
+  {id:"en",x:400,y:172,w:170,h:86,t:"Enrichment",sub:"on content-hash change\nLLM profile\nembeddings",c:"purple",fs:15},
+  {id:"db",x:615,y:170,w:180,h:92,t:"Catalog DB\n(Postgres)",s:"db",c:"gray",fs:15},
+  {id:"llm",x:185,y:310,w:170,h:62,t:"LLM + embedding\nmodels",c:"gray",fs:14},
+  {id:"ix",x:400,y:300,w:170,h:86,t:"Search index\n(BM25 + kNN)",s:"db",c:"teal",fs:14},
+  {id:"rd",x:615,y:300,w:180,h:86,t:"Redis caches",s:"db",c:"gray",fs:14}
+ ],
+ edges:[{a:"gh",b:"wr"},{a:"wr",b:"q"},{a:"q",b:"sw"},
+  {a:"sw",b:"gh",d:1,as:"t0.5",via:[[705,14],[75,14]],bs:"t",t:"re-fetch latest (App token)",lp:[390,14]},
+  {a:"sw",b:"db",t:"upsert if newer"},
+  {a:"rc",b:"gh",d:1,t:"list + ETags"},{a:"rc",b:"q",t:"missed"},
+  {a:"db",b:"en",bi:1},{a:"en",b:"llm"},
+  {a:"db",b:"ix",t:"outbox"},{a:"db",b:"rd",d:1,t:"invalidate"}]};
+D["design-repo-discovery-search"]={w:840,h:320,label:"Search path: an employee's query passes SSO into the Search API, which checks query caches, sends the query to a small-LLM query parser that returns filters and to an embedding call in parallel. A hybrid search runs BM25 and vector search with the filters, a reranker scores the top 50 using relevance and repo signals, and results are hydrated with owners and profiles from the catalog cache before returning.",
+ nodes:[
+  {id:"u",x:10,y:110,w:70,h:72,t:"Employee",s:"person"},
+  {id:"api",x:110,y:116,w:140,h:62,t:"Search API",sub:"SSO · rate limit",c:"orange",fs:15},
+  {id:"qc",x:110,y:8,w:140,h:80,t:"Query\ncaches",s:"db",c:"gray",fs:14},
+  {id:"qp",x:290,y:40,w:170,h:66,t:"Query parser",sub:"small LLM → filters",c:"purple",fs:15},
+  {id:"em",x:290,y:188,w:170,h:62,t:"Embed query",c:"teal",fs:15},
+  {id:"hs",x:500,y:110,w:150,h:74,t:"Hybrid search",sub:"BM25 + kNN\n+ filters",c:"teal",fs:15},
+  {id:"rr",x:690,y:40,w:140,h:66,t:"Rerank top 50",sub:"relevance + signals",c:"blue",fs:15},
+  {id:"hy",x:690,y:188,w:140,h:86,t:"Owners +\nprofiles",s:"db",c:"gray",fs:14}
+ ],
+ edges:[{a:"u",b:"api",bi:1},{a:"api",b:"qc",d:1,t:"hit?"},{a:"api",b:"qp"},{a:"api",b:"em"},
+  {a:"qp",b:"hs",t:"filters + text"},{a:"em",b:"hs",t:"vector"},{a:"hs",b:"rr"},{a:"rr",b:"hy",t:"hydrate"},
+  {a:"hy",b:"api",as:"b0.5",via:[[760,306],[180,306]],bs:"b",noh:0,t:"results + why matched",lp:[470,306]}]};
+D["design-repo-discovery-owners"]={w:800,h:310,label:"Ownership resolution: claims from catalog-info.yaml, an org custom property, portal overrides, CODEOWNERS, GitHub team permissions and commit activity feed an ownership resolver that applies precedence and confidence. A people directory synced from the IdP, SCIM and HR maps GitHub logins to active employees and falls back to the team or manager. The result is an owner card showing team, people, Slack contacts and the source of each claim.",
+ nodes:[
+  {id:"s1",x:10,y:12,w:210,h:38,t:"1. catalog-info.yaml",c:"green",fs:14},
+  {id:"s2",x:10,y:60,w:210,h:38,t:"2. Org custom property",c:"green",fs:14},
+  {id:"s3",x:10,y:108,w:210,h:38,t:"3. Portal override",c:"green",fs:14},
+  {id:"s4",x:10,y:156,w:210,h:38,t:"4. CODEOWNERS",c:"teal",fs:14},
+  {id:"s5",x:10,y:204,w:210,h:38,t:"5. Team permissions",c:"teal",fs:14},
+  {id:"s6",x:10,y:252,w:210,h:38,t:"6. Commit activity",c:"gray",fs:14},
+  {id:"rs",x:300,y:110,w:180,h:84,t:"Ownership\nresolver",sub:"precedence · confidence",c:"purple",fs:15},
+  {id:"pd",x:300,y:230,w:180,h:66,t:"People directory",sub:"IdP · SCIM · HR",c:"blue",fs:15},
+  {id:"oc",x:560,y:96,w:236,h:112,t:"Owner card",sub:"team · people · Slack\nsource + last verified\nfallback: team → manager",c:"orange",fs:16}
+ ],
+ edges:[{a:"s1",b:"rs",as:"r",bs:"l0.2"},{a:"s2",b:"rs",as:"r",bs:"l0.35"},{a:"s3",b:"rs",as:"r",bs:"l0.5"},
+  {a:"s4",b:"rs",as:"r",bs:"l0.6"},{a:"s5",b:"rs",as:"r",bs:"l0.75"},{a:"s6",b:"rs",as:"r",bs:"l0.9",d:1},
+  {a:"rs",b:"oc",t:"ranked claims"},{a:"pd",b:"oc",t:"active? Slack ID"}],
+ notes:[{x:115,y:302,t:"dashed: inferred, shown separately",a:"middle",fs:12}]};
+D["design-repo-discovery-final"]={w:860,h:450,label:"Final repo discovery design: employees reach an SSO identity-aware proxy from any network, then the Discovery API, which checks Redis caches, calls a small-LLM query parser, queries a hybrid search index and reads the Catalog DB for owners and profiles. A contact service routes requests to Slack or email using the people directory. On the write path, GitHub webhooks go to a receiver and to sync and enrichment workers that re-fetch from GitHub, call LLM and embedding APIs, and upsert the Catalog DB, which feeds the search index through an outbox. A nightly reconciler catches missed events.",
+ zones:[{x:670,y:6,w:186,h:438,t:"",c:"gray"}],
+ nodes:[
+  {id:"u",x:10,y:200,w:70,h:72,t:"Employee",s:"person"},
+  {id:"rd",x:100,y:30,w:130,h:86,t:"Redis\ncaches",s:"db",c:"gray",fs:15},
+  {id:"sso",x:100,y:205,w:130,h:62,t:"SSO proxy",sub:"OIDC · any network",c:"gray",fs:15},
+  {id:"sl",x:100,y:360,w:130,h:62,t:"Slack / email",c:"gray",fs:15},
+  {id:"qp",x:265,y:36,w:160,h:62,t:"Query parser",sub:"small LLM",c:"purple",fs:15},
+  {id:"api",x:265,y:205,w:160,h:62,t:"Discovery API",sub:"search · repos · owners",c:"orange",fs:15},
+  {id:"ct",x:265,y:360,w:160,h:62,t:"Contact service",sub:"routing · escalation",c:"green",fs:15},
+  {id:"ix",x:465,y:20,w:170,h:92,t:"Search index\n(BM25 + kNN)",s:"db",c:"teal",fs:14},
+  {id:"cat",x:465,y:190,w:170,h:92,t:"Catalog DB\n(Postgres)",s:"db",c:"gray",fs:15},
+  {id:"pd",x:465,y:360,w:170,h:62,t:"People directory",sub:"IdP · SCIM · HR",c:"blue",fs:15},
+  {id:"gh",x:685,y:20,w:160,h:62,t:"GitHub org(s)",sub:"GitHub App",c:"gray",fs:15},
+  {id:"wr",x:685,y:118,w:160,h:62,t:"Webhook receiver",sub:"HMAC · dedupe",c:"orange",fs:15},
+  {id:"sw",x:685,y:216,w:160,h:70,t:"Sync + enrich\nworkers",c:"blue",fs:15},
+  {id:"llm",x:685,y:330,w:160,h:62,t:"LLM / embedding\nAPIs",c:"gray",fs:14}
+ ],
+ edges:[{a:"u",b:"sso",bi:1},{a:"sso",b:"api",bi:1},{a:"api",b:"rd",d:1,t:"hit?"},{a:"api",b:"qp"},
+  {a:"api",b:"ix",t:"hybrid query",lp:[470,150]},{a:"api",b:"cat"},{a:"api",b:"ct"},{a:"ct",b:"sl"},{a:"ct",b:"pd"},
+  {a:"pd",b:"cat",d:1,t:"people sync"},{a:"cat",b:"ix",t:"outbox"},
+  {a:"gh",b:"wr",t:"webhooks"},{a:"wr",b:"sw",t:"queue"},{a:"sw",b:"cat"},{a:"sw",b:"llm"}],
+ notes:[{x:765,y:420,t:"nightly reconciler re-syncs\nanything webhooks missed",a:"middle",fs:12}]};
+
 D["design-voice-agent-cascade"]={w:820,h:300,label:"Two voice architectures. Cascaded: user audio flows through voice activity and turn detection, streaming speech-to-text, the LLM and streaming text-to-speech back to the user. Speech-to-speech: user audio goes straight into one realtime model that returns audio.",
  zones:[{x:8,y:8,w:804,h:128,t:"Cascaded pipeline",c:"blue"},{x:8,y:160,w:804,h:128,t:"Speech-to-speech (realtime model)",c:"purple"}],
  nodes:[
@@ -7554,7 +7875,7 @@ D["vector-search-migration"]={w:780,h:300,label:"Re-embedding migration: documen
 (function(){
 "use strict";
 var NS="http://www.w3.org/2000/svg";
-var ORDER=["introduction","how-to-prepare","delivery-framework","core-concepts","key-technologies","common-patterns","question-breakdowns","inference-serving","context-engineering","vector-search","rag-deep-dive","llm-caching","agents-tool-use","evaluation","guardrails-security","api-streaming","gateway-reliability","observability","fine-tuning","numbers-to-know","design-chatgpt","design-support-assistant","design-inference-batching","design-coding-agent","design-claude-code","design-code-completion","design-answer-engine","design-deep-research","design-llm-gateway","design-voice-agent","design-doc-extraction","question-bank","resources"];
+var ORDER=["introduction","how-to-prepare","delivery-framework","core-concepts","key-technologies","common-patterns","question-breakdowns","inference-serving","context-engineering","vector-search","rag-deep-dive","llm-caching","agents-tool-use","evaluation","guardrails-security","api-streaming","gateway-reliability","observability","fine-tuning","numbers-to-know","design-chatgpt","design-support-assistant","design-inference-batching","design-coding-agent","design-claude-code","design-code-completion","design-answer-engine","design-deep-research","design-llm-gateway","design-voice-agent","design-doc-extraction","design-repo-discovery","question-bank","resources"];
 function $(s,r){return (r||document).querySelector(s)}
 function $$(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s))}
 function el(tag,attrs,parent){var e=document.createElementNS(NS,tag);for(var k in attrs){if(attrs[k]!==undefined&&attrs[k]!==null)e.setAttribute(k,attrs[k])}if(parent)parent.appendChild(e);return e}
